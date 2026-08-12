@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prep-Phase Meeting Tracker — Buffalo Construction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+:root{
+  --navy:#00253D; --orange:#FF5F00; --cream:#F3F7F5; --black:#171C26;
+  --success:#0A6E5C; --warning:#E8961A; --error:#C43B2E; --info:#2A6496;
+  --muted:#5A6B7A; --border:#D1D5DB; --card:#F8FAFB; --hover:#0A3A5C;
+  --r-sm:4px; --r-md:8px; --r-lg:12px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Montserrat',system-ui,Arial,sans-serif;background:var(--cream);color:var(--navy);font-size:14px;line-height:1.5}
+button{font-family:inherit;cursor:pointer}
+a{color:var(--orange);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ── Header ─────────────────────────────────────────────── */
+header{background:var(--navy);color:#fff;padding:0 24px;height:68px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:50}
+.mark{width:34px;height:34px;flex:none}
+.brand{display:flex;flex-direction:column;line-height:1.15}
+.brand b{font-weight:900;text-transform:uppercase;letter-spacing:.06em;font-size:15px}
+.brand span{font-size:11px;color:var(--orange);text-transform:uppercase;letter-spacing:.12em;font-weight:600}
+.hspacer{flex:1}
+.sync{font-size:11px;color:#9fb3c2;text-align:right;line-height:1.4}
+.hbtn{background:transparent;border:1.5px solid rgba(255,255,255,.35);color:#fff;padding:8px 14px;border-radius:var(--r-sm);font-size:12px;font-weight:600}
+.hbtn:hover{border-color:var(--orange);color:var(--orange)}
+.hbtn.primary{background:var(--orange);border-color:var(--orange)}
+.hbtn.primary:hover{background:#e65600;border-color:#e65600;color:#fff}
+
+/* ── Tabs ───────────────────────────────────────────────── */
+nav.tabs{background:var(--navy);padding:0 24px;display:flex;gap:4px;border-top:1px solid rgba(255,255,255,.1);position:sticky;top:68px;z-index:49}
+nav.tabs button{background:none;border:none;color:#9fb3c2;padding:12px 16px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;border-bottom:3px solid transparent}
+nav.tabs button:hover{color:#fff}
+nav.tabs button.on{color:#fff;border-bottom-color:var(--orange)}
+nav.tabs .badge{display:inline-block;background:var(--orange);color:#fff;border-radius:9px;padding:1px 7px;font-size:10px;margin-left:6px}
+
+main{padding:24px;max-width:1400px;margin:0 auto}
+.panel{display:none}
+.panel.on{display:block}
+
+/* ── KPIs ───────────────────────────────────────────────── */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:20px}
+.kpi{background:#fff;border:1px solid var(--border);border-radius:var(--r-md);padding:16px 18px}
+.kpi .n{font-size:32px;font-weight:900;line-height:1.1;color:var(--navy)}
+.kpi .n.orange{color:var(--orange)}
+.kpi .n.err{color:var(--error)}
+.kpi .l{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-top:4px}
+
+/* ── Toolbar ────────────────────────────────────────────── */
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+.toolbar input[type=search],.toolbar select{padding:9px 12px;border:1px solid var(--border);border-radius:var(--r-sm);font-family:inherit;font-size:13px;background:#fff;color:var(--navy)}
+.toolbar input[type=search]{min-width:260px}
+.toolbar input:focus,.toolbar select:focus{outline:2px solid var(--orange);outline-offset:1px;border-color:var(--navy)}
+.chip{padding:7px 13px;border:1.5px solid var(--border);background:#fff;border-radius:20px;font-size:12px;font-weight:600;color:var(--muted)}
+.chip.on{background:var(--navy);border-color:var(--navy);color:#fff}
+
+/* ── Project table ──────────────────────────────────────── */
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden}
+thead th{background:var(--navy);color:#fff;text-align:left;padding:11px 14px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;white-space:nowrap}
+tbody td{padding:12px 14px;border-top:1px solid var(--border);vertical-align:middle}
+tbody tr:nth-child(even){background:var(--card)}
+tbody tr.click{cursor:pointer}
+tbody tr.click:hover{background:#fdece3}
+.pname{font-weight:700}
+.psub{font-size:11px;color:var(--muted);margin-top:2px}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* progress */
+.bar{width:120px;height:8px;background:var(--border);border-radius:4px;overflow:hidden;display:inline-block;vertical-align:middle}
+.bar>i{display:block;height:100%;background:var(--orange)}
+.bar>i.done{background:var(--success)}
+.pct{font-weight:800;font-variant-numeric:tabular-nums;margin-left:8px;font-size:13px}
+
+/* ── Status pills ───────────────────────────────────────── */
+.pill{display:inline-block;padding:3px 9px;border-radius:11px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}
+.pill.held{background:#dff0ec;color:var(--success)}
+.pill.notheld{background:#fbe4e1;color:var(--error)}
+.pill.na{background:#eceff1;color:var(--muted)}
+.pill.warn{background:#fdf0dc;color:#8a5a05}
+.pill.info{background:#e2ecf5;color:var(--info)}
+.pill.manual{background:#fff;border:1.5px solid var(--orange);color:var(--orange)}
+
+/* ── Modal ──────────────────────────────────────────────── */
+.overlay{position:fixed;inset:0;background:rgba(23,28,38,.6);z-index:100;display:none;padding:24px;overflow:auto}
+.overlay.on{display:block}
+.modal{background:var(--cream);max-width:1080px;margin:0 auto;border-radius:var(--r-lg);overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+.modal-hd{background:var(--navy);color:#fff;padding:20px 24px;display:flex;align-items:flex-start;gap:16px}
+.modal-hd h2{font-size:19px;font-weight:900;text-transform:uppercase;letter-spacing:.03em;line-height:1.25}
+.modal-hd .sub{font-size:12px;color:#9fb3c2;margin-top:5px}
+.x{background:none;border:none;color:#fff;font-size:26px;line-height:1;padding:0 4px}
+.x:hover{color:var(--orange)}
+.modal-bd{padding:22px 24px 28px}
+.sec-h{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin:22px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--orange)}
+.sec-h:first-child{margin-top:0}
+
+/* vendor rows */
+.vrow{background:#fff;border:1px solid var(--border);border-left:4px solid var(--border);border-radius:var(--r-sm);padding:12px 14px;margin-bottom:8px;display:flex;gap:14px;align-items:flex-start}
+.vrow.held{border-left-color:var(--success)}
+.vrow.not_held{border-left-color:var(--error)}
+.vrow.not_applicable{border-left-color:var(--muted);opacity:.72}
+.vrow .body{flex:1;min-width:0}
+.vrow .vn{font-weight:700}
+.vrow .ev{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.5}
+.vrow .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.mini{padding:5px 10px;font-size:11px;font-weight:700;border-radius:var(--r-sm);border:1.5px solid var(--border);background:#fff;color:var(--muted)}
+.mini:hover{border-color:var(--navy);color:var(--navy)}
+.mini.ok:hover{border-color:var(--success);color:var(--success)}
+.mini.no:hover{border-color:var(--error);color:var(--error)}
+
+.note{background:#fff;border:1px solid var(--border);border-left:4px solid var(--info);padding:12px 14px;border-radius:var(--r-sm);font-size:12.5px;color:var(--muted);margin-bottom:14px}
+.note.warn{border-left-color:var(--warning)}
+.note.err{border-left-color:var(--error);color:var(--error);font-weight:600}
+.note b{color:var(--navy)}
+.empty{padding:36px;text-align:center;color:var(--muted);background:#fff;border:1px dashed var(--border);border-radius:var(--r-md)}
+
+/* settings */
+.fieldset{background:#fff;border:1px solid var(--border);border-radius:var(--r-md);padding:18px 20px;margin-bottom:16px}
+.fieldset h3{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.09em;color:var(--navy);margin-bottom:4px}
+.fieldset p{font-size:12px;color:var(--muted);margin-bottom:12px}
+.opt{display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-top:1px solid var(--border)}
+.opt:first-of-type{border-top:none}
+.opt label{font-size:13px;font-weight:600;cursor:pointer}
+.opt .hint{font-size:11.5px;color:var(--muted);font-weight:400;margin-top:2px}
+.opt input{margin-top:3px;accent-color:var(--orange);width:16px;height:16px;flex:none}
+</style>
+</head>
+<body>
+
+<header>
+  <!-- Roman Mark, simplified silhouette. Always faces left, single colour, no stroke. -->
+  <svg class="mark" viewBox="0 0 64 44" fill="#FF5F00" aria-hidden="true">
+    <path d="M6 12c-1.6-3.4.3-7 3.6-7.6 2.2-.4 4 .6 5.3 2.3 2.6-2.1 6-3.2 9.8-3.2h17.5c4 0 7.5 1.2 10.1 3.4 1.3-1.8 3.2-2.9 5.5-2.5C61.2 5 63 8.7 61.3 12c-.8 1.6-2.3 2.5-3.9 2.8.3 1.4.4 2.9.3 4.4l-.6 6.8c-.3 3.2-1.9 6-4.4 7.9l.9 6.6c.1 1-.6 1.9-1.6 2h-4.3c-.9 0-1.6-.6-1.8-1.4l-1-4.6c-2.3.7-4.8 1-7.4 1h-8.6c-2.7 0-5.2-.4-7.5-1.1l-1 4.7c-.2.8-.9 1.4-1.8 1.4h-4.3c-1 0-1.7-.9-1.6-2l.9-6.7c-2.4-1.9-4-4.7-4.3-7.8l-.6-6.8c-.1-1.5 0-3 .3-4.4-1.6-.3-3.1-1.3-3.9-2.8z"/>
+    <circle cx="21" cy="20" r="2.6" fill="#00253D"/>
+    <circle cx="43" cy="20" r="2.6" fill="#00253D"/>
+  </svg>
+  <div class="brand"><b>Prep-Phase Meeting Tracker</b><span>Buffalo Construction</span></div>
+  <div class="hspacer"></div>
+  <div class="sync" id="sync">Loading…</div>
+  <button class="hbtn" id="btn-refresh">Refresh</button>
+  <button class="hbtn primary" id="btn-settings" style="display:none">Settings</button>
+</header>
+
+<nav class="tabs">
+  <button data-tab="projects" class="on">Projects</button>
+  <button data-tab="review">Review Queue<span class="badge" id="badge-review" style="display:none">0</span></button>
+  <button data-tab="settings" id="tab-settings" style="display:none">Settings</button>
+</nav>
+
+<main>
+  <!-- ── Projects ─────────────────────────────────────────── -->
+  <section class="panel on" id="panel-projects">
+    <div class="kpis" id="kpis"></div>
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="Search project, number or superintendent…">
+      <button class="chip on" data-filter="all">All</button>
+      <button class="chip" data-filter="outstanding">Has outstanding</button>
+      <button class="chip" data-filter="complete">Complete</button>
+      <button class="chip" data-filter="novendors">No vendors found</button>
+      <select id="scope">
+        <option value="active">Active projects (Course of Construction)</option>
+        <option value="all">All projects</option>
+      </select>
+    </div>
+    <div id="projects-out"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- ── Review queue ─────────────────────────────────────── -->
+  <section class="panel" id="panel-review">
+    <div class="note">
+      <b>Prep meetings that couldn't be credited to a vendor.</b> Each of these was logged in
+      Procore but nothing ties it to a company on the project's roster — usually the meeting was
+      titled with a person's name instead of the vendor's, or the sub isn't in Procore's
+      commitments or project directory. Every row is either a vendor to add or a title to fix.
+    </div>
+    <div id="review-out"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- ── Settings ─────────────────────────────────────────── -->
+  <section class="panel" id="panel-settings">
+    <div id="settings-out"><div class="empty">Loading…</div></div>
+  </section>
+</main>
+
+<div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
+
+<script>
+(function(){
+'use strict';
+
+/* ── state ─────────────────────────────────────────────── */
+var ADMIN=false, PROJECTS=[], TOTALS={}, SETTINGS={}, COVERAGE={}, REVIEW=[],
+    FILTER='all', SCOPE='active', CURRENT=null;
+
+/* ── helpers ───────────────────────────────────────────── */
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function $(id){return document.getElementById(id);}
+function fmtDate(d){
+  if(!d) return '—';
+  var p=String(d).slice(0,10).split('-');
+  return p.length===3 ? p[1]+'/'+p[2]+'/'+p[0] : String(d);
+}
+function ago(ts){
+  if(!ts) return 'never';
+  var h=(Date.now()-new Date(ts).getTime())/36e5;
+  if(h<1) return 'just now';
+  if(h<24) return Math.round(h)+'h ago';
+  return Math.round(h/24)+'d ago';
+}
+
+/**
+ * Every fetch goes through here so a failure can never be mistaken for an empty
+ * result. Rendering "0 vendors" when the API actually 503'd is the exact bug
+ * class that made the Safety Dashboard's tabs look like there was nothing to
+ * report — the caller gets a thrown error and shows a red note instead.
+ */
+async function api(path, opts){
+  var r = await fetch('/api'+path, opts||{});
+  var body=null;
+  try{ body = await r.json(); }catch(e){ /* non-JSON error page */ }
+  if(!r.ok){
+    throw new Error((body && body.error) || ('Request failed ('+r.status+' '+r.statusText+')'));
+  }
+  return body;
+}
+function errNote(msg){
+  return '<div class="note err">Couldn\'t load this: '+esc(msg)+'</div>';
+}
+
+/* ── projects ──────────────────────────────────────────── */
+function matchesFilter(p){
+  if(FILTER==='outstanding') return p.vendor_outstanding>0;
+  if(FILTER==='complete')    return p.vendor_total>0 && p.vendor_outstanding===0;
+  if(FILTER==='novendors')   return p.vendor_total===0;
+  return true;
+}
+function matchesQuery(p,q){
+  if(!q) return true;
+  return [p.project_name,p.project_number,p.superintendent_name,p.project_manager,p.project_id]
+    .some(function(v){ return String(v==null?'':v).toLowerCase().indexOf(q)>-1; });
+}
+
+function renderKpis(){
+  var t=TOTALS||{};
+  var cells=[
+    ['n',        t.projects||0,                'Projects tracked'],
+    ['n',        t.vendors||0,                 'Vendors on the checklist'],
+    ['n orange', t.held||0,                    'Prep meetings held'],
+    ['n err',    t.outstanding||0,             'Still outstanding'],
+    ['n',        (t.pct_complete==null?'—':t.pct_complete+'%'), 'Complete']
+  ];
+  $('kpis').innerHTML = cells.map(function(c){
+    return '<div class="kpi"><div class="'+c[0]+'">'+esc(c[1])+'</div><div class="l">'+esc(c[2])+'</div></div>';
+  }).join('');
+}
+
+function renderProjects(){
+  var q=($('q').value||'').trim().toLowerCase();
+  var rows=PROJECTS.filter(function(p){ return matchesFilter(p) && matchesQuery(p,q); });
+
+  if(!PROJECTS.length){
+    $('projects-out').innerHTML='<div class="empty">No projects came back for this scope. '
+      +'If you expected some, the Fabric mirror may not have run yet.</div>';
+    return;
+  }
+  if(!rows.length){
+    $('projects-out').innerHTML='<div class="empty">No projects match that filter.</div>';
+    return;
+  }
+
+  var html='<table><thead><tr>'
+    +'<th>Project</th><th>Superintendent</th>'
+    +'<th class="num">Vendors</th><th class="num">Held</th><th class="num">Outstanding</th>'
+    +'<th>Progress</th><th class="num">Last prep meeting</th><th class="num">Review</th>'
+    +'</tr></thead><tbody>';
+
+  rows.forEach(function(p){
+    var pct = p.pct_complete==null ? null : Number(p.pct_complete);
+    var barW = pct==null?0:pct;
+    html+='<tr class="click" data-pid="'+esc(p.project_id)+'">'
+      +'<td><div class="pname">'+esc(p.project_name||('Project '+p.project_id))+'</div>'
+        +'<div class="psub">'+esc(p.project_number||'—')+' · '+esc(p.stage||'No stage')+'</div></td>'
+      +'<td>'+esc(p.superintendent_name||p.project_manager||'—')+'</td>'
+      +'<td class="num">'+esc(p.vendor_total)+'</td>'
+      +'<td class="num">'+esc(p.vendor_held)+'</td>'
+      +'<td class="num">'+(p.vendor_outstanding>0
+          ? '<span class="pill notheld">'+esc(p.vendor_outstanding)+'</span>' : '0')+'</td>'
+      +'<td>'+(p.vendor_total===0
+          ? '<span class="pill warn">No vendors</span>'
+          : '<span class="bar"><i class="'+(pct===100?'done':'')+'" style="width:'+barW+'%"></i></span>'
+            +'<span class="pct">'+barW+'%</span>')+'</td>'
+      +'<td class="num">'+esc(fmtDate(p.last_meeting_date))+'</td>'
+      +'<td class="num">'+(p.unmatched_meeting_count>0
+          ? '<span class="pill warn">'+esc(p.unmatched_meeting_count)+'</span>' : '—')+'</td>'
+      +'</tr>';
+  });
+  html+='</tbody></table>';
+  $('projects-out').innerHTML=html;
+
+  Array.prototype.forEach.call($('projects-out').querySelectorAll('tr.click'),function(tr){
+    tr.onclick=function(){ openProject(Number(tr.getAttribute('data-pid'))); };
+  });
+}
+
+async function loadProjects(fresh){
+  try{
+    var r = await api('/tracker?scope='+SCOPE+(fresh?'&fresh=1':''));
+    PROJECTS = r.data||[];
+    TOTALS   = (r.meta&&r.meta.totals)||{};
+    SETTINGS = (r.meta&&r.meta.settings)||{};
+    renderKpis();
+    renderProjects();
+    var s=(r.meta&&r.meta.sync)||{};
+    $('sync').innerHTML='Vendor data '+esc(ago(s.roster_loaded_at))
+      +'<br>'+esc(s.prep_meeting_count||0)+' prep meetings loaded';
+  }catch(e){
+    $('projects-out').innerHTML=errNote(e.message);
+    $('kpis').innerHTML='';
+  }
+}
+
+/* ── project drilldown ─────────────────────────────────── */
+function evidenceLine(v){
+  if(v.override_status){
+    return 'Set to <b>'+esc(v.override_status.replace('_',' '))+'</b> by '
+      +esc(v.override_by||'an admin')
+      +(v.override_note?' — “'+esc(v.override_note)+'”':'');
+  }
+  if(v.status==='held'){
+    var how = v.match_method==='attendee'
+      ? 'Matched on the attendee list'+(v.matched_attendee_name?' ('+esc(v.matched_attendee_name)
+          +(v.attendance_status?', '+esc(v.attendance_status):'')+')':'')
+      : 'Matched on the meeting title only — nobody from this vendor was added to the attendee list';
+    return how+' · <b>'+esc(v.meeting_title||'meeting')+'</b> · '+esc(fmtDate(v.meeting_date))
+      +(v.meeting_count>1?' · '+esc(v.meeting_count)+' matching meetings':'');
+  }
+  return 'No preparatory meeting found for this vendor.';
+}
+
+function vendorRow(v){
+  var cls=v.status;
+  var pill = v.status==='held' ? '<span class="pill held">Held</span>'
+           : v.status==='not_applicable' ? '<span class="pill na">N/A</span>'
+           : '<span class="pill notheld">Not held</span>';
+  var tags='';
+  if(v.is_manual) tags+=' <span class="pill manual">Added manually</span>';
+  else if(v.from_commitment && !v.from_directory) tags+=' <span class="pill info">Commitment</span>';
+  else if(v.from_directory && !v.from_commitment) tags+=' <span class="pill info">Directory</span>';
+  if(v.status==='held' && v.match_method==='title' && !v.override_status){
+    tags+=' <span class="pill warn">Title match</span>';
+  }
+
+  var acts='';
+  if(ADMIN){
+    var vn=encodeURIComponent(v.vendor_normalized);
+    if(v.override_status){
+      acts+='<button class="mini" data-act="clear" data-v="'+vn+'">Undo override</button>';
+    }else{
+      if(v.status!=='held')  acts+='<button class="mini ok" data-act="held" data-v="'+vn+'">Mark held</button>';
+      if(v.status==='held')  acts+='<button class="mini no" data-act="not_held" data-v="'+vn+'">Not held</button>';
+      acts+='<button class="mini" data-act="not_applicable" data-v="'+vn+'">N/A</button>';
+    }
+  }
+
+  return '<div class="vrow '+esc(cls)+'">'
+    +'<div class="body"><div class="vn">'+esc(v.vendor_name||v.vendor_normalized)+' '+pill+tags+'</div>'
+      +(v.trade_name?'<div class="ev">'+esc(v.trade_name)+'</div>':'')
+      +'<div class="ev">'+evidenceLine(v)+'</div></div>'
+    +(acts?'<div class="acts">'+acts+'</div>':'')
+    +'</div>';
+}
+
+async function openProject(pid){
+  CURRENT=pid;
+  $('modal').innerHTML='<div class="modal-hd"><h2>Loading…</h2></div>';
+  $('overlay').classList.add('on');
+  try{
+    var r = await api('/projects/'+pid+'?fresh=1');
+    var p = (r.meta&&r.meta.project)||{}, s=(r.meta&&r.meta.summary)||{};
+    var vendors = r.data||[];
+    var unmatched = (r.meta&&r.meta.unmatched)||[];
+    var meetings  = (r.meta&&r.meta.meetings)||[];
+
+    var out=[], held=[], na=[];
+    vendors.forEach(function(v){
+      (v.status==='not_held'?out:v.status==='held'?held:na).push(v);
+    });
+
+    var body='';
+    if(!vendors.length){
+      body+='<div class="note warn">No vendors are on this project\'s checklist. Either Procore '
+        +'has no commitments or directory companies for the job, or the current <b>vendor source</b> '
+        +'setting is filtering them all out. Check Settings, or add a vendor manually.</div>';
+    }
+    if(unmatched.length){
+      body+='<div class="note warn"><b>'+esc(unmatched.length)+' prep meeting'
+        +(unmatched.length>1?'s':'')+' on this job couldn\'t be credited to a vendor.</b> '
+        +'See the Review Queue tab.</div>';
+    }
+
+    if(out.length)  body+='<div class="sec-h">Outstanding — '+out.length+'</div>'+out.map(vendorRow).join('');
+    if(held.length) body+='<div class="sec-h">Prep meeting held — '+held.length+'</div>'+held.map(vendorRow).join('');
+    if(na.length)   body+='<div class="sec-h">Not applicable — '+na.length+'</div>'+na.map(vendorRow).join('');
+
+    if(ADMIN){
+      body+='<div class="sec-h">Add a vendor</div>'
+        +'<div class="note">Use this when a sub is on the job but isn\'t in Procore\'s commitments '
+        +'or project directory yet. It joins this project\'s checklist immediately.</div>'
+        +'<div class="toolbar"><input type="search" id="mv-name" placeholder="Vendor company name…">'
+        +'<button class="hbtn primary" id="mv-add" style="color:#fff">Add to checklist</button></div>';
+    }
+
+    body+='<div class="sec-h">Prep meetings logged — '+meetings.length+'</div>';
+    if(!meetings.length){
+      body+='<div class="empty">No preparatory meetings found in Procore for this project.</div>';
+    }else{
+      body+='<table><thead><tr><th>Meeting</th><th class="num">Date</th>'
+        +'<th class="num">Attendees</th><th class="num">Vendor side</th>'
+        +'<th class="num">Vendors matched</th></tr></thead><tbody>';
+      meetings.forEach(function(m){
+        body+='<tr><td>'+esc(m.title||'—')+'</td>'
+          +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'
+          +'<td class="num">'+esc(m.attendee_count==null?'—':m.attendee_count)+'</td>'
+          +'<td class="num">'+esc(m.vendor_attendee_count==null?'—':m.vendor_attendee_count)+'</td>'
+          +'<td class="num">'+(Number(m.matched_vendor_count||0)===0
+              ? '<span class="pill warn">none</span>' : esc(m.matched_vendor_count))+'</td></tr>';
+      });
+      body+='</tbody></table>';
+    }
+
+    $('modal').innerHTML=
+      '<div class="modal-hd"><div style="flex:1">'
+        +'<h2>'+esc(p.project_name||('Project '+pid))+'</h2>'
+        +'<div class="sub">'+esc(p.project_number||'—')+' · '+esc(p.stage||'No stage')
+        +' · Superintendent: '+esc(p.superintendent_name||p.project_manager||'—')
+        +' · <b style="color:#fff">'+esc(s.vendor_held||0)+' of '+esc(s.vendor_total||0)
+        +'</b> prep meetings held</div></div>'
+        +'<button class="x" id="modal-x">&times;</button></div>'
+      +'<div class="modal-bd">'+body+'</div>';
+
+    $('modal-x').onclick=closeModal;
+    wireVendorActions(pid);
+  }catch(e){
+    $('modal').innerHTML='<div class="modal-hd"><h2>Project '+esc(pid)+'</h2>'
+      +'<div style="flex:1"></div><button class="x" id="modal-x">&times;</button></div>'
+      +'<div class="modal-bd">'+errNote(e.message)+'</div>';
+    $('modal-x').onclick=closeModal;
+  }
+}
+
+function wireVendorActions(pid){
+  Array.prototype.forEach.call($('modal').querySelectorAll('button[data-act]'),function(b){
+    b.onclick=async function(){
+      var act=b.getAttribute('data-act');
+      var vendor=decodeURIComponent(b.getAttribute('data-v'));
+      var note=null;
+      if(act==='held'||act==='not_applicable'){
+        note=window.prompt(act==='held'
+          ? 'Optional note — why is this being marked held? (e.g. "held on site 4/2, not logged in Procore")'
+          : 'Optional note — why does this vendor not need a prep meeting?','');
+        if(note===null) return; // cancelled
+      }
+      b.disabled=true; b.textContent='Saving…';
+      try{
+        await api('/overrides',{
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({project_id:pid, vendor_normalized:vendor,
+                               status:(act==='clear'?'clear':act), note:note})
+        });
+        await openProject(pid);
+        loadProjects(true);
+      }catch(e){
+        alert('Could not save: '+e.message);
+        b.disabled=false;
+      }
+    };
+  });
+
+  var add=$('mv-add');
+  if(add) add.onclick=async function(){
+    var name=($('mv-name').value||'').trim();
+    if(!name){ $('mv-name').focus(); return; }
+    add.disabled=true; add.textContent='Adding…';
+    try{
+      await api('/manual-vendors',{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({project_id:pid, vendor_name:name})
+      });
+      await openProject(pid);
+      loadProjects(true);
+    }catch(e){
+      alert('Could not add: '+e.message);
+      add.disabled=false; add.textContent='Add to checklist';
+    }
+  };
+}
+
+function closeModal(){ $('overlay').classList.remove('on'); CURRENT=null; }
+
+/* ── review queue ──────────────────────────────────────── */
+async function loadReview(){
+  try{
+    var r = await api('/unmatched-meetings?scope='+SCOPE);
+    REVIEW = r.data||[];
+    var b=$('badge-review');
+    if(REVIEW.length){ b.textContent=REVIEW.length; b.style.display=''; } else { b.style.display='none'; }
+
+    if(!REVIEW.length){
+      $('review-out').innerHTML='<div class="empty">Every prep meeting is credited to a vendor. '
+        +'Nothing to review.</div>';
+      return;
+    }
+    var h='<table><thead><tr><th>Project</th><th>Meeting title</th><th class="num">Date</th>'
+      +'<th class="num">Attendees</th><th class="num">Vendor-side attendees</th></tr></thead><tbody>';
+    REVIEW.forEach(function(m){
+      h+='<tr class="click" data-pid="'+esc(m.project_id)+'">'
+        +'<td class="pname">'+esc(m.project_name||m.project_id)+'</td>'
+        +'<td>'+esc(m.title||'—')+'</td>'
+        +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'
+        +'<td class="num">'+esc(m.attendee_count==null?'—':m.attendee_count)+'</td>'
+        +'<td class="num">'+(Number(m.vendor_attendee_count||0)===0
+            ? '<span class="pill warn">0</span>' : esc(m.vendor_attendee_count))+'</td></tr>';
+    });
+    h+='</tbody></table>';
+    $('review-out').innerHTML=h;
+    Array.prototype.forEach.call($('review-out').querySelectorAll('tr.click'),function(tr){
+      tr.onclick=function(){ openProject(Number(tr.getAttribute('data-pid'))); };
+    });
+  }catch(e){
+    $('review-out').innerHTML=errNote(e.message);
+  }
+}
+
+/* ── settings ──────────────────────────────────────────── */
+function radio(name,value,current,label,hint){
+  return '<div class="opt"><input type="radio" name="'+name+'" id="'+name+'-'+value+'" value="'+value+'"'
+    +(String(current)===String(value)?' checked':'')+(ADMIN?'':' disabled')+'>'
+    +'<label for="'+name+'-'+value+'">'+esc(label)+'<div class="hint">'+hint+'</div></label></div>';
+}
+
+async function loadSettings(){
+  try{
+    var r = await api('/settings');
+    SETTINGS = r.data||{};
+    COVERAGE = (r.meta&&r.meta.coverage)||{};
+    var c=COVERAGE;
+
+    var coverageNote='';
+    if(c.projects_with_any!=null){
+      coverageNote='<div class="note"><b>What Procore actually has, across active projects.</b><br>'
+        +'Commitments (subcontracts + purchase orders) cover <b>'+esc(c.projects_with_commitments||0)
+        +'</b> projects and '+esc(c.vendor_rows_commitment||0)+' vendor rows.<br>'
+        +'The project directory covers <b>'+esc(c.projects_with_directory||0)+'</b> projects and '
+        +esc(c.vendor_rows_directory||0)+' vendor rows.<br>'
+        +'Whichever covers more projects is the one your teams keep current — pick that one below. '
+        +'The directory usually carries more rows because it also holds the owner, architect and '
+        +'inspectors, who never need a prep meeting.</div>';
+    }
+
+    var h=coverageNote
+      +'<div class="fieldset"><h3>Which vendors belong on the checklist</h3>'
+      +'<p>The denominator every project\'s percentage is measured against.</p>'
+      +radio('vendorSource','either',SETTINGS.vendorSource,'Both sources (widest)',
+          'Every company from either Procore list. Nothing gets missed, but companies that never '
+          +'need a prep meeting show up as outstanding until someone marks them N/A.')
+      +radio('vendorSource','commitment',SETTINGS.vendorSource,'Commitments only',
+          'Companies with a subcontract or purchase order on the job. Closest to "vendors doing '
+          +'work" — but only correct if every sub\'s contract is written in Procore.')
+      +radio('vendorSource','directory',SETTINGS.vendorSource,'Project directory only',
+          'Every company in the project directory. Complete, but includes the owner, architect '
+          +'and inspectors.')
+      +'</div>'
+
+      +'<div class="fieldset"><h3>What counts as the meeting having happened</h3>'
+      +'<p>How a vendor gets tied to a preparatory meeting.</p>'
+      +'<div class="opt"><input type="checkbox" id="allowTitleMatch"'
+        +(Number(SETTINGS.allowTitleMatch)?' checked':'')+(ADMIN?'':' disabled')+'>'
+        +'<label for="allowTitleMatch">Accept a meeting-title match'
+        +'<div class="hint">Counts “Preparatory Meeting - ZIP” for the vendor ZIP even when nobody '
+        +'from ZIP was added to the attendee list. This is how your teams actually name these '
+        +'meetings — turning it off will drop most historical matches.</div></label></div>'
+      +'<div class="opt"><input type="checkbox" id="requireVendorPresent"'
+        +(Number(SETTINGS.requireVendorPresent)?' checked':'')+(ADMIN?'':' disabled')+'>'
+        +'<label for="requireVendorPresent">Require the vendor to be marked Present'
+        +'<div class="hint">Ignores an attendee set to “For Distribution Only”. Stricter and more '
+        +'truthful — but only switch this on once you\'ve confirmed the Present / Absent / '
+        +'Distribution buttons are being filled in reliably, or real meetings will start reading '
+        +'as missed. Does not affect title matches.</div></label></div>'
+      +'<div class="opt"><input type="checkbox" id="requireMeetingHeld"'
+        +(Number(SETTINGS.requireMeetingHeld)?' checked':'')+(ADMIN?'':' disabled')+'>'
+        +'<label for="requireMeetingHeld">Require Procore\'s “held” flag'
+        +'<div class="hint">Only counts meetings explicitly marked held in Procore. That flag is '
+        +'rarely flipped, so expect most rows to go to “not held” if you enable this.</div></label></div>'
+      +'</div>';
+
+    if(ADMIN){
+      h+='<button class="hbtn primary" id="save-settings" style="color:#fff">Save settings</button>'
+        +' <span id="save-msg" style="font-size:12px;color:var(--muted)"></span>';
+    }else{
+      h+='<div class="note">You\'re signed in as a viewer. Settings and overrides are '
+        +'restricted to tracker admins.</div>';
+    }
+
+    $('settings-out').innerHTML=h;
+
+    var btn=$('save-settings');
+    if(btn) btn.onclick=async function(){
+      btn.disabled=true; $('save-msg').textContent='Saving…';
+      try{
+        var sel=document.querySelector('input[name="vendorSource"]:checked');
+        await api('/settings',{
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({
+            vendorSource: sel?sel.value:SETTINGS.vendorSource,
+            allowTitleMatch: $('allowTitleMatch').checked?1:0,
+            requireVendorPresent: $('requireVendorPresent').checked?1:0,
+            requireMeetingHeld: $('requireMeetingHeld').checked?1:0
+          })
+        });
+        $('save-msg').textContent='Saved — reloading the tracker.';
+        await loadProjects(true);
+        await loadReview();
+      }catch(e){
+        $('save-msg').textContent='Failed: '+e.message;
+      }
+      btn.disabled=false;
+    };
+  }catch(e){
+    $('settings-out').innerHTML=errNote(e.message);
+  }
+}
+
+/* ── wiring ────────────────────────────────────────────── */
+function showTab(name){
+  Array.prototype.forEach.call(document.querySelectorAll('nav.tabs button'),function(b){
+    b.classList.toggle('on', b.getAttribute('data-tab')===name);
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.panel'),function(p){
+    p.classList.toggle('on', p.id==='panel-'+name);
+  });
+  if(name==='settings') loadSettings();
+}
+
+document.addEventListener('click',function(e){
+  var t=e.target;
+  if(t.matches && t.matches('nav.tabs button[data-tab]')) showTab(t.getAttribute('data-tab'));
+  if(t.matches && t.matches('.chip[data-filter]')){
+    FILTER=t.getAttribute('data-filter');
+    Array.prototype.forEach.call(document.querySelectorAll('.chip[data-filter]'),function(c){
+      c.classList.toggle('on', c===t);
+    });
+    renderProjects();
+  }
+});
+$('overlay').onclick=function(e){ if(e.target===$('overlay')) closeModal(); };
+document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeModal(); });
+$('q').oninput=renderProjects;
+$('scope').onchange=function(){ SCOPE=$('scope').value; loadProjects(true); loadReview(); };
+$('btn-refresh').onclick=function(){ loadProjects(true); loadReview(); };
+$('btn-settings').onclick=function(){ showTab('settings'); };
+
+(async function init(){
+  try{
+    var me = await api('/me');
+    ADMIN = !!(me.data && me.data.is_admin);
+  }catch(e){ ADMIN=false; }
+  if(ADMIN){ $('btn-settings').style.display=''; }
+  $('tab-settings').style.display='';
+  await loadProjects(false);
+  await loadReview();
+})();
+})();
+</script>
+</body>
+</html>
