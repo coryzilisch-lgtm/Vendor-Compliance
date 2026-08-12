@@ -16,8 +16,12 @@
 # the ingest — we don't yet know which Procore tool BCI keeps current, and the
 # COVERAGE DIAGNOSTIC printed at the end answers that empirically.
 #
-# Self-contained + throttled. Reuses the main ingestion cell's auth when present;
-# otherwise bootstraps from Key Vault.
+# FULLY STANDALONE. Belongs in its OWN notebook — it mints its own Procore token
+# from Key Vault and fetches its own project list, so it does not depend on the
+# main Procore ingestion notebook having run. (If it IS pasted into a notebook
+# where that cell already ran, it reuses that token manager instead of minting a
+# second one.) Keeping it separate means a vendor-tracker failure can never take
+# down the safety dashboard's nightly run, and vice versa.
 #
 # Writes:
 #   bronze_vendor_meeting_summaries      bronze_vendor_meeting_details
@@ -26,8 +30,7 @@
 #   silver_vendor_prep_meetings          silver_vendor_prep_attendees
 #   silver_vendor_roster
 #
-# Run AFTER main_ingestion.py (for the project list + token manager). Then run
-# build_vendor_gold.py, then the mirror pipeline.
+# Cell 1 of 2. Cell 2 is build_vendor_gold.py. Then run the mirror pipeline.
 # ============================================================
 
 import json

@@ -31,11 +31,28 @@ as the other dashboards" true by construction rather than by a second definition
 
 ---
 
-## 1. Run the ingest (Fabric notebook)
+## 1. Run the ingest (its own new Fabric notebook)
 
-Paste `fabric/ingest_vendor_compliance.py` into a cell in the same notebook as the Procore
-ingestion cells. Run **`main_ingestion.py` first** — this cell reuses its auto-refreshing token
-manager when present, and bootstraps its own from Key Vault when not.
+**Create a NEW notebook — don't add cells to the existing Procore notebooks.** Suggested name:
+**`Vendor Compliance - Prep Meetings`**. Attach it to the same Lakehouse the other Procore
+notebooks use, so the mirror pipeline's source tables sit where you'd expect them.
+
+Two cells:
+
+| Cell | Source file |
+|---|---|
+| 1 | `fabric/ingest_vendor_compliance.py` |
+| 2 | `fabric/build_vendor_gold.py` |
+
+**This notebook is fully standalone.** It mints its own Procore token from Key Vault
+(`procore-client-id` / `-secret` / `-company-id`) and fetches its own project list, so it does
+**not** require `main_ingestion.py` or any other notebook to have run first. Keeping it separate
+means a vendor-tracker failure can't take down the safety dashboard's nightly run, and vice versa.
+
+The one thing it *does* rely on is `dbo.projects` in the Safety-Dash SQL DB being populated — that
+comes from the existing **Procore Nightly incremental** → **mirror-procore-to-safety** chain, which
+already runs. Nothing to do; just be aware that a brand-new project won't appear in the tracker
+until that chain has seen it.
 
 First run: leave the defaults. It pulls meetings, commitments and directory vendors for every
 project dated on/after `PROJECTS_SINCE` (2024-01-01).
@@ -59,7 +76,7 @@ project-level merge.
 
 ## 2. Build gold
 
-Paste and run `fabric/build_vendor_gold.py`. Builds four tables and prints the match breakdown.
+Run cell 2 (`fabric/build_vendor_gold.py`). Builds four tables and prints the match breakdown.
 
 Pay attention to two of its diagnostics:
 
@@ -159,11 +176,18 @@ wipe every override on the next nightly run.
 
 ## Nightly operating order
 
-1. `main_ingestion.py` (Procore projects — shared with the other dashboards)
-2. `ingest_vendor_compliance.py`
-3. `build_vendor_gold.py`
-4. pipeline `mirror-vendor-to-sql`
-5. The API auto-deploys on push; hard-refresh the dashboard after a UI change.
+The `Vendor Compliance - Prep Meetings` notebook runs **independently** of the Procore/Safety
+chain — no ordering dependency between them, so schedule it wherever it fits in the off-hours
+window:
+
+1. `Vendor Compliance - Prep Meetings` — cell 1 (ingest), cell 2 (gold)
+2. pipeline `mirror-vendor-to-sql`
+3. The API auto-deploys on push; hard-refresh the dashboard after a UI change.
+
+Run it after the existing **Procore Nightly incremental** / **mirror-procore-to-safety** chain only
+so a newly-added project reaches `dbo.projects` before the tracker looks for it — roughly 2:15 AM
+if that chain starts at 2:00. Capacity is shared with the Safety Dashboard, the intranet and the
+Permit hub, so keep everything out of business hours.
 
 **Notebook cell drift:** edits to `fabric/*.py` in this repo do **not** reach your pasted notebook
 cells. Re-paste after pulling changes.
