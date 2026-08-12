@@ -1,0 +1,731 @@
+import { db } from './client.js';
+
+/* ============================================================================
+ * ACTIVE PROJECTS
+ *
+ * These rules are a deliberate, verbatim port of Safety-Dash's
+ * api/src/db/queries.ts. The tracker reads the SAME dbo.projects table in the
+ * SAME Fabric SQL DB, so "the active projects we identify in the other
+ * dashboards" is enforced by using the same predicate against the same rows —
+ * not by a second definition that drifts a release later.
+ *
+ * ⚠️ If Safety-Dash changes its stage rules, change them here too. The two lists
+ * below are the whole definition.
+ * ==========================================================================*/
+
+let projectMetaProbed = false;
+let projectsHasIsActive = false;
+let hasSuperTables = false;
+
+/**
+ * The mirror pipeline AUTO-CREATES dbo.projects, so its column set follows
+ * whichever build_gold ran last. Naming a column that isn't there is a SQL
+ * *parse* error, which fails the whole query and blanks the dashboard — so
+ * probe once and degrade instead of assuming.
+ *
+ * Also probes for the superintendent tables. Note that dbo.projects does NOT
+ * carry a superintendent name (it has project_manager, not superintendent) —
+ * the mapping lives in dbo.project_superintendents joined to dbo.superintendents.
+ * Those are Safety-Dash's tables in this shared DB; if that pipeline hasn't run,
+ * the tracker still works and just shows no superintendent.
+ */
+export async function ensureProjectColumnMeta(): Promise<void> {
+  if (projectMetaProbed) return;
+  try {
+    const { rows } = await db.query<{ has_active: number | null; has_super: number | null }>(
+      `SELECT COL_LENGTH('dbo.projects','is_active')                  AS has_active,
+              OBJECT_ID('dbo.project_superintendents','U')            AS has_super`,
+    );
+    projectsHasIsActive = rows[0]?.has_active != null;
+    hasSuperTables = rows[0]?.has_super != null;
+  } catch {
+    projectsHasIsActive = false;
+    hasSuperTables = false;
+  }
+  if (hasSuperTables) {
+    try {
+      const { rows } = await db.query<{ has_names: number | null }>(
+        `SELECT OBJECT_ID('dbo.superintendents','U') AS has_names`,
+      );
+      hasSuperTables = rows[0]?.has_names != null;
+    } catch {
+      hasSuperTables = false;
+    }
+  }
+  projectMetaProbed = true;
+}
+
+/**
+ * Superintendent name for a project, as a scalar subquery so a project with two
+ * supers can never fan the row out. Degrades to NULL when Safety-Dash's tables
+ * aren't present. Requires ensureProjectColumnMeta() first.
+ */
+function superintendentNameExpr(alias = 'p'): string {
+  if (!hasSuperTables) return `CAST(NULL AS NVARCHAR(256))`;
+  return `(SELECT TOP 1 s.name
+             FROM dbo.project_superintendents ps
+             JOIN dbo.superintendents s ON s.id = ps.superintendent_id
+            WHERE ps.project_id = ${alias}.id
+            ORDER BY s.name)`;
+}
+
+/**
+ * True when Procore marks the project Inactive. CAST first, THEN COALESCE — the
+ * reverse order makes SQL Server pick INT type precedence and blow up converting
+ * 'true'/'false' if the mirror typed the column NVARCHAR instead of BIT.
+ */
+function inactiveProject(alias = 'p'): string {
+  return `LOWER(COALESCE(CAST(${alias}.is_active AS NVARCHAR(10)), '1')) IN ('0','false')`;
+}
+
+/**
+ * Stage strings that contain the word "construction" but are NOT live
+ * course-of-construction work. Every one is a trap for a naive
+ * `LIKE '%construction%'`: "Awarded Preconstruction" (no hyphen),
+ * "Construction Hold" (paused mid-flight), "Post Construction" (already done).
+ */
+const NOT_COURSE_OF_CONSTRUCTION = [
+  '%pre-construction%', '%preconstruction%', '%pre construction%',
+  '%post-construction%', '%postconstruction%', '%post construction%',
+  '%hold%',
+  '%closeout%', '%close out%', '%complete%',
+];
+
+/** Active course-of-construction projects only. Requires ensureProjectColumnMeta(). */
+export function activeStageFilter(alias = 'p'): string {
+  const s = `LOWER(COALESCE(${alias}.stage, ''))`;
+  const base = `${s} LIKE '%construction%'
+      AND ${NOT_COURSE_OF_CONSTRUCTION.map((p) => `${s} NOT LIKE '${p}'`).join('\n      AND ')}`;
+  return projectsHasIsActive ? `${base}\n      AND NOT (${inactiveProject(alias)})` : base;
+}
+
+/* ============================================================================
+ * SETTINGS
+ *
+ * Applied LIVE at query time, never baked into gold — flipping one of these is
+ * a checkbox in the dashboard, not a notebook + pipeline run.
+ * ==========================================================================*/
+
+export type VendorSource = 'commitment' | 'directory' | 'either';
+
+export type Settings = {
+  /** Which Procore roster defines "every vendor on the project".
+   *  Default 'either' (the union) on purpose: it is the only value that cannot
+   *  silently HIDE a vendor. Run the coverage diagnostic at the bottom of
+   *  ingest_vendor_compliance.py, then narrow this to whichever source BCI
+   *  actually keeps current. */
+  vendorSource: VendorSource;
+  /** Require the vendor's attendee to be marked Present/Conference rather than
+   *  merely listed. Default OFF: the Present / Absent / For Distribution Only
+   *  radio group is frequently left at its default in the field, so switching
+   *  this on before checking the data will under-count real meetings.
+   *  Applies to attendee matches only — a title match carries no attendance. */
+  requireVendorPresent: 0 | 1;
+  /** Count a meeting whose title names the vendor even when the vendor was never
+   *  added to the attendee list. Default ON — that is how BCI labels these
+   *  meetings, and turning it off drops most historical matches. */
+  allowTitleMatch: 0 | 1;
+  /** Require Procore's `held` flag. Default OFF: the flag is rarely flipped, so
+   *  requiring it makes almost everything read "not held". */
+  requireMeetingHeld: 0 | 1;
+};
+
+export const DEFAULT_SETTINGS: Settings = {
+  vendorSource: 'either',
+  requireVendorPresent: 0,
+  allowTitleMatch: 1,
+  requireMeetingHeld: 0,
+};
+
+let settingsTableReady = false;
+
+async function ensureSettingsTable(): Promise<void> {
+  if (settingsTableReady) return;
+  await db.query(`
+    IF OBJECT_ID('dbo.vendor_settings','U') IS NULL
+    CREATE TABLE dbo.vendor_settings (
+      setting_key   NVARCHAR(64)  NOT NULL PRIMARY KEY,
+      setting_value NVARCHAR(256) NULL,
+      updated_by    NVARCHAR(256) NULL,
+      updated_at    DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+    );`);
+  settingsTableReady = true;
+}
+
+function coerceSettings(raw: Record<string, string | null>): Settings {
+  const bit = (k: keyof Settings): 0 | 1 => {
+    const v = raw[k];
+    if (v === '0') return 0;
+    if (v === '1') return 1;
+    return DEFAULT_SETTINGS[k] as 0 | 1;
+  };
+  const src = raw.vendorSource;
+  const vendorSource: VendorSource =
+    src === 'commitment' || src === 'directory' || src === 'either'
+      ? src
+      : DEFAULT_SETTINGS.vendorSource;
+  return {
+    vendorSource,
+    requireVendorPresent: bit('requireVendorPresent'),
+    allowTitleMatch: bit('allowTitleMatch'),
+    requireMeetingHeld: bit('requireMeetingHeld'),
+  };
+}
+
+export async function getSettings(): Promise<Settings> {
+  await ensureSettingsTable();
+  const { rows } = await db.query<{ setting_key: string; setting_value: string | null }>(
+    `SELECT setting_key, setting_value FROM dbo.vendor_settings`,
+  );
+  const raw: Record<string, string | null> = {};
+  for (const r of rows) raw[r.setting_key] = r.setting_value;
+  return coerceSettings(raw);
+}
+
+export async function saveSettings(
+  patch: Partial<Record<keyof Settings, unknown>>,
+  actor: string,
+): Promise<Settings> {
+  await ensureSettingsTable();
+  // Validate before writing so a bad value can never reach the query builder,
+  // which interpolates these into SQL.
+  const allowed: Record<string, (v: unknown) => string | null> = {
+    vendorSource: (v) =>
+      v === 'commitment' || v === 'directory' || v === 'either' ? String(v) : null,
+    requireVendorPresent: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
+    allowTitleMatch: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
+    requireMeetingHeld: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
+  };
+  for (const [key, value] of Object.entries(patch)) {
+    const validate = allowed[key];
+    if (!validate) continue;
+    const clean = validate(value);
+    if (clean === null) continue;
+    await db.query(
+      `MERGE dbo.vendor_settings AS t
+       USING (SELECT @k AS setting_key) AS s ON t.setting_key = s.setting_key
+       WHEN MATCHED THEN UPDATE SET setting_value = @v, updated_by = @actor, updated_at = SYSUTCDATETIME()
+       WHEN NOT MATCHED THEN INSERT (setting_key, setting_value, updated_by)
+            VALUES (@k, @v, @actor);`,
+      { k: key, v: clean, actor },
+    );
+  }
+  return getSettings();
+}
+
+/* ============================================================================
+ * ADMIN-MANAGED TABLES (auto-created, never mirrored from gold)
+ * ==========================================================================*/
+
+let adminTablesReady = false;
+
+async function ensureAdminTables(): Promise<void> {
+  if (adminTablesReady) return;
+
+  // Per-vendor override of the computed answer.
+  //   'held'           the meeting happened but Procore doesn't show it
+  //   'not_held'       dismiss a match the matcher got wrong
+  //   'not_applicable' this company never needs a prep meeting on this job
+  //                    (the owner, an inspector, a materials supplier) — removed
+  //                    from the denominator rather than counted as outstanding
+  await db.query(`
+    IF OBJECT_ID('dbo.vendor_prep_overrides','U') IS NULL
+    CREATE TABLE dbo.vendor_prep_overrides (
+      id                BIGINT IDENTITY(1,1) PRIMARY KEY,
+      project_id        BIGINT        NOT NULL,
+      vendor_normalized NVARCHAR(256) NOT NULL,
+      status            NVARCHAR(32)  NOT NULL,
+      meeting_date      DATE          NULL,
+      note              NVARCHAR(1000) NULL,
+      created_by        NVARCHAR(256) NULL,
+      created_at        DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+    );`);
+  await db.query(`
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes
+                   WHERE name = 'UX_vendor_prep_overrides'
+                     AND object_id = OBJECT_ID('dbo.vendor_prep_overrides'))
+    CREATE UNIQUE INDEX UX_vendor_prep_overrides
+        ON dbo.vendor_prep_overrides (project_id, vendor_normalized);`);
+
+  // Vendors that belong on the checklist but aren't in either Procore roster —
+  // the escape hatch for a sub working under someone else's contract, or one
+  // added to the job before the paperwork caught up.
+  await db.query(`
+    IF OBJECT_ID('dbo.vendor_manual_roster','U') IS NULL
+    CREATE TABLE dbo.vendor_manual_roster (
+      id                BIGINT IDENTITY(1,1) PRIMARY KEY,
+      project_id        BIGINT        NOT NULL,
+      vendor_normalized NVARCHAR(256) NOT NULL,
+      vendor_name       NVARCHAR(256) NOT NULL,
+      trade_name        NVARCHAR(256) NULL,
+      note              NVARCHAR(1000) NULL,
+      created_by        NVARCHAR(256) NULL,
+      created_at        DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+    );`);
+  await db.query(`
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes
+                   WHERE name = 'UX_vendor_manual_roster'
+                     AND object_id = OBJECT_ID('dbo.vendor_manual_roster'))
+    CREATE UNIQUE INDEX UX_vendor_manual_roster
+        ON dbo.vendor_manual_roster (project_id, vendor_normalized);`);
+
+  adminTablesReady = true;
+}
+
+/* ============================================================================
+ * THE RESOLUTION QUERY
+ *
+ * Builds the vendor checklist live from:
+ *   dbo.vendor_roster        (+ dbo.vendor_manual_roster)   the denominator
+ *   dbo.vendor_prep_matches                                  the candidate matches
+ *   dbo.vendor_prep_overrides                                the human's last word
+ * with the settings above deciding which matches count.
+ * ==========================================================================*/
+
+/** Which roster rows form the denominator, per the vendorSource setting. */
+function vendorSourcePredicate(s: Settings, alias = 'r'): string {
+  switch (s.vendorSource) {
+    case 'commitment':
+      return `CAST(${alias}.from_commitment AS NVARCHAR(10)) IN ('1','true','True')`;
+    case 'directory':
+      return `CAST(${alias}.from_directory AS NVARCHAR(10)) IN ('1','true','True')`;
+    default:
+      return '1 = 1';
+  }
+}
+
+/** Which match rows count, per the settings. */
+function matchPredicate(s: Settings, alias = 'm'): string {
+  const parts: string[] = [];
+  if (!s.allowTitleMatch) parts.push(`${alias}.match_method = 'attendee'`);
+  if (s.requireVendorPresent) {
+    // Attendance is only knowable for attendee matches; a title match has no
+    // attendee row to inspect, so it passes this gate on its own merits.
+    parts.push(
+      `(${alias}.match_method <> 'attendee'
+        OR CAST(${alias}.attendee_attended AS NVARCHAR(10)) IN ('1','true','True'))`,
+    );
+  }
+  if (s.requireMeetingHeld) {
+    parts.push(`CAST(${alias}.held AS NVARCHAR(10)) IN ('1','true','True')`);
+  }
+  return parts.length ? parts.join('\n        AND ') : '1 = 1';
+}
+
+/**
+ * The shared CTE block: the resolved vendor checklist for whichever projects the
+ * caller's `projectFilter` selects. Emits one row per (project, vendor) with the
+ * final status and the evidence behind it.
+ */
+function vendorStatusCTEs(s: Settings, projectFilter: string): string {
+  return `
+  proj AS (
+      SELECT p.id AS project_id, p.name AS project_name, p.stage,
+             p.project_number, p.project_manager,
+             ${superintendentNameExpr('p')} AS superintendent_name
+      FROM dbo.projects p
+      WHERE ${projectFilter}
+  ),
+  roster AS (
+      SELECT r.project_id,
+             r.vendor_normalized,
+             MAX(r.vendor_name)  AS vendor_name,
+             MAX(r.trade_name)   AS trade_name,
+             MAX(CASE WHEN CAST(r.from_commitment AS NVARCHAR(10)) IN ('1','true','True')
+                      THEN 1 ELSE 0 END) AS from_commitment,
+             MAX(CASE WHEN CAST(r.from_directory AS NVARCHAR(10)) IN ('1','true','True')
+                      THEN 1 ELSE 0 END) AS from_directory,
+             0 AS is_manual
+      FROM dbo.vendor_roster r
+      JOIN proj ON proj.project_id = r.project_id
+      WHERE CAST(r.is_excluded_vendor AS NVARCHAR(10)) NOT IN ('1','true','True')
+        AND (${vendorSourcePredicate(s, 'r')})
+      GROUP BY r.project_id, r.vendor_normalized
+
+      UNION ALL
+
+      SELECT mr.project_id, mr.vendor_normalized, MAX(mr.vendor_name), MAX(mr.trade_name),
+             0, 0, 1
+      FROM dbo.vendor_manual_roster mr
+      JOIN proj ON proj.project_id = mr.project_id
+      GROUP BY mr.project_id, mr.vendor_normalized
+  ),
+  -- A manually added vendor and a Procore one can collide on the same key; keep
+  -- one row and remember it was manual.
+  roster_dedup AS (
+      SELECT project_id, vendor_normalized,
+             MAX(vendor_name)     AS vendor_name,
+             MAX(trade_name)      AS trade_name,
+             MAX(from_commitment) AS from_commitment,
+             MAX(from_directory)  AS from_directory,
+             MAX(is_manual)       AS is_manual
+      FROM roster
+      GROUP BY project_id, vendor_normalized
+  ),
+  eligible AS (
+      SELECT m.*
+      FROM dbo.vendor_prep_matches m
+      JOIN proj ON proj.project_id = m.project_id
+      WHERE ${matchPredicate(s, 'm')}
+  ),
+  -- Best evidence per vendor: an attendee match outranks a title match, then the
+  -- EARLIEST meeting wins — a preparatory meeting is held before the vendor
+  -- starts work, so the first one is the one that satisfies the requirement.
+  best AS (
+      SELECT e.project_id, e.vendor_normalized, e.meeting_id, e.meeting_title,
+             e.meeting_date, e.match_method, e.matched_attendee_name, e.attendance_status,
+             ROW_NUMBER() OVER (
+               PARTITION BY e.project_id, e.vendor_normalized
+               ORDER BY CASE WHEN e.match_method = 'attendee' THEN 0 ELSE 1 END,
+                        e.meeting_date ASC, e.meeting_id ASC) AS rn
+      FROM eligible e
+  ),
+  evidence AS (
+      SELECT project_id, vendor_normalized,
+             COUNT(DISTINCT meeting_id) AS meeting_count,
+             MAX(CASE WHEN match_method = 'attendee' THEN 1 ELSE 0 END) AS has_attendee_match,
+             MAX(CASE WHEN match_method = 'title'    THEN 1 ELSE 0 END) AS has_title_match
+      FROM eligible
+      GROUP BY project_id, vendor_normalized
+  ),
+  resolved AS (
+      SELECT
+          rd.project_id,
+          rd.vendor_normalized,
+          rd.vendor_name,
+          rd.trade_name,
+          rd.from_commitment,
+          rd.from_directory,
+          rd.is_manual,
+          b.meeting_id,
+          b.meeting_title,
+          b.meeting_date,
+          b.match_method,
+          b.matched_attendee_name,
+          b.attendance_status,
+          COALESCE(ev.meeting_count, 0)      AS meeting_count,
+          COALESCE(ev.has_attendee_match, 0) AS has_attendee_match,
+          COALESCE(ev.has_title_match, 0)    AS has_title_match,
+          o.status                           AS override_status,
+          o.note                             AS override_note,
+          o.meeting_date                     AS override_meeting_date,
+          o.created_by                       AS override_by,
+          -- The human's answer wins over the matcher's, always.
+          CASE
+            WHEN o.status IN ('held','not_held','not_applicable') THEN o.status
+            WHEN b.meeting_id IS NOT NULL THEN 'held'
+            ELSE 'not_held'
+          END AS status
+      FROM roster_dedup rd
+      LEFT JOIN best b
+             ON b.project_id = rd.project_id
+            AND b.vendor_normalized = rd.vendor_normalized
+            AND b.rn = 1
+      LEFT JOIN evidence ev
+             ON ev.project_id = rd.project_id
+            AND ev.vendor_normalized = rd.vendor_normalized
+      LEFT JOIN dbo.vendor_prep_overrides o
+             ON o.project_id = rd.project_id
+            AND o.vendor_normalized = rd.vendor_normalized
+  )`;
+}
+
+export type ProjectSummary = {
+  project_id: number;
+  project_name: string;
+  project_number: string | null;
+  stage: string | null;
+  project_manager: string | null;
+  superintendent_name: string | null;
+  vendor_total: number;
+  vendor_held: number;
+  vendor_outstanding: number;
+  vendor_not_applicable: number;
+  pct_complete: number | null;
+  last_meeting_date: string | null;
+  prep_meeting_count: number;
+  unmatched_meeting_count: number;
+};
+
+/** One row per active project — the tracker's landing view. */
+export async function getProjectSummaries(scope: 'active' | 'all'): Promise<ProjectSummary[]> {
+  await ensureProjectColumnMeta();
+  await ensureAdminTables();
+  const s = await getSettings();
+  const projectFilter = scope === 'all' ? '1 = 1' : activeStageFilter('p');
+
+  const { rows } = await db.query<ProjectSummary>(`
+    WITH ${vendorStatusCTEs(s, projectFilter)},
+    agg AS (
+        SELECT project_id,
+               SUM(CASE WHEN status <> 'not_applicable' THEN 1 ELSE 0 END) AS vendor_total,
+               SUM(CASE WHEN status = 'held' THEN 1 ELSE 0 END)            AS vendor_held,
+               SUM(CASE WHEN status = 'not_held' THEN 1 ELSE 0 END)        AS vendor_outstanding,
+               SUM(CASE WHEN status = 'not_applicable' THEN 1 ELSE 0 END)  AS vendor_not_applicable,
+               MAX(meeting_date)                                           AS last_meeting_date
+        FROM resolved
+        GROUP BY project_id
+    ),
+    mtg AS (
+        SELECT m.project_id,
+               COUNT(*) AS prep_meeting_count,
+               SUM(CASE WHEN x.meeting_id IS NULL THEN 1 ELSE 0 END) AS unmatched_meeting_count
+        FROM dbo.vendor_prep_meetings m
+        LEFT JOIN (SELECT DISTINCT meeting_id FROM dbo.vendor_prep_matches) x
+               ON x.meeting_id = m.meeting_id
+        GROUP BY m.project_id
+    )
+    SELECT
+        proj.project_id,
+        proj.project_name,
+        proj.project_number,
+        proj.stage,
+        proj.project_manager,
+        proj.superintendent_name,
+        COALESCE(agg.vendor_total, 0)          AS vendor_total,
+        COALESCE(agg.vendor_held, 0)           AS vendor_held,
+        COALESCE(agg.vendor_outstanding, 0)    AS vendor_outstanding,
+        COALESCE(agg.vendor_not_applicable, 0) AS vendor_not_applicable,
+        CASE WHEN COALESCE(agg.vendor_total, 0) = 0 THEN NULL
+             ELSE ROUND(100.0 * agg.vendor_held / agg.vendor_total, 0) END AS pct_complete,
+        CONVERT(VARCHAR(10), agg.last_meeting_date, 23) AS last_meeting_date,
+        COALESCE(mtg.prep_meeting_count, 0)      AS prep_meeting_count,
+        COALESCE(mtg.unmatched_meeting_count, 0) AS unmatched_meeting_count
+    FROM proj
+    LEFT JOIN agg ON agg.project_id = proj.project_id
+    LEFT JOIN mtg ON mtg.project_id = proj.project_id
+    ORDER BY proj.project_name;
+  `);
+  return rows;
+}
+
+export type VendorRow = {
+  project_id: number;
+  vendor_normalized: string;
+  vendor_name: string;
+  trade_name: string | null;
+  from_commitment: number;
+  from_directory: number;
+  is_manual: number;
+  status: string;
+  meeting_id: number | null;
+  meeting_title: string | null;
+  meeting_date: string | null;
+  match_method: string | null;
+  matched_attendee_name: string | null;
+  attendance_status: string | null;
+  meeting_count: number;
+  has_attendee_match: number;
+  has_title_match: number;
+  override_status: string | null;
+  override_note: string | null;
+  override_by: string | null;
+};
+
+/** The full drilldown for one project: checklist + meetings + review queue. */
+export async function getProjectDetail(projectId: number): Promise<{
+  project: Record<string, unknown> | null;
+  vendors: VendorRow[];
+  meetings: Record<string, unknown>[];
+  unmatched: Record<string, unknown>[];
+}> {
+  await ensureProjectColumnMeta();
+  await ensureAdminTables();
+  const s = await getSettings();
+
+  const { rows: vendors } = await db.query<VendorRow>(
+    `
+    WITH ${vendorStatusCTEs(s, 'p.id = @pid')}
+    SELECT
+        project_id, vendor_normalized, vendor_name, trade_name,
+        from_commitment, from_directory, is_manual,
+        status, meeting_id, meeting_title,
+        CONVERT(VARCHAR(10), COALESCE(override_meeting_date, meeting_date), 23) AS meeting_date,
+        match_method, matched_attendee_name, attendance_status,
+        meeting_count, has_attendee_match, has_title_match,
+        override_status, override_note, override_by
+    FROM resolved
+    ORDER BY CASE status WHEN 'not_held' THEN 0 WHEN 'held' THEN 1 ELSE 2 END, vendor_name;
+  `,
+    { pid: projectId },
+  );
+
+  const { rows: project } = await db.query(
+    `SELECT TOP 1 p.id AS project_id, p.name AS project_name, p.project_number,
+            p.stage, p.project_manager,
+            ${superintendentNameExpr('p')} AS superintendent_name
+     FROM dbo.projects p WHERE p.id = @pid`,
+    { pid: projectId },
+  );
+
+  const { rows: meetings } = await db.query(
+    `SELECT m.meeting_id, m.title, CONVERT(VARCHAR(10), m.meeting_date, 23) AS meeting_date,
+            m.held, m.attendee_count, m.vendor_attendee_count, m.vendor_attendees_present,
+            m.series_name, m.location,
+            (SELECT COUNT(DISTINCT x.vendor_normalized) FROM dbo.vendor_prep_matches x
+              WHERE x.meeting_id = m.meeting_id) AS matched_vendor_count
+     FROM dbo.vendor_prep_meetings m
+     WHERE m.project_id = @pid
+     ORDER BY m.meeting_date DESC`,
+    { pid: projectId },
+  );
+
+  const unmatched = (meetings as Record<string, unknown>[]).filter(
+    (m) => Number(m.matched_vendor_count ?? 0) === 0,
+  );
+
+  return { project: project[0] ?? null, vendors, meetings, unmatched };
+}
+
+/**
+ * Prep meetings the matcher could not credit to any vendor. This is the
+ * tracker's honest blind spot — a meeting was held and logged, but nothing ties
+ * it to a company on the roster (usually a meeting titled with a person's name,
+ * or a sub who never made it onto either Procore roster). Surfacing them beats
+ * quietly dropping them.
+ */
+export async function getUnmatchedMeetings(scope: 'active' | 'all'): Promise<Record<string, unknown>[]> {
+  await ensureProjectColumnMeta();
+  const projectFilter = scope === 'all' ? '1 = 1' : activeStageFilter('p');
+  const { rows } = await db.query(`
+    SELECT m.project_id, p.name AS project_name, m.meeting_id, m.title,
+           CONVERT(VARCHAR(10), m.meeting_date, 23) AS meeting_date,
+           m.attendee_count, m.vendor_attendee_count
+    FROM dbo.vendor_prep_meetings m
+    JOIN dbo.projects p ON p.id = m.project_id
+    LEFT JOIN (SELECT DISTINCT meeting_id FROM dbo.vendor_prep_matches) x
+           ON x.meeting_id = m.meeting_id
+    WHERE x.meeting_id IS NULL
+      AND ${projectFilter}
+    ORDER BY m.meeting_date DESC;
+  `);
+  return rows;
+}
+
+/* ============================================================================
+ * WRITES
+ * ==========================================================================*/
+
+export async function saveOverride(
+  projectId: number,
+  vendorNormalized: string,
+  status: 'held' | 'not_held' | 'not_applicable',
+  opts: { note?: string | null; meetingDate?: string | null; actor: string },
+): Promise<void> {
+  await ensureAdminTables();
+  await db.query(
+    `MERGE dbo.vendor_prep_overrides AS t
+     USING (SELECT @pid AS project_id, @vn AS vendor_normalized) AS s
+        ON t.project_id = s.project_id AND t.vendor_normalized = s.vendor_normalized
+     WHEN MATCHED THEN UPDATE SET status = @status, note = @note,
+          meeting_date = TRY_CONVERT(DATE, @mdate), created_by = @actor, created_at = SYSUTCDATETIME()
+     WHEN NOT MATCHED THEN
+          INSERT (project_id, vendor_normalized, status, note, meeting_date, created_by)
+          VALUES (@pid, @vn, @status, @note, TRY_CONVERT(DATE, @mdate), @actor);`,
+    {
+      pid: projectId,
+      vn: vendorNormalized,
+      status,
+      note: opts.note ?? null,
+      mdate: opts.meetingDate ?? null,
+      actor: opts.actor,
+    },
+  );
+}
+
+export async function clearOverride(projectId: number, vendorNormalized: string): Promise<void> {
+  await ensureAdminTables();
+  await db.query(
+    `DELETE FROM dbo.vendor_prep_overrides
+      WHERE project_id = @pid AND vendor_normalized = @vn`,
+    { pid: projectId, vn: vendorNormalized },
+  );
+}
+
+export async function listOverrides(): Promise<Record<string, unknown>[]> {
+  await ensureAdminTables();
+  const { rows } = await db.query(`
+    SELECT o.id, o.project_id, p.name AS project_name, o.vendor_normalized,
+           o.status, o.note, CONVERT(VARCHAR(10), o.meeting_date, 23) AS meeting_date,
+           o.created_by, o.created_at
+    FROM dbo.vendor_prep_overrides o
+    LEFT JOIN dbo.projects p ON p.id = o.project_id
+    ORDER BY o.created_at DESC;`);
+  return rows;
+}
+
+export async function addManualVendor(
+  projectId: number,
+  vendorName: string,
+  vendorNormalized: string,
+  opts: { trade?: string | null; note?: string | null; actor: string },
+): Promise<void> {
+  await ensureAdminTables();
+  await db.query(
+    `MERGE dbo.vendor_manual_roster AS t
+     USING (SELECT @pid AS project_id, @vn AS vendor_normalized) AS s
+        ON t.project_id = s.project_id AND t.vendor_normalized = s.vendor_normalized
+     WHEN MATCHED THEN UPDATE SET vendor_name = @name, trade_name = @trade, note = @note
+     WHEN NOT MATCHED THEN
+          INSERT (project_id, vendor_normalized, vendor_name, trade_name, note, created_by)
+          VALUES (@pid, @vn, @name, @trade, @note, @actor);`,
+    {
+      pid: projectId,
+      vn: vendorNormalized,
+      name: vendorName,
+      trade: opts.trade ?? null,
+      note: opts.note ?? null,
+      actor: opts.actor,
+    },
+  );
+}
+
+export async function removeManualVendor(
+  projectId: number,
+  vendorNormalized: string,
+): Promise<void> {
+  await ensureAdminTables();
+  await db.query(
+    `DELETE FROM dbo.vendor_manual_roster
+      WHERE project_id = @pid AND vendor_normalized = @vn`,
+    { pid: projectId, vn: vendorNormalized },
+  );
+}
+
+/* ============================================================================
+ * MISC
+ * ==========================================================================*/
+
+export async function getSyncStatus(): Promise<Record<string, unknown>> {
+  const { rows } = await db.query(`
+    SELECT
+      (SELECT MAX(_fabric_loaded_at) FROM dbo.vendor_prep_meetings) AS meetings_loaded_at,
+      (SELECT MAX(_fabric_loaded_at) FROM dbo.vendor_roster)        AS roster_loaded_at,
+      (SELECT COUNT(*) FROM dbo.vendor_prep_meetings)               AS prep_meeting_count,
+      (SELECT COUNT(*) FROM dbo.vendor_roster)                      AS roster_row_count;`);
+  return rows[0] ?? {};
+}
+
+/**
+ * Coverage comparison between the two Procore rosters, for the settings screen.
+ * This is the in-app version of the ingest's COVERAGE DIAGNOSTIC and is what
+ * tells an admin which `vendorSource` to pick.
+ */
+export async function getRosterCoverage(): Promise<Record<string, unknown>> {
+  await ensureProjectColumnMeta();
+  const { rows } = await db.query(`
+    SELECT
+      COUNT(DISTINCT CASE WHEN CAST(r.from_commitment AS NVARCHAR(10)) IN ('1','true','True')
+                          THEN r.project_id END) AS projects_with_commitments,
+      COUNT(DISTINCT CASE WHEN CAST(r.from_directory AS NVARCHAR(10)) IN ('1','true','True')
+                          THEN r.project_id END) AS projects_with_directory,
+      SUM(CASE WHEN CAST(r.from_commitment AS NVARCHAR(10)) IN ('1','true','True')
+               THEN 1 ELSE 0 END) AS vendor_rows_commitment,
+      SUM(CASE WHEN CAST(r.from_directory AS NVARCHAR(10)) IN ('1','true','True')
+               THEN 1 ELSE 0 END) AS vendor_rows_directory,
+      COUNT(DISTINCT r.project_id) AS projects_with_any
+    FROM dbo.vendor_roster r
+    JOIN dbo.projects p ON p.id = r.project_id
+    WHERE ${activeStageFilter('p')};`);
+  return rows[0] ?? {};
+}

@@ -1,0 +1,131 @@
+import { HttpRequest, HttpResponseInit } from '@azure/functions';
+
+// ─── Identity & authorization (Entra ID via Static Web Apps) ────────────────
+// SWA terminates Entra sign-in and injects the signed-in user on every request
+// as the base64-JSON `x-ms-client-principal` header. READ access is enforced by
+// the route config in staticwebapp.config.json (allowedRoles: ["authenticated"])
+// before a request reaches the function, so reads only need a signed-in user.
+// WRITE endpoints additionally gate on the admin allowlist below.
+
+/**
+ * The only identities allowed to change tracker state — mark a prep meeting
+ * held, mark a vendor not-applicable, or change the resolution settings.
+ * Matched case-insensitively against the signed-in user's email / UPN.
+ *
+ * Single source of truth: the dashboard reads its admin state from GET /api/me,
+ * it does not keep its own copy. To change who can edit, edit this list and
+ * redeploy.
+ */
+export const ADMIN_EMAILS = new Set<string>([
+  'julia.hoff@buffaloconstruction.com',
+  'justin.houston@buffaloconstruction.com',
+  'robert.burns@buffaloconstruction.com',
+  'matthew.frazier@buffaloconstruction.com',
+  'cory.zilisch@buffaloconstruction.com',
+]);
+
+export type ClientPrincipal = {
+  identityProvider?: string;
+  userId?: string;
+  userDetails?: string;
+  userRoles?: string[];
+  claims?: Array<{ typ?: string; val?: string }>;
+};
+
+export function getClientPrincipal(request: HttpRequest): ClientPrincipal | null {
+  const header = request.headers.get('x-ms-client-principal');
+  if (!header) return null;
+  try {
+    return JSON.parse(Buffer.from(header, 'base64').toString('utf8')) as ClientPrincipal;
+  } catch {
+    return null;
+  }
+}
+
+/** Every email/UPN-ish value on the principal, lowercased. Entra usually puts
+ *  the email in userDetails; common email/upn claims are scanned as a fallback. */
+function principalEmails(p: ClientPrincipal): string[] {
+  const out: string[] = [];
+  if (p.userDetails) out.push(p.userDetails);
+  for (const c of p.claims ?? []) {
+    if (c.val && /(emailaddress|^email$|preferred_username|upn)$/i.test(c.typ ?? '')) {
+      out.push(c.val);
+    }
+  }
+  return out.map((e) => e.trim().toLowerCase()).filter(Boolean);
+}
+
+export function isAdmin(request: HttpRequest): boolean {
+  const p = getClientPrincipal(request);
+  return !!p && principalEmails(p).some((e) => ADMIN_EMAILS.has(e));
+}
+
+/** Best display identity for audit columns on writes. */
+export function actorEmail(request: HttpRequest): string {
+  const p = getClientPrincipal(request);
+  return (p && principalEmails(p)[0]) || 'unknown';
+}
+
+/** Write-side gate: 401 if not signed in, 403 if signed in but not an admin. */
+export function requireAdmin(request: HttpRequest): HttpResponseInit | null {
+  const p = getClientPrincipal(request);
+  if (!p) return { status: 401, jsonBody: { error: 'Sign-in required' } };
+  if (!principalEmails(p).some((e) => ADMIN_EMAILS.has(e))) {
+    return {
+      status: 403,
+      jsonBody: { error: 'Admin access required — editing the tracker is restricted.' },
+    };
+  }
+  return null;
+}
+
+/** Wrap a payload in the dashboard's { data, meta } envelope. */
+export function meta(
+  data: unknown,
+  extra?: Record<string, unknown>,
+  ttlSec = 3600,
+): HttpResponseInit {
+  const arr = Array.isArray(data) ? data : [data];
+  return {
+    headers:
+      ttlSec > 0
+        ? { 'Cache-Control': `public, max-age=${ttlSec}, stale-while-revalidate=3600` }
+        : { 'Cache-Control': 'no-store' },
+    jsonBody: { data, meta: { count: arr.length, ...extra } },
+  };
+}
+
+/** True when the caller asked to bypass every cache layer. */
+export function isFresh(request: HttpRequest): boolean {
+  return request.query.get('fresh') === '1';
+}
+
+/** Map errors to a useful response, with hints for the common mirror/config issues. */
+export function errorResponse(err: unknown): HttpResponseInit {
+  const message = (err as Error)?.message ?? String(err);
+  console.error('[api] Error:', message);
+
+  if (/Invalid object name/i.test(message)) {
+    return {
+      status: 503,
+      jsonBody: {
+        error:
+          `${message} — the vendor tables aren't in the Safety-Dash SQL DB yet. ` +
+          `Run fabric/ingest_vendor_compliance.py, then fabric/build_vendor_gold.py, ` +
+          `then the mirror-vendor-to-sql pipeline. See docs/setup.md.`,
+      },
+    };
+  }
+  if (/Login failed|AZURE_CLIENT|FABRIC_SQL|token/i.test(message)) {
+    return {
+      status: 500,
+      jsonBody: {
+        error:
+          `${message} — check the SWA app settings (AZURE_CLIENT_ID / AZURE_CLIENT_SECRET / ` +
+          `AZURE_TENANT_ID, FABRIC_SQL_SERVER / FABRIC_SQL_DATABASE) and that the service ` +
+          `principal still has Contributor on the workspace AND Read/Write all data on the SQL DB item.`,
+      },
+    };
+  }
+  return { status: 500, jsonBody: { error: message } };
+}
