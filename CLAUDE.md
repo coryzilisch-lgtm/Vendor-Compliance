@@ -27,6 +27,16 @@ Procore ─▶ fabric/ingest_vendor_compliance.py ─▶ silver_vendor_*
         ─▶ api/ (SWA managed Functions)       ─▶ dashboard/index.html
 ```
 
+### It lives in its own Fabric notebook
+
+`Vendor Compliance - Prep Meetings`, two cells (ingest, then gold). **Fully standalone** — it mints
+its own Procore token from Key Vault and fetches its own project list, so it has no ordering
+dependency on `main_ingestion.py` or the Procore Nightly/Friday notebooks. A failure here can't
+take down the safety dashboard's run, and vice versa.
+
+Its only external dependency is `dbo.projects` in the Safety-Dash SQL DB (for the active-project
+filter and project names), which the existing Procore→safety mirror chain already maintains.
+
 ### Two decisions the user made, and why they shape everything
 
 1. **Vendor roster = both sources, with a toggle.** Both Procore commitments
