@@ -19,9 +19,14 @@
 #                         hours an all-meetings detail pull takes)
 #
 # BOTH vendor rosters are ingested on purpose. Which one drives the tracker's
-# checklist is a dashboard setting (`vendorSource`), not a decision baked into
-# the ingest — we don't yet know which Procore tool BCI keeps current, and the
-# COVERAGE DIAGNOSTIC printed at the end answers that empirically.
+# checklist is a dashboard setting (`vendorSource`), not a decision baked in here.
+#
+# ANSWERED 2026-08 against live data: BCI does NOT use Procore commitments —
+# work_order_contracts and purchase_order_contracts both return HTTP 200 with
+# zero rows on every project, so that is a real absence and not a permission
+# error. **The project directory is the vendor roster.** The commitments pull is
+# kept (it is 2 cheap calls) so the day someone starts writing subcontracts in
+# Procore, the better denominator appears with no code change.
 #
 # FULLY STANDALONE. Belongs in its OWN notebook — it mints its own Procore token
 # from Key Vault and fetches its own project list, so it does not depend on the
@@ -622,7 +627,11 @@ def attendee_company(att):
     if name:
         _company_paths[f"deep:{path}"] = _company_paths.get(f"deep:{path}", 0) + 1
         return name
-    _company_paths["<none>"] = _company_paths.get("<none>", 0) + 1
+    # Not on the attendee object. In BCI's tenant that is the normal case — the
+    # company is resolved by the directory join afterwards — so this is a
+    # neutral observation, not a failure. The real failure counter is
+    # "resolved:unresolved".
+    _company_paths["on_object:absent"] = _company_paths.get("on_object:absent", 0) + 1
     return None
 
 
@@ -1274,9 +1283,10 @@ if template_id_hits:
     for tid, n in sorted(template_id_hits.items(), key=lambda kv: -kv[1])[:15]:
         mark = "  <-- the prep template" if tid == str(PREP_MEETING_TEMPLATE_ID) else ""
         print(f"  template_id={tid}: {n} meetings{mark}")
-    print("  => the API DOES expose a template id. If the prep template appears above,")
-    print("     set PREP_REQUIRE_TEMPLATE_ID = True for an exact filter instead of the")
-    print("     title-substring heuristic.")
+    print("  => the API exposes the template id. PREP_MATCH_MODE = 'template_or_title'")
+    print("     (the default) takes the UNION of the template and the title test, which is")
+    print("     what you want. Set it to 'template' only if a title-matched meeting from a")
+    print("     different template turns out to be noise.")
 else:
     print("  none of", TEMPLATE_ID_FIELDS, "appeared on any meeting record.")
     print("  => the API does not expose the originating template; the title match is")
@@ -1316,12 +1326,17 @@ for k, n in sorted(_attendee_keys.items(), key=lambda kv: -kv[1])[:30]:
 print("  path that produced the company name:")
 for k, n in sorted(_company_paths.items(), key=lambda kv: -kv[1]):
     print(f"    {k}: {n}")
-if _company_paths.get("<none>"):
-    print(f"  ⚠️  {_company_paths['<none>']} attendee(s) yielded no company even after a deep")
-    print("      search of the whole object. The attendee record probably only references a")
-    print("      person id, with the UI resolving the company by joining the project")
-    print("      directory. Paste one row of the sample below and the extractor can be")
-    print("      pointed at the right field (or switched to a directory join).")
+_unresolved = _company_paths.get("resolved:unresolved", 0)
+_resolved   = sum(v for k, v in _company_paths.items() if k.startswith("resolved:")) - _unresolved
+print(f"  => {_resolved} attendee(s) resolved, {_unresolved} unresolved.")
+if _company_paths.get("resolved:email_domain"):
+    print(f"  note: {_company_paths['resolved:email_domain']} resolved by EMAIL DOMAIN rather than")
+    print("        the directory join — those people aren't in the project directory. Worth a")
+    print("        spot-check, and worth adding them to the Procore project directory.")
+if _unresolved:
+    print(f"  ⚠️  {_unresolved} attendee(s) could not be tied to a company by any route: not on")
+    print("      the record, not in the project directory, and the email domain matched no")
+    print("      vendor on the job. Those meetings can still match on the title. Sample:")
     try:
         _sample = spark.sql("""
             SELECT raw_json FROM bronze_vendor_meeting_attendees
@@ -1340,7 +1355,12 @@ for v, n in sorted(raw_status_values.items(), key=lambda kv: -kv[1]):
     print(f"    {v!r} -> {known}{mark}")
 for st, n in sorted(attendance_shapes.items(), key=lambda kv: -kv[1]):
     print(f"  {st}: {n}")
-if attendance_shapes.get("unknown", 0) > sum(attendance_shapes.values()) * 0.5:
+_unknown = attendance_shapes.get("unknown", 0)
+if _unknown:
+    print(f"  ({_unknown} attendee(s) carried NO status field at all — nobody ticked a box for")
+    print("   them. That is different from an unrecognized value; every status string Procore")
+    print("   actually returned is listed above and is understood.)")
+if _unknown > sum(attendance_shapes.values()) * 0.5:
     print("  ⚠️  Most attendees came back 'unknown' — the attendance field is in a")
     print("     shape attendance_status() doesn't recognize. Inspect a raw_json row")
     print("     in bronze_vendor_meeting_attendees and extend the hint lists.")
