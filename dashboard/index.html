@@ -70,6 +70,15 @@ tbody tr.click:hover{background:#fdece3}
 .pname{font-weight:700}
 .psub{font-size:11px;color:var(--muted);margin-top:2px}
 .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+thead th.sortable{cursor:pointer;user-select:none}
+thead th.sortable:hover{color:var(--orange)}
+thead th .arrow{opacity:.35;margin-left:5px;font-size:9px}
+thead th.sorted .arrow{opacity:1;color:var(--orange)}
+thead th.sorted{color:#fff}
+a.ext{color:var(--orange);font-weight:700;white-space:nowrap}
+a.ext:hover{text-decoration:underline}
+td a.ext{font-size:11px}
+.modal-hd a.ext{color:var(--orange)}
 
 /* progress */
 .bar{width:120px;height:8px;background:var(--border);border-radius:4px;overflow:hidden;display:inline-block;vertical-align:middle}
@@ -86,6 +95,22 @@ tbody tr.click:hover{background:#fdece3}
 .pill.info{background:#e2ecf5;color:var(--info)}
 .pill.manual{background:#fff;border:1.5px solid var(--orange);color:var(--orange)}
 
+/* ── Metrics ────────────────────────────────────────────── */
+.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));gap:16px;margin-bottom:20px}
+.card{background:#fff;border:1px solid var(--border);border-radius:var(--r-md);padding:16px 18px}
+.card h3{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.09em;color:var(--navy)}
+.card .sub{font-size:11.5px;color:var(--muted);margin:3px 0 12px;line-height:1.45}
+.chart-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:11px;color:var(--muted)}
+.chart-legend span{display:inline-flex;align-items:center;gap:5px}
+.chart-legend i{width:11px;height:3px;border-radius:2px;display:inline-block}
+.ctip{position:fixed;background:var(--navy);color:#fff;padding:6px 10px;border-radius:var(--r-sm);
+  font-size:11.5px;pointer-events:none;z-index:200;display:none;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap}
+.ctip b{color:var(--orange)}
+.cdot{cursor:pointer}
+.mini-bar{height:7px;background:var(--border);border-radius:4px;overflow:hidden;min-width:70px}
+.mini-bar>i{display:block;height:100%;background:var(--orange)}
+.mini-bar>i.done{background:var(--success)}
+
 /* ── Modal ──────────────────────────────────────────────── */
 .overlay{position:fixed;inset:0;background:rgba(23,28,38,.6);z-index:100;display:none;padding:24px;overflow:auto}
 .overlay.on{display:block}
@@ -98,6 +123,18 @@ tbody tr.click:hover{background:#fdece3}
 .modal-bd{padding:22px 24px 28px}
 .sec-h{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin:22px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--orange)}
 .sec-h:first-child{margin-top:0}
+/* Collapsible section header. A <button> rather than a styled div so it is
+   keyboard-reachable and announces its expanded state to a screen reader. */
+button.sec-t{width:100%;display:flex;align-items:center;gap:9px;background:none;border:none;
+  font-family:inherit;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--muted);margin:22px 0 10px;padding:0 0 6px;border-bottom:2px solid var(--orange);text-align:left}
+button.sec-t:first-child{margin-top:0}
+button.sec-t:hover{color:var(--navy)}
+button.sec-t .chev{transition:transform .15s;font-size:10px;color:var(--orange)}
+button.sec-t.closed .chev{transform:rotate(-90deg)}
+button.sec-t .cnt{background:var(--navy);color:#fff;border-radius:9px;padding:1px 8px;font-size:10px}
+button.sec-t.closed .cnt{background:var(--muted)}
+.sec-body.closed{display:none}
 
 /* vendor rows */
 .vrow{background:#fff;border:1px solid var(--border);border-left:4px solid var(--border);border-radius:var(--r-sm);padding:12px 14px;margin-bottom:8px;display:flex;gap:14px;align-items:flex-start}
@@ -148,6 +185,7 @@ tbody tr.click:hover{background:#fdece3}
 
 <nav class="tabs">
   <button data-tab="projects" class="on">Projects</button>
+  <button data-tab="metrics">Metrics</button>
   <button data-tab="review">Review Queue<span class="badge" id="badge-review" style="display:none">0</span></button>
   <button data-tab="settings" id="tab-settings" style="display:none">Settings</button>
 </nav>
@@ -170,6 +208,17 @@ tbody tr.click:hover{background:#fdece3}
     <div id="projects-out"><div class="empty">Loading…</div></div>
   </section>
 
+  <!-- ── Metrics ──────────────────────────────────────────── -->
+  <section class="panel" id="panel-metrics">
+    <div class="toolbar">
+      <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)">Range</span>
+      <button class="chip" data-months="6">6 months</button>
+      <button class="chip on" data-months="12">12 months</button>
+      <button class="chip" data-months="24">24 months</button>
+    </div>
+    <div id="metrics-out"><div class="empty">Loading…</div></div>
+  </section>
+
   <!-- ── Review queue ─────────────────────────────────────── -->
   <section class="panel" id="panel-review">
     <div class="note">
@@ -187,6 +236,7 @@ tbody tr.click:hover{background:#fdece3}
   </section>
 </main>
 
+<div class="ctip" id="ctip"></div>
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 
 <script>
@@ -195,7 +245,37 @@ tbody tr.click:hover{background:#fdece3}
 
 /* ── state ─────────────────────────────────────────────── */
 var ADMIN=false, PROJECTS=[], TOTALS={}, SETTINGS={}, COVERAGE={}, REVIEW=[],
-    FILTER='all', SCOPE='active', CURRENT=null;
+    ADMINS=[], FILTER='all', SCOPE='active', CURRENT=null;
+
+/* Sort state for the projects table. Default: worst-performing LAST — the user
+   asked for highest percent first. Nulls (projects with no vendors at all)
+   always sink to the bottom regardless of direction, because "no data" isn't a
+   score and shouldn't outrank a real one. */
+var SORT={key:'pct_complete', dir:'desc'};
+
+/* Collapsed section ids in the project modal, remembered while the modal is
+   open so a re-render (after an override) doesn't spring everything back. */
+var COLLAPSED={};
+
+/* Buffalo Construction's Procore company id. Not a secret — it is visible in
+   every Procore URL the team already uses. */
+var PROCORE_COMPANY_ID=18895;
+
+function procoreProjectUrl(pid){
+  return 'https://app.procore.com/'+encodeURIComponent(pid)+'/project/home';
+}
+/* Meetings tool deep link. The company/project/tool shape matches the create
+   URL the team uses (.../tools/meetings/create/383995), with the meeting id in
+   place of "create/{template}". If Procore ever changes this, it is the only
+   place to edit. */
+function procoreMeetingUrl(pid, mid){
+  return 'https://app.procore.com/webclients/host/companies/'+PROCORE_COMPANY_ID
+    +'/projects/'+encodeURIComponent(pid)+'/tools/meetings/'+encodeURIComponent(mid);
+}
+function extLink(href, label, title){
+  return '<a class="ext" href="'+esc(href)+'" target="_blank" rel="noopener"'
+    +(title?' title="'+esc(title)+'"':'')+'>'+esc(label)+' <span aria-hidden="true">&#8599;</span></a>';
+}
 
 /* ── helpers ───────────────────────────────────────────── */
 function esc(s){
@@ -263,6 +343,43 @@ function renderKpis(){
   }).join('');
 }
 
+/* Column definitions drive both the header and the sort, so a header can never
+   sort by something other than what it displays. */
+var COLS=[
+  {key:'project_name',            label:'Project',           type:'text'},
+  {key:'superintendent_name',     label:'Superintendent',    type:'text'},
+  {key:'vendor_total',            label:'Vendors',           type:'num', num:true},
+  {key:'vendor_held',             label:'Held',              type:'num', num:true},
+  {key:'vendor_outstanding',      label:'Outstanding',       type:'num', num:true},
+  {key:'pct_complete',            label:'Progress',          type:'num'},
+  {key:'last_meeting_date',       label:'Last prep meeting', type:'text', num:true},
+  {key:'unmatched_meeting_count', label:'Review',            type:'num', num:true},
+  {key:null,                      label:'Procore',           type:null,  num:true}
+];
+
+function sortValue(p, key){
+  if(key==='superintendent_name') return p.superintendent_name||p.project_manager||'';
+  return p[key];
+}
+
+function sortProjects(rows){
+  var col=COLS.filter(function(c){return c.key===SORT.key;})[0];
+  if(!col) return rows;
+  var dir = SORT.dir==='asc' ? 1 : -1;
+  return rows.slice().sort(function(a,b){
+    var av=sortValue(a,col.key), bv=sortValue(b,col.key);
+    // Nulls always sink, in BOTH directions. A project with no vendors has no
+    // score — letting it float to the top of an ascending sort would read as
+    // "worst performer", which is a different and wrong claim.
+    var an=(av===null||av===undefined||av===''), bn=(bv===null||bv===undefined||bv==='');
+    if(an&&bn) return 0;
+    if(an) return 1;
+    if(bn) return -1;
+    if(col.type==='num'){ return (Number(av)-Number(bv))*dir; }
+    return String(av).localeCompare(String(bv))*dir;
+  });
+}
+
 function renderProjects(){
   var q=($('q').value||'').trim().toLowerCase();
   var rows=PROJECTS.filter(function(p){ return matchesFilter(p) && matchesQuery(p,q); });
@@ -276,12 +393,16 @@ function renderProjects(){
     $('projects-out').innerHTML='<div class="empty">No projects match that filter.</div>';
     return;
   }
+  rows=sortProjects(rows);
 
-  var html='<table><thead><tr>'
-    +'<th>Project</th><th>Superintendent</th>'
-    +'<th class="num">Vendors</th><th class="num">Held</th><th class="num">Outstanding</th>'
-    +'<th>Progress</th><th class="num">Last prep meeting</th><th class="num">Review</th>'
-    +'</tr></thead><tbody>';
+  var html='<table><thead><tr>'+COLS.map(function(c){
+    if(!c.key) return '<th class="num">'+esc(c.label)+'</th>';
+    var on=SORT.key===c.key;
+    var arrow=on ? (SORT.dir==='asc'?'&#9650;':'&#9660;') : '&#9660;';
+    return '<th class="sortable'+(c.num?' num':'')+(on?' sorted':'')+'" data-sort="'+c.key+'"'
+      +' title="Sort by '+esc(c.label)+'">'+esc(c.label)
+      +'<span class="arrow">'+arrow+'</span></th>';
+  }).join('')+'</tr></thead><tbody>';
 
   rows.forEach(function(p){
     var pct = p.pct_complete==null ? null : Number(p.pct_complete);
@@ -301,13 +422,32 @@ function renderProjects(){
       +'<td class="num">'+esc(fmtDate(p.last_meeting_date))+'</td>'
       +'<td class="num">'+(p.unmatched_meeting_count>0
           ? '<span class="pill warn">'+esc(p.unmatched_meeting_count)+'</span>' : '—')+'</td>'
+      +'<td class="num">'+extLink(procoreProjectUrl(p.project_id),'Open')+'</td>'
       +'</tr>';
   });
   html+='</tbody></table>';
   $('projects-out').innerHTML=html;
 
   Array.prototype.forEach.call($('projects-out').querySelectorAll('tr.click'),function(tr){
-    tr.onclick=function(){ openProject(Number(tr.getAttribute('data-pid'))); };
+    tr.onclick=function(ev){
+      // Let the Procore link do its own thing instead of opening the modal.
+      if(ev.target.closest && ev.target.closest('a')) return;
+      openProject(Number(tr.getAttribute('data-pid')));
+    };
+  });
+  Array.prototype.forEach.call($('projects-out').querySelectorAll('th[data-sort]'),function(th){
+    th.onclick=function(){
+      var key=th.getAttribute('data-sort');
+      if(SORT.key===key){
+        SORT.dir = SORT.dir==='asc' ? 'desc' : 'asc';
+      }else{
+        SORT.key=key;
+        // Text columns read naturally A->Z; counts and percentages are almost
+        // always wanted biggest-first.
+        SORT.dir = (COLS.filter(function(c){return c.key===key;})[0].type==='text') ? 'asc' : 'desc';
+      }
+      renderProjects();
+    };
   });
 }
 
@@ -340,10 +480,39 @@ function evidenceLine(v){
       ? 'Matched on the attendee list'+(v.matched_attendee_name?' ('+esc(v.matched_attendee_name)
           +(v.attendance_status?', '+esc(v.attendance_status):'')+')':'')
       : 'Matched on the meeting title only — nobody from this vendor was added to the attendee list';
+    var link = v.meeting_id
+      ? ' ' + extLink(procoreMeetingUrl(CURRENT, v.meeting_id), 'Open in Procore',
+                      'Open this meeting in Procore')
+      : '';
     return how+' · <b>'+esc(v.meeting_title||'meeting')+'</b> · '+esc(fmtDate(v.meeting_date))
-      +(v.meeting_count>1?' · '+esc(v.meeting_count)+' matching meetings':'');
+      +(v.meeting_count>1?' · '+esc(v.meeting_count)+' matching meetings':'')+link;
   }
   return 'No preparatory meeting found for this vendor.';
+}
+
+/* A collapsible block. `id` keys the remembered open/closed state so a
+   re-render after an override doesn't reset what the user collapsed. */
+function section(id, label, count, bodyHtml, defaultClosed){
+  if(!(id in COLLAPSED)) COLLAPSED[id] = !!defaultClosed;
+  var closed = COLLAPSED[id];
+  return '<button class="sec-t'+(closed?' closed':'')+'" data-sec="'+esc(id)+'"'
+      +' aria-expanded="'+(closed?'false':'true')+'">'
+      +'<span class="chev">&#9660;</span><span>'+esc(label)+'</span>'
+      +'<span class="cnt">'+esc(count)+'</span></button>'
+    +'<div class="sec-body'+(closed?' closed':'')+'" data-secbody="'+esc(id)+'">'+bodyHtml+'</div>';
+}
+
+function wireSections(root){
+  Array.prototype.forEach.call(root.querySelectorAll('button[data-sec]'),function(b){
+    b.onclick=function(){
+      var id=b.getAttribute('data-sec');
+      COLLAPSED[id]=!COLLAPSED[id];
+      b.classList.toggle('closed', COLLAPSED[id]);
+      b.setAttribute('aria-expanded', COLLAPSED[id]?'false':'true');
+      var body=root.querySelector('[data-secbody="'+id+'"]');
+      if(body) body.classList.toggle('closed', COLLAPSED[id]);
+    };
+  });
 }
 
 function vendorRow(v){
@@ -380,6 +549,7 @@ function vendorRow(v){
 }
 
 async function openProject(pid){
+  if(CURRENT!==pid) COLLAPSED={};
   CURRENT=pid;
   $('modal').innerHTML='<div class="modal-hd"><h2>Loading…</h2></div>';
   $('overlay').classList.add('on');
@@ -407,35 +577,46 @@ async function openProject(pid){
         +'See the Review Queue tab.</div>';
     }
 
-    if(out.length)  body+='<div class="sec-h">Outstanding — '+out.length+'</div>'+out.map(vendorRow).join('');
-    if(held.length) body+='<div class="sec-h">Prep meeting held — '+held.length+'</div>'+held.map(vendorRow).join('');
-    if(na.length)   body+='<div class="sec-h">Not applicable — '+na.length+'</div>'+na.map(vendorRow).join('');
+    // Held first, per the safety team: the tracker is read as "what have we
+    // done", and burying the completed work under the outstanding list made the
+    // page open on a wall of red every time.
+    if(held.length) body+=section('held','Prep meeting held',held.length,
+                                  held.map(vendorRow).join(''),false);
+    if(out.length)  body+=section('out','Outstanding',out.length,
+                                  out.map(vendorRow).join(''),false);
+    // Not-applicable rows are settled business — collapsed unless asked for.
+    if(na.length)   body+=section('na','Not applicable',na.length,
+                                  na.map(vendorRow).join(''),true);
 
     if(ADMIN){
-      body+='<div class="sec-h">Add a vendor</div>'
-        +'<div class="note">Use this when a sub is on the job but isn\'t in Procore\'s commitments '
-        +'or project directory yet. It joins this project\'s checklist immediately.</div>'
+      body+=section('addv','Add a vendor','+',
+        '<div class="note">Use this when a sub is on the job but isn\'t in Procore\'s project '
+        +'directory. It joins this checklist immediately, and any prep meeting naming it — on the '
+        +'attendee list or in the title — is credited straight away.</div>'
         +'<div class="toolbar"><input type="search" id="mv-name" placeholder="Vendor company name…">'
-        +'<button class="hbtn primary" id="mv-add" style="color:#fff">Add to checklist</button></div>';
+        +'<button class="hbtn primary" id="mv-add" style="color:#fff">Add to checklist</button></div>',
+        true);
     }
 
-    body+='<div class="sec-h">Prep meetings logged — '+meetings.length+'</div>';
+    var mtgHtml;
     if(!meetings.length){
-      body+='<div class="empty">No preparatory meetings found in Procore for this project.</div>';
+      mtgHtml='<div class="empty">No preparatory meetings found in Procore for this project.</div>';
     }else{
-      body+='<table><thead><tr><th>Meeting</th><th class="num">Date</th>'
+      mtgHtml='<table><thead><tr><th>Meeting</th><th class="num">Date</th>'
         +'<th class="num">Attendees</th><th class="num">Vendor side</th>'
-        +'<th class="num">Vendors matched</th></tr></thead><tbody>';
+        +'<th class="num">Vendors matched</th><th class="num">Procore</th></tr></thead><tbody>';
       meetings.forEach(function(m){
-        body+='<tr><td>'+esc(m.title||'—')+'</td>'
+        mtgHtml+='<tr><td>'+esc(m.title||'—')+'</td>'
           +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'
           +'<td class="num">'+esc(m.attendee_count==null?'—':m.attendee_count)+'</td>'
           +'<td class="num">'+esc(m.vendor_attendee_count==null?'—':m.vendor_attendee_count)+'</td>'
           +'<td class="num">'+(Number(m.matched_vendor_count||0)===0
-              ? '<span class="pill warn">none</span>' : esc(m.matched_vendor_count))+'</td></tr>';
+              ? '<span class="pill warn">none</span>' : esc(m.matched_vendor_count))+'</td>'
+          +'<td class="num">'+extLink(procoreMeetingUrl(pid, m.meeting_id),'Open')+'</td></tr>';
       });
-      body+='</tbody></table>';
+      mtgHtml+='</tbody></table>';
     }
+    body+=section('mtgs','Prep meetings logged',meetings.length,mtgHtml,false);
 
     $('modal').innerHTML=
       '<div class="modal-hd"><div style="flex:1">'
@@ -448,6 +629,7 @@ async function openProject(pid){
       +'<div class="modal-bd">'+body+'</div>';
 
     $('modal-x').onclick=closeModal;
+    wireSections($('modal'));
     wireVendorActions(pid);
   }catch(e){
     $('modal').innerHTML='<div class="modal-hd"><h2>Project '+esc(pid)+'</h2>'
@@ -520,7 +702,8 @@ async function loadReview(){
       return;
     }
     var h='<table><thead><tr><th>Project</th><th>Meeting title</th><th class="num">Date</th>'
-      +'<th class="num">Attendees</th><th class="num">Vendor-side attendees</th></tr></thead><tbody>';
+      +'<th class="num">Attendees</th><th class="num">Vendor-side attendees</th>'
+      +'<th class="num">Procore</th></tr></thead><tbody>';
     REVIEW.forEach(function(m){
       h+='<tr class="click" data-pid="'+esc(m.project_id)+'">'
         +'<td class="pname">'+esc(m.project_name||m.project_id)+'</td>'
@@ -528,12 +711,16 @@ async function loadReview(){
         +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'
         +'<td class="num">'+esc(m.attendee_count==null?'—':m.attendee_count)+'</td>'
         +'<td class="num">'+(Number(m.vendor_attendee_count||0)===0
-            ? '<span class="pill warn">0</span>' : esc(m.vendor_attendee_count))+'</td></tr>';
+            ? '<span class="pill warn">0</span>' : esc(m.vendor_attendee_count))+'</td>'
+        +'<td class="num">'+extLink(procoreMeetingUrl(m.project_id, m.meeting_id),'Open')+'</td></tr>';
     });
     h+='</tbody></table>';
     $('review-out').innerHTML=h;
     Array.prototype.forEach.call($('review-out').querySelectorAll('tr.click'),function(tr){
-      tr.onclick=function(){ openProject(Number(tr.getAttribute('data-pid'))); };
+      tr.onclick=function(ev){
+        if(ev.target.closest && ev.target.closest('a')) return;
+        openProject(Number(tr.getAttribute('data-pid')));
+      };
     });
   }catch(e){
     $('review-out').innerHTML=errNote(e.message);
@@ -610,7 +797,11 @@ async function loadSettings(){
         +'restricted to tracker admins.</div>';
     }
 
+    h+='<div id="admin-panel"></div>';
+
     $('settings-out').innerHTML=h;
+    await loadAdmins();
+    renderAdminPanel();
 
     var btn=$('save-settings');
     if(btn) btn.onclick=async function(){
@@ -623,7 +814,9 @@ async function loadSettings(){
             vendorSource: sel?sel.value:SETTINGS.vendorSource,
             allowTitleMatch: $('allowTitleMatch').checked?1:0,
             requireVendorPresent: $('requireVendorPresent').checked?1:0,
-            requireMeetingHeld: $('requireMeetingHeld').checked?1:0
+            requireMeetingHeld: $('requireMeetingHeld').checked?1:0,
+            adminMode: (document.querySelector('input[name="adminMode"]:checked')||{}).value
+                       || SETTINGS.adminMode
           })
         });
         $('save-msg').textContent='Saved — reloading the tracker.';
@@ -639,6 +832,350 @@ async function loadSettings(){
   }
 }
 
+
+/* ── Charts ────────────────────────────────────────────────
+   Mirrors the Safety Dashboard's drawChart: inline SVG, dashed gridlines,
+   2px polylines, invisible hover targets over each point, legend below.
+
+   Categorical order is FIXED — orange, steel blue, amber — and never cycled.
+   That trio was validated for colour-vision separation (worst adjacent pair
+   ΔE 36 normal / 22 protan); the obvious "good/bad" choice of orange + red
+   fails it outright at ΔE 14.5, which is why match quality is not painted
+   green-amber-red here. Series colour is never the only signal: every chart
+   with more than one series carries a legend, and the tables below repeat the
+   same numbers. */
+var SERIES_COLORS=['var(--orange)','var(--info)','var(--warning)'];
+
+function drawChart(id, series, labels, opts){
+  var el=$(id);
+  if(!el) return;
+  opts=opts||{};
+  if(!labels||!labels.length){
+    el.innerHTML='<div class="empty" style="padding:24px">No meetings in this range.</div>';
+    return;
+  }
+  var W=320,H=118,PL=34,PR=10,PT=10,PB=22;
+  var all=[]; series.forEach(function(sr){ (sr.values||[]).forEach(function(v){ if(v!=null) all.push(Number(v)); }); });
+  var isPct = opts.unit==='%';
+  var maxY = opts.max!=null ? opts.max : (isPct ? 100 : Math.max(1, Math.ceil(Math.max.apply(null,all.concat([0]))*1.1)));
+  var n=labels.length;
+  var X=function(i){ return PL + (n<=1 ? (W-PL-PR)/2 : (W-PL-PR)*i/(n-1)); };
+  var Y=function(v){ return PT + (H-PT-PB)*(1-Math.min(1,Math.max(0,Number(v)/maxY))); };
+  var fmt=function(v){ return isPct ? Math.round(v)+'%' : String(Math.round(v)); };
+
+  var svg='<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="display:block;overflow:visible">';
+  [0,0.25,0.5,0.75,1].forEach(function(f){
+    var yy=Y(maxY*f);
+    svg+='<line x1="'+PL+'" y1="'+yy.toFixed(1)+'" x2="'+(W-PR)+'" y2="'+yy.toFixed(1)
+      +'" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="3,3"/>'
+      +'<text x="'+(PL-4)+'" y="'+(yy+3.5).toFixed(1)+'" font-size="8" fill="var(--muted)" '
+      +'text-anchor="end">'+fmt(maxY*f)+'</text>';
+  });
+  svg+='<line x1="'+PL+'" y1="'+(H-PB)+'" x2="'+(W-PR)+'" y2="'+(H-PB)+'" stroke="var(--border)"/>'
+     + '<line x1="'+PL+'" y1="'+PT+'" x2="'+PL+'" y2="'+(H-PB)+'" stroke="var(--border)"/>';
+
+  series.forEach(function(sr,si){
+    var col=sr.color||SERIES_COLORS[si%SERIES_COLORS.length];
+    var pts=(sr.values||[]).map(function(v,i){ return X(i).toFixed(1)+','+Y(v).toFixed(1); }).join(' ');
+    if(pts) svg+='<polyline points="'+pts+'" fill="none" stroke="'+col
+      +'" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>';
+    // A single point would draw nothing as a polyline, so mark it.
+    if((sr.values||[]).length===1) svg+='<circle cx="'+X(0).toFixed(1)+'" cy="'+Y(sr.values[0]).toFixed(1)
+      +'" r="3" fill="'+col+'"/>';
+  });
+  series.forEach(function(sr,si){
+    var col=sr.color||SERIES_COLORS[si%SERIES_COLORS.length];
+    (sr.values||[]).forEach(function(v,i){
+      svg+='<circle class="cdot" cx="'+X(i).toFixed(1)+'" cy="'+Y(v).toFixed(1)+'" r="7" '
+        +'fill="transparent" data-t="'+esc(labels[i]+' · '+(sr.name?sr.name+': ':'')+fmt(v))+'"/>';
+    });
+  });
+  var step=Math.max(1,Math.ceil(n/6)), idxs=[];
+  for(var i=0;i<n;i+=step) idxs.push(i);
+  if(idxs[idxs.length-1]!==n-1){
+    if(n-1-idxs[idxs.length-1] < Math.ceil(step*0.6)) idxs.pop();
+    idxs.push(n-1);
+  }
+  idxs.forEach(function(i){
+    svg+='<text x="'+X(i).toFixed(1)+'" y="'+(H-5)+'" font-size="8" fill="var(--muted)" '
+      +'text-anchor="middle">'+esc(labels[i])+'</text>';
+  });
+  svg+='</svg>';
+
+  if(series.length>1){
+    svg+='<div class="chart-legend">'+series.map(function(sr,si){
+      return '<span><i style="background:'+(sr.color||SERIES_COLORS[si%SERIES_COLORS.length])+'"></i>'
+        +esc(sr.name||'')+'</span>';
+    }).join('')+'</div>';
+  }
+  el.innerHTML=svg;
+
+  Array.prototype.forEach.call(el.querySelectorAll('.cdot'),function(c){
+    c.onmouseenter=function(ev){
+      var t=$('ctip'); t.textContent=c.getAttribute('data-t');
+      t.style.display='block';
+      t.style.left=(ev.clientX+12)+'px'; t.style.top=(ev.clientY-30)+'px';
+    };
+    c.onmouseleave=function(){ $('ctip').style.display='none'; };
+  });
+}
+
+/* ── Metrics ───────────────────────────────────────────── */
+var METRICS=null, MONTHS=12;
+
+/* SQL only returns months that had meetings. Charting those consecutively
+   would compress a six-month gap into one flat step and misrepresent the
+   trend, so the missing months are filled with real zeros. */
+function fillMonths(rows, months){
+  var have={}; (rows||[]).forEach(function(r){ have[r.month]=r; });
+  var out=[], d=new Date();
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth()-(months-1));
+  for(var i=0;i<months;i++){
+    var key=d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0');
+    out.push(have[key] || {month:key, meetings:0, projects:0, attendee_matched:0,
+                           title_only:0, unmatched:0, attendees:0,
+                           attendees_with_status:0, vendors_credited:0});
+    d.setUTCMonth(d.getUTCMonth()+1);
+  }
+  return out;
+}
+function monthLabel(ym){
+  var p=String(ym).split('-');
+  return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][Number(p[1])-1]
+    +" '"+String(p[0]).slice(2);
+}
+
+function renderMetrics(){
+  if(!METRICS){ return; }
+  var snap=METRICS.snapshot||{}, rows=fillMonths(METRICS.monthly, MONTHS);
+  var labels=rows.map(function(r){ return monthLabel(r.month); });
+  var num=function(v){ return Number(v||0); };
+
+  var adoption = num(snap.active_projects)
+    ? Math.round(100*num(snap.projects_with_meetings)/num(snap.active_projects)) : null;
+  var coverage = num(snap.vendors_tracked)
+    ? Math.round(100*num(snap.vendors_held)/num(snap.vendors_tracked)) : null;
+
+  var h='<div class="kpis">'
+    +kpi(num(snap.active_projects),'Active projects','')
+    +kpi(num(snap.projects_with_meetings)+' / '+num(snap.active_projects),'Projects holding prep meetings','orange')
+    +kpi(adoption==null?'—':adoption+'%','Project adoption','orange')
+    +kpi(num(snap.vendors_held)+' / '+num(snap.vendors_tracked),'Vendors with a prep meeting','')
+    +kpi(coverage==null?'—':coverage+'%','Coverage of all directory companies','')
+    +kpi(num(snap.unmatched_meetings),'Meetings needing review',
+         num(snap.unmatched_meetings)>0?'err':'')
+    +'</div>';
+
+  h+='<div class="note"><b>Read the coverage figure carefully.</b> Its denominator is every '
+    +'company in the Procore project directory — which also holds owners, architects, inspectors '
+    +'and suppliers who never need a prep meeting. Until those are marked <b>Not applicable</b> on '
+    +'each project, coverage understates the real picture badly. <b>Project adoption</b> and the '
+    +'monthly charts are the trustworthy headline today.</div>'
+    +'<div class="note"><b>Why there is no "coverage over time" chart.</b> The vendor roster is a '
+    +'current snapshot from Procore with no history — there is no record of who was on a job\'s '
+    +'roster last March — so any past-month percentage would be measured against a denominator we '
+    +'do not have. The monthly charts therefore count only things that actually happened.</div>';
+
+  h+='<div class="chart-grid">'
+    +card('mc1','Prep meetings held per month',
+          'Raw volume. The first thing to watch — the process is only as good as its adoption.')
+    +card('mc2','Projects holding prep meetings',
+          'How many distinct jobs took part each month. Flat and low means the practice is '
+          +'concentrated in a few crews rather than spreading.')
+    +card('mc3','How each meeting was recorded',
+          'Each meeting counted once, at its strongest evidence. "Attendee list" is the one to '
+          +'grow: it is the only signal that proves who was actually in the room.')
+    +card('mc5','Meetings that matched no vendor',
+          'Held, logged, and creditable to nobody — usually titled with a person rather than a '
+          +'company, or naming a sub who is not in the Procore project directory. These are the '
+          +'Review Queue.')
+    +card('mc4','Attendance actually ticked',
+          'Share of attendees with Present / Absent / Distribution recorded. This has to be high '
+          +'before "require the vendor to be marked Present" can be switched on in Settings.')
+    +'</div>';
+
+  h+='<div class="card" style="margin-bottom:16px"><h3>Project coverage</h3>'
+    +'<div class="sub">Current vendor coverage per active project, worst first — where the next '
+    +'conversation should happen.</div><div id="mc-lead"></div></div>';
+  h+='<div class="card"><h3>Vendors appearing in the most prep meetings</h3>'
+    +'<div class="sub">Across every project. A vendor never seen on an attendee list is one '
+    +'whose meetings are only being matched by title.</div><div id="mc-vend"></div></div>';
+
+  $('metrics-out').innerHTML=h;
+
+  drawChart('mc1',[{name:'Meetings',values:rows.map(function(r){return num(r.meetings);})}],labels,{unit:'count'});
+  drawChart('mc2',[{name:'Projects',values:rows.map(function(r){return num(r.projects);}),
+                    color:'var(--info)'}],labels,{unit:'count'});
+  // Two series here, not three. "Unmatched" got its own chart below because the
+  // only third colour available inside Buffalo's palette was amber, and
+  // amber↔orange measures ΔE 4.6 under deuteranopia — a red-green colourblind
+  // reader could not separate the best evidence from the worst, which is
+  // exactly the comparison this chart exists to make. Orange↔steel is ΔE 22.
+  drawChart('mc3',[
+    {name:'Attendee list',values:rows.map(function(r){return num(r.attendee_matched);})},
+    {name:'Title only',   values:rows.map(function(r){return num(r.title_only);})}
+  ],labels,{unit:'count'});
+  drawChart('mc5',[{name:'Unmatched',values:rows.map(function(r){return num(r.unmatched);}),
+                    color:'var(--error)'}],labels,{unit:'count'});
+  drawChart('mc4',[{name:'Attendance recorded',
+    values:rows.map(function(r){ return num(r.attendees) ? Math.round(100*num(r.attendees_with_status)/num(r.attendees)) : 0; })
+  }],labels,{unit:'%',max:100});
+
+  renderLeaderboard();
+  renderTopVendors();
+}
+
+function kpi(n,label,cls){
+  return '<div class="kpi"><div class="n '+(cls||'')+'">'+esc(n)+'</div><div class="l">'+esc(label)+'</div></div>';
+}
+function card(id,title,sub){
+  return '<div class="card"><h3>'+esc(title)+'</h3><div class="sub">'+esc(sub)+'</div>'
+    +'<div id="'+id+'"></div></div>';
+}
+
+function renderLeaderboard(){
+  var rows=(METRICS.leaderboard||[]).map(function(r){
+    var tracked=Number(r.tracked||0), held=Number(r.held||0);
+    return {r:r, tracked:tracked, held:held, pct: tracked?Math.round(100*held/tracked):null};
+  });
+  // Worst first, but projects with no vendors at all sink — no vendors is not a
+  // score, and ranking them "worst" would send people to the wrong jobs.
+  rows.sort(function(a,b){
+    if(a.tracked===0 && b.tracked===0) return 0;
+    if(a.tracked===0) return 1;
+    if(b.tracked===0) return -1;
+    return a.pct-b.pct;
+  });
+  if(!rows.length){ $('mc-lead').innerHTML='<div class="empty">No active projects.</div>'; return; }
+  var h='<table><thead><tr><th>Project</th><th>Superintendent</th><th class="num">Vendors</th>'
+    +'<th class="num">Held</th><th>Coverage</th><th class="num">Meetings</th></tr></thead><tbody>';
+  rows.forEach(function(x){
+    h+='<tr class="click" data-pid="'+esc(x.r.project_id)+'">'
+      +'<td class="pname">'+esc(x.r.project_name||x.r.project_id)+'</td>'
+      +'<td>'+esc(x.r.superintendent_name||x.r.project_manager||'—')+'</td>'
+      +'<td class="num">'+x.tracked+'</td><td class="num">'+x.held+'</td>'
+      +'<td>'+(x.tracked===0 ? '<span class="pill warn">No vendors</span>'
+          : '<div style="display:flex;align-items:center;gap:8px"><span class="mini-bar" style="flex:1">'
+            +'<i class="'+(x.pct===100?'done':'')+'" style="width:'+x.pct+'%"></i></span>'
+            +'<b style="font-variant-numeric:tabular-nums">'+x.pct+'%</b></div>')+'</td>'
+      +'<td class="num">'+esc(x.r.meetings||0)+'</td></tr>';
+  });
+  h+='</tbody></table>';
+  $('mc-lead').innerHTML=h;
+  Array.prototype.forEach.call($('mc-lead').querySelectorAll('tr.click'),function(tr){
+    tr.onclick=function(){ openProject(Number(tr.getAttribute('data-pid'))); };
+  });
+}
+
+function renderTopVendors(){
+  var rows=METRICS.topVendors||[];
+  if(!rows.length){ $('mc-vend').innerHTML='<div class="empty">No matched vendors yet.</div>'; return; }
+  var h='<table><thead><tr><th>Vendor</th><th class="num">Prep meetings</th>'
+    +'<th class="num">Projects</th><th>Evidence</th></tr></thead><tbody>';
+  rows.forEach(function(v){
+    h+='<tr><td class="pname">'+esc(v.vendor_name)+'</td>'
+      +'<td class="num">'+esc(v.meetings)+'</td><td class="num">'+esc(v.projects)+'</td>'
+      +'<td>'+(Number(v.ever_on_attendee_list)===1
+          ? '<span class="pill held">On attendee list</span>'
+          : '<span class="pill warn">Title match only</span>')+'</td></tr>';
+  });
+  h+='</tbody></table>';
+  $('mc-vend').innerHTML=h;
+}
+
+async function loadMetrics(fresh){
+  try{
+    var r=await api('/api/metrics?months='+MONTHS+(fresh?'&fresh=1':''));
+    METRICS=r.data||null;
+    renderMetrics();
+  }catch(e){
+    $('metrics-out').innerHTML=errNote(e.message);
+  }
+}
+
+/* ── admin access ──────────────────────────────────────── */
+function renderAdminPanel(){
+  var open = SETTINGS.adminMode !== 'allowlist';
+  var h='<div class="fieldset"><h3>Admin access</h3>'
+    +'<p>Who can mark meetings held, add vendors and change these settings.</p>'
+    +'<div class="opt"><input type="radio" name="adminMode" id="am-open" value="open"'
+      +(open?' checked':'')+(ADMIN?'':' disabled')+'>'
+      +'<label for="am-open">Everyone signed in <span class="pill info">current</span>'
+      +'<div class="hint">Anyone who can reach this app can edit it. Sign-in is still required, '
+      +'so this means anyone at Buffalo — not the public. This is the temporary setting until '
+      +'Entra roles are assigned.</div></label></div>'
+    +'<div class="opt"><input type="radio" name="adminMode" id="am-list" value="allowlist"'
+      +(open?'':' checked')+(ADMIN?'':' disabled')+'>'
+      +'<label for="am-list">Only the admins listed below'
+      +'<div class="hint">Everyone else becomes read-only. Switch to this once you\'ve confirmed '
+      +'the list below is right — the built-in accounts can never be removed, so you can\'t lock '
+      +'yourself out.</div></label></div>';
+
+  h+='<div style="margin-top:14px">';
+  if(!ADMINS.length){
+    h+='<div class="empty">No admins recorded yet.</div>';
+  }else{
+    h+='<table><thead><tr><th>Admin</th><th>Added by</th><th class="num"></th></tr></thead><tbody>';
+    ADMINS.forEach(function(a){
+      h+='<tr><td class="pname">'+esc(a.email)
+        +(a.is_bootstrap?' <span class="pill info">built-in</span>':'')+'</td>'
+        +'<td>'+esc(a.added_by||'—')+'</td>'
+        +'<td class="num">'+(ADMIN && !a.is_bootstrap
+            ? '<button class="mini no" data-rmadmin="'+esc(a.email)+'">Remove</button>'
+            : '')+'</td></tr>';
+    });
+    h+='</tbody></table>';
+  }
+  h+='</div>';
+
+  if(ADMIN){
+    h+='<div class="toolbar" style="margin-top:12px">'
+      +'<input type="search" id="admin-email" placeholder="name@buffaloconstruction.com">'
+      +'<button class="hbtn primary" id="admin-add" style="color:#fff">Add admin</button>'
+      +'<span id="admin-msg" style="font-size:12px;color:var(--muted)"></span></div>';
+  }
+  h+='</div>';
+  $('admin-panel').innerHTML=h;
+
+  var add=$('admin-add');
+  if(add) add.onclick=async function(){
+    var email=($('admin-email').value||'').trim();
+    if(!email){ $('admin-email').focus(); return; }
+    add.disabled=true; $('admin-msg').textContent='Adding…';
+    try{
+      var r=await api('/admins',{method:'POST',headers:{'Content-Type':'application/json'},
+                                 body:JSON.stringify({email:email})});
+      ADMINS=r.data||[]; $('admin-email').value='';
+      renderAdminPanel(); $('admin-msg').textContent='Added.';
+    }catch(e){ $('admin-msg').textContent='Failed: '+e.message; add.disabled=false; }
+  };
+
+  Array.prototype.forEach.call($('admin-panel').querySelectorAll('button[data-rmadmin]'),function(b){
+    b.onclick=async function(){
+      var email=b.getAttribute('data-rmadmin');
+      if(!window.confirm('Remove '+email+' as an admin?')) return;
+      b.disabled=true; b.textContent='…';
+      try{
+        var r=await api('/admins/'+encodeURIComponent(email),{method:'DELETE'});
+        ADMINS=r.data||[]; renderAdminPanel();
+      }catch(e){
+        // The API refuses to remove a built-in account or the last admin, and
+        // says which. Surface that rather than a silent no-op.
+        alert(e.message); b.disabled=false; b.textContent='Remove';
+      }
+    };
+  });
+}
+
+async function loadAdmins(){
+  try{
+    var r=await api('/admins');
+    ADMINS=r.data||[];
+    if(r.meta && r.meta.adminMode) SETTINGS.adminMode=r.meta.adminMode;
+  }catch(e){ ADMINS=[]; }
+}
+
 /* ── wiring ────────────────────────────────────────────── */
 function showTab(name){
   Array.prototype.forEach.call(document.querySelectorAll('nav.tabs button'),function(b){
@@ -648,11 +1185,19 @@ function showTab(name){
     p.classList.toggle('on', p.id==='panel-'+name);
   });
   if(name==='settings') loadSettings();
+  if(name==='metrics' && !METRICS) loadMetrics();
 }
 
 document.addEventListener('click',function(e){
   var t=e.target;
   if(t.matches && t.matches('nav.tabs button[data-tab]')) showTab(t.getAttribute('data-tab'));
+  if(t.matches && t.matches('.chip[data-months]')){
+    MONTHS=Number(t.getAttribute('data-months'));
+    Array.prototype.forEach.call(document.querySelectorAll('.chip[data-months]'),function(c){
+      c.classList.toggle('on', c===t);
+    });
+    loadMetrics(true);
+  }
   if(t.matches && t.matches('.chip[data-filter]')){
     FILTER=t.getAttribute('data-filter');
     Array.prototype.forEach.call(document.querySelectorAll('.chip[data-filter]'),function(c){
@@ -665,7 +1210,7 @@ $('overlay').onclick=function(e){ if(e.target===$('overlay')) closeModal(); };
 document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeModal(); });
 $('q').oninput=renderProjects;
 $('scope').onchange=function(){ SCOPE=$('scope').value; loadProjects(true); loadReview(); };
-$('btn-refresh').onclick=function(){ loadProjects(true); loadReview(); };
+$('btn-refresh').onclick=function(){ loadProjects(true); loadReview(); if(METRICS) loadMetrics(true); };
 $('btn-settings').onclick=function(){ showTab('settings'); };
 
 (async function init(){

@@ -16,6 +16,7 @@ import { db } from './client.js';
 let projectMetaProbed = false;
 let projectsHasIsActive = false;
 let hasSuperTables = false;
+let meetingsHaveTitlePadded = false;
 
 /**
  * The mirror pipeline AUTO-CREATES dbo.projects, so its column set follows
@@ -32,15 +33,20 @@ let hasSuperTables = false;
 export async function ensureProjectColumnMeta(): Promise<void> {
   if (projectMetaProbed) return;
   try {
-    const { rows } = await db.query<{ has_active: number | null; has_super: number | null }>(
-      `SELECT COL_LENGTH('dbo.projects','is_active')                  AS has_active,
-              OBJECT_ID('dbo.project_superintendents','U')            AS has_super`,
+    const { rows } = await db.query<{
+      has_active: number | null; has_super: number | null; has_padded: number | null;
+    }>(
+      `SELECT COL_LENGTH('dbo.projects','is_active')                    AS has_active,
+              OBJECT_ID('dbo.project_superintendents','U')              AS has_super,
+              COL_LENGTH('dbo.vendor_prep_meetings','title_padded')     AS has_padded`,
     );
     projectsHasIsActive = rows[0]?.has_active != null;
     hasSuperTables = rows[0]?.has_super != null;
+    meetingsHaveTitlePadded = rows[0]?.has_padded != null;
   } catch {
     projectsHasIsActive = false;
     hasSuperTables = false;
+    meetingsHaveTitlePadded = false;
   }
   if (hasSuperTables) {
     try {
@@ -108,6 +114,19 @@ export function activeStageFilter(alias = 'p'): string {
 
 export type VendorSource = 'commitment' | 'directory' | 'either';
 
+/**
+ * Who may edit the tracker.
+ *
+ *   'open'       every signed-in user is an admin. The current default, because
+ *                Entra app roles aren't assigned yet — the SWA route already
+ *                requires authentication, so this is "anyone at BCI who can
+ *                reach the app", not "anyone on the internet".
+ *   'allowlist'  only addresses in dbo.vendor_admins (plus the code-level
+ *                bootstrap list, which is permanent). Switch to this once Entra
+ *                roles are in place.
+ */
+export type AdminMode = 'open' | 'allowlist';
+
 export type Settings = {
   /** Which Procore roster defines "every vendor on the project".
    *  Default 'either' (the union) on purpose: it is the only value that cannot
@@ -128,6 +147,8 @@ export type Settings = {
   /** Require Procore's `held` flag. Default OFF: the flag is rarely flipped, so
    *  requiring it makes almost everything read "not held". */
   requireMeetingHeld: 0 | 1;
+  /** See AdminMode. Default 'open' until Entra roles are assigned. */
+  adminMode: AdminMode;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -135,6 +156,7 @@ export const DEFAULT_SETTINGS: Settings = {
   requireVendorPresent: 0,
   allowTitleMatch: 1,
   requireMeetingHeld: 0,
+  adminMode: 'open',
 };
 
 let settingsTableReady = false;
@@ -164,22 +186,41 @@ function coerceSettings(raw: Record<string, string | null>): Settings {
     src === 'commitment' || src === 'directory' || src === 'either'
       ? src
       : DEFAULT_SETTINGS.vendorSource;
+  const am = raw.adminMode;
+  const adminMode: AdminMode =
+    am === 'open' || am === 'allowlist' ? am : DEFAULT_SETTINGS.adminMode;
   return {
     vendorSource,
     requireVendorPresent: bit('requireVendorPresent'),
     allowTitleMatch: bit('allowTitleMatch'),
     requireMeetingHeld: bit('requireMeetingHeld'),
+    adminMode,
   };
 }
 
+/* getSettings is now on the hot path — every request resolves admin rights
+   through it — so memoize briefly. The capacity is shared with three other
+   apps; a settings SELECT per request is exactly the kind of avoidable load
+   that shows up as interactive delay. Writes bust it immediately, so a setting
+   change is still visible on the next request. */
+let settingsCache: { value: Settings; expires: number } | null = null;
+const SETTINGS_TTL_MS = 30_000;
+
+export function bustSettingsCache(): void {
+  settingsCache = null;
+}
+
 export async function getSettings(): Promise<Settings> {
+  if (settingsCache && Date.now() < settingsCache.expires) return settingsCache.value;
   await ensureSettingsTable();
   const { rows } = await db.query<{ setting_key: string; setting_value: string | null }>(
     `SELECT setting_key, setting_value FROM dbo.vendor_settings`,
   );
   const raw: Record<string, string | null> = {};
   for (const r of rows) raw[r.setting_key] = r.setting_value;
-  return coerceSettings(raw);
+  const value = coerceSettings(raw);
+  settingsCache = { value, expires: Date.now() + SETTINGS_TTL_MS };
+  return value;
 }
 
 export async function saveSettings(
@@ -195,6 +236,7 @@ export async function saveSettings(
     requireVendorPresent: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
     allowTitleMatch: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
     requireMeetingHeld: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
+    adminMode: (v) => (v === 'open' || v === 'allowlist' ? String(v) : null),
   };
   for (const [key, value] of Object.entries(patch)) {
     const validate = allowed[key];
@@ -210,7 +252,110 @@ export async function saveSettings(
       { k: key, v: clean, actor },
     );
   }
+  bustSettingsCache();
   return getSettings();
+}
+
+/* ============================================================================
+ * ADMINS
+ *
+ * The list is editable in-app, but the code-level BOOTSTRAP_ADMINS in
+ * functions/_shared.ts are permanent and cannot be removed through the API.
+ * That is the lockout guard: an admin list you can edit is an admin list you
+ * can empty, and this app's only other recovery route would be a SQL console.
+ * ==========================================================================*/
+
+let adminTableReady = false;
+
+async function ensureAdminTable(bootstrap: string[]): Promise<void> {
+  if (adminTableReady) return;
+  await db.query(`
+    IF OBJECT_ID('dbo.vendor_admins','U') IS NULL
+    CREATE TABLE dbo.vendor_admins (
+      email      NVARCHAR(256) NOT NULL PRIMARY KEY,
+      added_by   NVARCHAR(256) NULL,
+      added_at   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+    );`);
+  // Seed the bootstrap accounts once, so the allowlist is never empty the first
+  // time someone switches away from 'open'.
+  for (const email of bootstrap) {
+    await db.query(
+      `IF NOT EXISTS (SELECT 1 FROM dbo.vendor_admins WHERE email = @e)
+       INSERT INTO dbo.vendor_admins (email, added_by) VALUES (@e, 'bootstrap');`,
+      { e: email.toLowerCase() },
+    );
+  }
+  adminTableReady = true;
+}
+
+export async function listAdmins(bootstrap: string[]): Promise<Record<string, unknown>[]> {
+  await ensureAdminTable(bootstrap);
+  const { rows } = await db.query<{ email: string }>(
+    `SELECT email, added_by, added_at FROM dbo.vendor_admins ORDER BY email`,
+  );
+  const boot = new Set(bootstrap.map((e) => e.toLowerCase()));
+  return rows.map((r) => ({ ...r, is_bootstrap: boot.has(String(r.email).toLowerCase()) }));
+}
+
+export async function addAdmin(email: string, actor: string, bootstrap: string[]): Promise<void> {
+  await ensureAdminTable(bootstrap);
+  await db.query(
+    `IF NOT EXISTS (SELECT 1 FROM dbo.vendor_admins WHERE email = @e)
+     INSERT INTO dbo.vendor_admins (email, added_by) VALUES (@e, @actor);`,
+    { e: email.trim().toLowerCase(), actor },
+  );
+}
+
+/**
+ * Remove an admin. Refuses two cases outright rather than letting someone lock
+ * the tracker's administration away:
+ *   - a bootstrap account (permanent by design, the recovery path)
+ *   - the last remaining admin
+ */
+export async function removeAdmin(
+  email: string,
+  bootstrap: string[],
+): Promise<{ ok: boolean; error?: string }> {
+  await ensureAdminTable(bootstrap);
+  const target = email.trim().toLowerCase();
+
+  if (bootstrap.map((e) => e.toLowerCase()).includes(target)) {
+    return {
+      ok: false,
+      error:
+        `${email} is a built-in admin and can't be removed here — that account is the ` +
+        `recovery path if the list is ever emptied.`,
+    };
+  }
+
+  const { rows } = await db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM dbo.vendor_admins`);
+  if ((rows[0]?.n ?? 0) <= 1) {
+    return {
+      ok: false,
+      error: 'Refusing to remove the last admin — someone has to be able to edit the tracker.',
+    };
+  }
+
+  await db.query(`DELETE FROM dbo.vendor_admins WHERE email = @e`, { e: target });
+  return { ok: true };
+}
+
+/** Is this signed-in address allowed to edit? Honors the adminMode setting. */
+export async function isAdminEmail(emails: string[], bootstrap: string[]): Promise<boolean> {
+  const settings = await getSettings();
+  if (settings.adminMode === 'open') return emails.length > 0;
+
+  const lower = emails.map((e) => e.toLowerCase());
+  if (lower.some((e) => bootstrap.map((b) => b.toLowerCase()).includes(e))) return true;
+  if (!lower.length) return false;
+
+  await ensureAdminTable(bootstrap);
+  const { rows } = await db.query<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM dbo.vendor_admins
+      WHERE email IN (${lower.map((_, i) => `@e${i}`).join(',')})`,
+    Object.fromEntries(lower.map((e, i) => [`e${i}`, e])),
+  );
+  return (rows[0]?.n ?? 0) > 0;
 }
 
 /* ============================================================================
@@ -294,6 +439,44 @@ function vendorSourcePredicate(s: Settings, alias = 'r'): string {
   }
 }
 
+/**
+ * Live title matching for manually-added vendors.
+ *
+ * Depends on `title_padded` — the normalized, space-padded meeting title that
+ * build_vendor_gold emits so the same whole-token test can run here without
+ * re-implementing normalize_company in T-SQL. It's a newer column, so it is
+ * PROBED: a mirror built before that change simply doesn't get live title
+ * matching for manual vendors, rather than failing the whole query with an
+ * invalid-column parse error and blanking the dashboard.
+ */
+function manualTitleMatchBranch(): string {
+  if (!meetingsHaveTitlePadded) return '';
+  return `
+      UNION ALL
+
+      -- Manual vendor, matched on the meeting title. CHARINDEX over the padded
+      -- title is the T-SQL equivalent of the notebook's INSTR(token_pad(...))
+      -- test: ' zip ' matches ' preparatory meeting zip ' but never ' zipper '.
+      SELECT
+          CAST(mv.project_id AS BIGINT),
+          CAST(mv.vendor_normalized AS NVARCHAR(256)),
+          CAST(mtg.meeting_id AS BIGINT),
+          CAST(mtg.title AS NVARCHAR(4000)),
+          CAST(mtg.meeting_date AS DATE),
+          CAST(mtg.held AS NVARCHAR(10)),
+          CAST('title' AS NVARCHAR(16)),
+          CAST(NULL AS NVARCHAR(10)),
+          CAST(NULL AS NVARCHAR(256)),
+          CAST(NULL AS NVARCHAR(64))
+      FROM dbo.vendor_manual_roster mv
+      JOIN proj ON proj.project_id = mv.project_id
+      JOIN dbo.vendor_prep_meetings mtg ON mtg.project_id = mv.project_id
+      WHERE mtg.title_padded IS NOT NULL
+        AND mtg.title_padded <> ''
+        AND LEN(REPLACE(mv.vendor_normalized, ' ', '')) >= 3
+        AND CHARINDEX(' ' + mv.vendor_normalized + ' ', mtg.title_padded) > 0`;
+}
+
 /** Which match rows count, per the settings. */
 function matchPredicate(s: Settings, alias = 'm'): string {
   const parts: string[] = [];
@@ -362,10 +545,65 @@ function vendorStatusCTEs(s: Settings, projectFilter: string): string {
       FROM roster
       GROUP BY project_id, vendor_normalized
   ),
-  eligible AS (
-      SELECT m.*
+  -- Candidate matches, from two places.
+  --
+  -- gold's dbo.vendor_prep_matches only ever sees vendors that were in PROCORE's
+  -- roster, so a vendor an admin adds by hand is invisible to it. Without the
+  -- second and third branches below, adding "K&B Electric" to a project whose
+  -- prep meeting is literally titled "Preparatory Meeting - K&B Electric" would
+  -- leave it reading "not held" forever — the admin action would appear to do
+  -- nothing. That is not hypothetical: the first live run produced ten unmatched
+  -- meetings naming real subs that Procore's project directory has never heard of.
+  --
+  -- Every column is CAST explicitly. The mirror pipeline auto-creates these
+  -- tables, so a column's type follows whatever the last build inferred, and an
+  -- un-cast UNION ALL between an NVARCHAR mirror column and a computed INT is
+  -- exactly the kind of implicit-conversion failure that takes the whole
+  -- dashboard down.
+  eligible_raw AS (
+      SELECT
+          CAST(m.project_id AS BIGINT)                    AS project_id,
+          CAST(m.vendor_normalized AS NVARCHAR(256))      AS vendor_normalized,
+          CAST(m.meeting_id AS BIGINT)                    AS meeting_id,
+          CAST(m.meeting_title AS NVARCHAR(4000))         AS meeting_title,
+          CAST(m.meeting_date AS DATE)                    AS meeting_date,
+          CAST(m.held AS NVARCHAR(10))                    AS held,
+          CAST(m.match_method AS NVARCHAR(16))            AS match_method,
+          CAST(m.attendee_attended AS NVARCHAR(10))       AS attendee_attended,
+          CAST(m.matched_attendee_name AS NVARCHAR(256))  AS matched_attendee_name,
+          CAST(m.attendance_status AS NVARCHAR(64))       AS attendance_status
       FROM dbo.vendor_prep_matches m
       JOIN proj ON proj.project_id = m.project_id
+
+      UNION ALL
+
+      -- Manual vendor, matched on the attendee list. Both sides are already
+      -- normalized keys, so this needs no text processing.
+      SELECT
+          CAST(mv.project_id AS BIGINT),
+          CAST(mv.vendor_normalized AS NVARCHAR(256)),
+          CAST(mtg.meeting_id AS BIGINT),
+          CAST(mtg.title AS NVARCHAR(4000)),
+          CAST(mtg.meeting_date AS DATE),
+          CAST(mtg.held AS NVARCHAR(10)),
+          CAST('attendee' AS NVARCHAR(16)),
+          CAST(MAX(CASE WHEN CAST(a.attended AS NVARCHAR(10)) IN ('1','true','True')
+                        THEN 1 ELSE 0 END) AS NVARCHAR(10)),
+          CAST(MAX(a.attendee_name) AS NVARCHAR(256)),
+          CAST(MAX(a.attendance_status) AS NVARCHAR(64))
+      FROM dbo.vendor_manual_roster mv
+      JOIN proj ON proj.project_id = mv.project_id
+      JOIN dbo.vendor_prep_meetings mtg ON mtg.project_id = mv.project_id
+      JOIN dbo.vendor_prep_attendees a
+             ON a.meeting_id = mtg.meeting_id
+            AND a.company_normalized = mv.vendor_normalized
+      WHERE CAST(a.is_gc AS NVARCHAR(10)) NOT IN ('1','true','True')
+      GROUP BY mv.project_id, mv.vendor_normalized, mtg.meeting_id, mtg.title,
+               mtg.meeting_date, mtg.held
+      ${manualTitleMatchBranch()}
+  ),
+  eligible AS (
+      SELECT * FROM eligible_raw m
       WHERE ${matchPredicate(s, 'm')}
   ),
   -- Best evidence per vendor: an attendee match outranks a title match, then the
@@ -695,6 +933,138 @@ export async function removeManualVendor(
 /* ============================================================================
  * MISC
  * ==========================================================================*/
+
+/* ============================================================================
+ * METRICS
+ *
+ * ⚠️ One thing is deliberately NOT computed here: **coverage percentage over
+ * time.** The vendor roster is a CURRENT snapshot mirrored from Procore — there
+ * is no history of who was on a project's roster in March — so a chart claiming
+ * "42% of vendors had their prep meeting in March" would be inventing its own
+ * denominator. Coverage is reported as a present-day figure only; what IS
+ * honestly derivable month over month is what actually happened: meetings held,
+ * projects participating, vendors credited, and how well the meetings were
+ * recorded. The dashboard says as much next to the charts.
+ * ==========================================================================*/
+
+export async function getMetrics(months: number): Promise<Record<string, unknown>> {
+  await ensureProjectColumnMeta();
+  await ensureAdminTables();
+  const s = await getSettings();
+  const win = Math.max(1, Math.min(60, Math.floor(months)));
+
+  // ── Current adoption + coverage snapshot ────────────────────────────────
+  const { rows: snap } = await db.query(`
+    WITH ${vendorStatusCTEs(s, activeStageFilter('p'))},
+    per_project AS (
+        SELECT project_id,
+               SUM(CASE WHEN status <> 'not_applicable' THEN 1 ELSE 0 END) AS tracked,
+               SUM(CASE WHEN status = 'held' THEN 1 ELSE 0 END)            AS held
+        FROM resolved GROUP BY project_id
+    )
+    SELECT
+        (SELECT COUNT(*) FROM proj)                                    AS active_projects,
+        (SELECT COUNT(DISTINCT m.project_id) FROM dbo.vendor_prep_meetings m
+          JOIN proj ON proj.project_id = m.project_id)                 AS projects_with_meetings,
+        COALESCE(SUM(pp.tracked), 0)                                   AS vendors_tracked,
+        COALESCE(SUM(pp.held), 0)                                      AS vendors_held,
+        (SELECT COUNT(*) FROM dbo.vendor_prep_meetings m
+          JOIN proj ON proj.project_id = m.project_id)                 AS total_meetings,
+        (SELECT COUNT(*) FROM dbo.vendor_prep_meetings m
+          JOIN proj ON proj.project_id = m.project_id
+          LEFT JOIN (SELECT DISTINCT meeting_id FROM dbo.vendor_prep_matches) x
+                 ON x.meeting_id = m.meeting_id
+         WHERE x.meeting_id IS NULL)                                   AS unmatched_meetings
+    FROM per_project pp;`);
+
+  // ── Month-by-month, from what actually happened ─────────────────────────
+  // Each meeting is classified by its BEST evidence: an attendee match beats a
+  // title-only match beats nothing. Counting a meeting once, at its strongest
+  // signal, keeps the three series a partition of the total rather than
+  // overlapping sets that sum to more than the meetings held.
+  const { rows: monthly } = await db.query(
+    `
+    WITH mtg AS (
+        SELECT m.meeting_id,
+               m.project_id,
+               CONVERT(CHAR(7), m.meeting_date, 23) AS ym,
+               MAX(CASE WHEN x.match_method = 'attendee' THEN 1 ELSE 0 END) AS has_attendee,
+               MAX(CASE WHEN x.match_method = 'title'    THEN 1 ELSE 0 END) AS has_title
+        FROM dbo.vendor_prep_meetings m
+        LEFT JOIN dbo.vendor_prep_matches x ON x.meeting_id = m.meeting_id
+        WHERE m.meeting_date IS NOT NULL
+          AND m.meeting_date >= DATEADD(MONTH, -@win, CAST(GETUTCDATE() AS DATE))
+        GROUP BY m.meeting_id, m.project_id, CONVERT(CHAR(7), m.meeting_date, 23)
+    ),
+    att AS (
+        SELECT CONVERT(CHAR(7), m.meeting_date, 23) AS ym,
+               COUNT(*) AS attendees,
+               SUM(CASE WHEN a.attendance_status IN ('present','conference','absent','distribution')
+                        THEN 1 ELSE 0 END) AS attendees_with_status,
+               SUM(CASE WHEN CAST(a.is_gc AS NVARCHAR(10)) NOT IN ('1','true','True')
+                        THEN 1 ELSE 0 END) AS vendor_attendees
+        FROM dbo.vendor_prep_attendees a
+        JOIN dbo.vendor_prep_meetings m ON m.meeting_id = a.meeting_id
+        WHERE m.meeting_date IS NOT NULL
+          AND m.meeting_date >= DATEADD(MONTH, -@win, CAST(GETUTCDATE() AS DATE))
+        GROUP BY CONVERT(CHAR(7), m.meeting_date, 23)
+    ),
+    ven AS (
+        SELECT CONVERT(CHAR(7), x.meeting_date, 23) AS ym,
+               COUNT(DISTINCT CONCAT(CAST(x.project_id AS NVARCHAR(20)), '|', x.vendor_normalized))
+                 AS vendors_credited
+        FROM dbo.vendor_prep_matches x
+        WHERE x.meeting_date IS NOT NULL
+          AND x.meeting_date >= DATEADD(MONTH, -@win, CAST(GETUTCDATE() AS DATE))
+        GROUP BY CONVERT(CHAR(7), x.meeting_date, 23)
+    )
+    SELECT
+        mtg.ym                                                        AS month,
+        COUNT(*)                                                      AS meetings,
+        COUNT(DISTINCT mtg.project_id)                                AS projects,
+        SUM(CASE WHEN mtg.has_attendee = 1 THEN 1 ELSE 0 END)         AS attendee_matched,
+        SUM(CASE WHEN mtg.has_attendee = 0 AND mtg.has_title = 1 THEN 1 ELSE 0 END) AS title_only,
+        SUM(CASE WHEN mtg.has_attendee = 0 AND mtg.has_title = 0 THEN 1 ELSE 0 END) AS unmatched,
+        MAX(COALESCE(att.attendees, 0))             AS attendees,
+        MAX(COALESCE(att.attendees_with_status, 0)) AS attendees_with_status,
+        MAX(COALESCE(att.vendor_attendees, 0))      AS vendor_attendees,
+        MAX(COALESCE(ven.vendors_credited, 0))      AS vendors_credited
+    FROM mtg
+    LEFT JOIN att ON att.ym = mtg.ym
+    LEFT JOIN ven ON ven.ym = mtg.ym
+    GROUP BY mtg.ym
+    ORDER BY mtg.ym;`,
+    { win },
+  );
+
+  // ── Per-project leaderboard (current coverage) ──────────────────────────
+  const { rows: leaderboard } = await db.query(`
+    WITH ${vendorStatusCTEs(s, activeStageFilter('p'))}
+    SELECT
+        proj.project_id, proj.project_name, proj.superintendent_name, proj.project_manager,
+        SUM(CASE WHEN r.status <> 'not_applicable' THEN 1 ELSE 0 END) AS tracked,
+        SUM(CASE WHEN r.status = 'held' THEN 1 ELSE 0 END)            AS held,
+        (SELECT COUNT(*) FROM dbo.vendor_prep_meetings m
+          WHERE m.project_id = proj.project_id)                       AS meetings
+    FROM proj
+    LEFT JOIN resolved r ON r.project_id = proj.project_id
+    GROUP BY proj.project_id, proj.project_name, proj.superintendent_name, proj.project_manager
+    ORDER BY proj.project_name;`);
+
+  // ── Vendors appearing in the most prep meetings ─────────────────────────
+  const { rows: topVendors } = await db.query(`
+    SELECT TOP 15
+           x.vendor_name,
+           COUNT(DISTINCT x.meeting_id) AS meetings,
+           COUNT(DISTINCT x.project_id) AS projects,
+           MAX(CASE WHEN x.match_method = 'attendee' THEN 1 ELSE 0 END) AS ever_on_attendee_list
+    FROM dbo.vendor_prep_matches x
+    WHERE COALESCE(x.vendor_name,'') <> ''
+    GROUP BY x.vendor_name
+    ORDER BY COUNT(DISTINCT x.meeting_id) DESC, x.vendor_name;`);
+
+  return { snapshot: snap[0] ?? {}, monthly, leaderboard, topVendors, months: win };
+}
 
 export async function getSyncStatus(): Promise<Record<string, unknown>> {
   const { rows } = await db.query(`

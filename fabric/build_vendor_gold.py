@@ -195,6 +195,10 @@ SELECT
     m.status,
     m.location,
     m.attendee_count,
+    -- Normalized + space-padded title, so the API can run the same whole-token
+    -- title test live for manually-added vendors without re-implementing
+    -- normalize_company in T-SQL.
+    token_pad(m.title)       AS title_padded,
     -- Vendor-side attendees only: the count that says whether anyone from
     -- outside Buffalo Construction was actually in the room.
     COALESCE(a.vendor_attendees, 0)          AS vendor_attendee_count,

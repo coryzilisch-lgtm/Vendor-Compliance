@@ -525,9 +525,16 @@ def looks_like_prep_meeting(title):
 # "meeting_date" are all absent in this tenant — same class of problem as the
 # attendee company. DATE_FIELDS is probed in order and the key that actually
 # won is reported by the MEETING DATE diagnostic, so this stops being guesswork.
+# CONFIRMED 2026-08: this tenant populates **starts_at** (80 of 81 meetings;
+# the 81st fell through to created_at). `date`, `scheduled_date` and
+# `meeting_date` — the three the first version probed — are never present, which
+# is why every meeting came back dateless. starts_at is listed first now so the
+# common case doesn't walk the whole list; created_at stays LAST because it is a
+# record-creation timestamp, not when the meeting happened, and is only ever a
+# last resort.
 DATE_FIELDS = [
-    "meeting_date", "date", "scheduled_date", "scheduled_at", "datetime",
-    "date_time", "start_date", "start_time", "starts_at", "start_at",
+    "starts_at", "meeting_date", "date", "scheduled_date", "scheduled_at",
+    "datetime", "date_time", "start_date", "start_time", "start_at",
     "occurred_at", "held_at", "actual_start_time", "created_at",
 ]
 

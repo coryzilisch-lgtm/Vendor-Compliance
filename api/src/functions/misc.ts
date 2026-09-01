@@ -23,7 +23,7 @@ app.http('me', {
       {
         email: p.userDetails ?? null,
         identityProvider: p.identityProvider ?? null,
-        is_admin: isAdmin(request),
+        is_admin: await isAdmin(request),
       },
       undefined,
       0,

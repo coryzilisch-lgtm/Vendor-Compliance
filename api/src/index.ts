@@ -11,3 +11,5 @@ import './functions/projectDetail.js';
 import './functions/overrides.js';
 import './functions/manualVendors.js';
 import './functions/settings.js';
+import './functions/admins.js';
+import './functions/metrics.js';

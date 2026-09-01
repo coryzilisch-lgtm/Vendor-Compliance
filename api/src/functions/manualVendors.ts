@@ -18,7 +18,7 @@ app.http('manualVendors', {
   route: 'manual-vendors',
   handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
-      const denied = requireAdmin(request);
+      const denied = await requireAdmin(request);
       if (denied) return denied;
 
       const body = (await request.json()) as Record<string, unknown>;
@@ -43,6 +43,7 @@ app.http('manualVendors', {
       });
 
       cacheBust('tracker:');
+      cacheBust('metrics:');
       cacheBust(`project:${projectId}`);
       return meta({ ok: true, project_id: projectId, vendor_normalized: vendorNormalized }, undefined, 0);
     } catch (err) {
@@ -58,7 +59,7 @@ app.http('manualVendorDelete', {
   route: 'manual-vendors/{projectId}/{vendor}',
   handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
-      const denied = requireAdmin(request);
+      const denied = await requireAdmin(request);
       if (denied) return denied;
 
       const projectId = Number(request.params.projectId);
@@ -68,6 +69,7 @@ app.http('manualVendorDelete', {
       }
       await removeManualVendor(projectId, vendor);
       cacheBust('tracker:');
+      cacheBust('metrics:');
       cacheBust(`project:${projectId}`);
       return meta({ ok: true }, undefined, 0);
     } catch (err) {
