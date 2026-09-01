@@ -21,12 +21,19 @@
 # BOTH vendor rosters are ingested on purpose. Which one drives the tracker's
 # checklist is a dashboard setting (`vendorSource`), not a decision baked in here.
 #
-# ANSWERED 2026-08 against live data: BCI does NOT use Procore commitments —
-# work_order_contracts and purchase_order_contracts both return HTTP 200 with
-# zero rows on every project, so that is a real absence and not a permission
-# error. **The project directory is the vendor roster.** The commitments pull is
-# kept (it is 2 cheap calls) so the day someone starts writing subcontracts in
-# Procore, the better denominator appears with no code change.
+# CORRECTED 2026-09. An earlier note here said "BCI does NOT use Procore
+# commitments". That was wrong, and it was wrong in a way worth keeping written
+# down. Commitments exist — project 3119932 alone returns 20 work orders and 10
+# purchase orders, with Procore's Total header agreeing — and this file was
+# already calling the right endpoint. What actually happened: the contract's
+# vendor name came back empty on every row, the silver roster drops rows with an
+# empty vendor, and the resulting zero in the coverage diagnostic got read as a
+# fact about the business rather than a bug in the extraction.
+#
+# Both rosters are pulled, the vendor is now resolved the same way an attendee's
+# company is (documented keys -> recursive search -> per-contract detail call),
+# and a COMMITMENT VENDOR RESOLUTION diagnostic reports bronze-in vs roster-out
+# so that specific misreading can't happen again.
 #
 # FULLY STANDALONE. Belongs in its OWN notebook — it mints its own Procore token
 # from Key Vault and fetches its own project list, so it does not depend on the
@@ -132,19 +139,33 @@ _endpoint_status = {} # (endpoint, http status) -> count, to tell 403 from empty
 _withheld = {}        # endpoint -> projects where Total exceeded the rows returned
 _last_total = {"value": None}  # Procore's Total header from the most recent response
 _date_key_samples = {}  # date-ish keys actually present on meeting records
+_commitment_paths = {}  # which JSON path yielded each commitment's vendor
+_commitment_view  = {}  # endpoint -> the `view` param that actually carries vendors
+_commitment_stats = {"rows": 0, "with_vendor": 0, "via_detail": 0, "detail_calls": 0}
 
 # ---- What to pull -----------------------------------------------------------
 PULL_MEETINGS    = True
-# MEASURED 2026-08 across 90/90 projects: work_order_contracts and
-# purchase_order_contracts both return HTTP 200 with ZERO rows. BCI does not
-# write subcontracts in Procore. Those two calls per project were 180 of the
-# run's 532 calls — 34% of the API budget — producing nothing.
+# ⚠️ An earlier run concluded "BCI writes no subcontracts in Procore" from empty
+# 200s and turned this off. That was WRONG, and the way it was wrong is worth
+# remembering: commitments DO exist (project 3119932 alone has 20 work orders and
+# 10 purchase orders, and Procore's Total header agrees), the ingest was already
+# calling the right endpoint, and 1500 rows really did land in
+# bronze_vendor_commitments. They then vanished in the silver build, because the
+# vendor name came back empty on every one of them and the roster's
+# `WHERE vendor_normalized <> ''` filter dropped the lot. A wrong number in a
+# coverage diagnostic got read as a fact about the business.
 #
-# Left OFF by default. Flip it True occasionally (say monthly, or when someone
-# says Procore commitments are being adopted) to re-check; the COVERAGE
-# DIAGNOSTIC will show them the moment they exist, and the vendorSource setting
-# can then switch to the cleaner denominator with no code change.
-PULL_COMMITMENTS = False       # work order + purchase order contracts
+# So: back ON, with the vendor now resolved the same way an attendee's company
+# is — documented keys first, then a recursive search, then a per-contract detail
+# call — and with a diagnostic that reports how many commitment rows carry a
+# usable vendor, so a silent drop can't be mistaken for an absence again.
+PULL_COMMITMENTS = True        # work order + purchase order contracts
+# Procore's list endpoints return a slim contract record. When the vendor isn't
+# on it, fall back to GET /{path}/{id}, bounded so a tenant with thousands of
+# contracts can't turn one run into thousands of extra calls. The view probe
+# below usually makes this unnecessary after the first project.
+COMMITMENT_DETAIL_LOOKUP = True
+COMMITMENT_DETAIL_MAX    = 600
 PULL_DIRECTORY   = True        # project directory vendor list
 # The attendee -> company bridge. A meeting attendee carries only a person id
 # and an email, so the company has to come from the project directory people
@@ -734,6 +755,84 @@ def attendee_company(att):
     return None
 
 
+def commitment_vendor(contract):
+    """(name, procore_id, path) for the company a commitment is written against.
+
+    Same failure mode as the attendee company, and so the same treatment. The
+    first version of this read only `contract["vendor"]`; Procore's LIST response
+    for work_order_contracts is slim and doesn't carry it, so every one of 1500
+    ingested contracts produced an empty vendor name and was then silently
+    dropped by the silver roster's non-empty filter. The number that reached the
+    diagnostic — zero commitment vendors — was read as "BCI has no commitments".
+
+    Documented keys first, then the recursive search, and the caller falls back
+    to a per-contract detail call when both come up empty.
+    """
+    if not isinstance(contract, dict):
+        return None, None, None
+    for key in ("vendor", "contract_company", "company", "subcontractor", "supplier"):
+        value = contract.get(key)
+        name = pick_name(value)
+        if name:
+            vid = value.get("id") if isinstance(value, dict) else None
+            _commitment_paths[key] = _commitment_paths.get(key, 0) + 1
+            return name, vid, key
+    direct = pick(contract, "vendor_name", "contract_company_name", "company_name")
+    if direct:
+        _commitment_paths["<direct>"] = _commitment_paths.get("<direct>", 0) + 1
+        return direct, pick(contract, "vendor_id", "company_id"), "<direct>"
+    name, path = _deep_company(contract)
+    if name:
+        _commitment_paths[f"deep:{path}"] = _commitment_paths.get(f"deep:{path}", 0) + 1
+        return name, None, f"deep:{path}"
+    _commitment_paths["absent"] = _commitment_paths.get("absent", 0) + 1
+    return None, None, None
+
+
+def fetch_commitment_rows(pid, path, label):
+    """List a project's commitments, resolving WHICH request shape carries the
+    vendor once per endpoint rather than per project.
+
+    Procore's `view=extended` returns the fat record on most tenants. Whether it
+    does here is a question about this tenant, so it gets asked once: on the
+    first project that returns any contracts, try extended, and keep it only if
+    it actually produced vendors that the default view didn't. Every later
+    project reuses that answer — no repeated probing, and no assumption baked in
+    from a different tenant's behaviour.
+    """
+    url = f"{PROCORE_API_BASE_URL}/rest/v1.0/{path}"
+
+    def _list(view):
+        params = {"project_id": pid}
+        if view:
+            params["view"] = view
+        return get_paginated(url, params, per_page=VENDOR_PAGE_SIZE, label=label)
+
+    def _vendor_count(rows):
+        return sum(1 for r in rows if commitment_vendor(r)[0])
+
+    known = _commitment_view.get(path, "unset")
+    if known != "unset":
+        return _list(known)
+
+    rows = _list(None)
+    if not rows:
+        return rows                      # nothing to learn from; ask again next project
+    if _vendor_count(rows):
+        _commitment_view[path] = None
+        return rows
+    try:
+        extended = _list("extended")
+    except Exception:
+        extended = []
+    if extended and _vendor_count(extended):
+        _commitment_view[path] = "extended"
+        print(f"  {label}: vendor only present with view=extended — using it from here on.")
+        return extended
+    _commitment_view[path] = None
+    return rows
+
+
 def attendee_name(att):
     if not isinstance(att, dict):
         return str(att) if att else None
@@ -999,13 +1098,31 @@ for pi, project in enumerate(scope, start=1):
         for kind, path in (("work_order", "work_order_contracts"),
                            ("purchase_order", "purchase_order_contracts")):
             try:
-                rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.0/{path}",
-                                     {"project_id": pid}, per_page=VENDOR_PAGE_SIZE,
-                                     label=path)
+                rows = fetch_commitment_rows(pid, path, path)
                 for c in rows:
-                    vendor = c.get("vendor") if isinstance(c, dict) else None
-                    vname = pick_name(vendor) or pick(c, "vendor_name", "contract_company_name")
-                    vid   = vendor.get("id") if isinstance(vendor, dict) else pick(c, "vendor_id")
+                    vname, vid, _ = commitment_vendor(c)
+                    _commitment_stats["rows"] += 1
+                    # Last resort: the fat record. Only for contracts the list
+                    # view left without a vendor, and hard-bounded — the whole
+                    # point of the view probe above is that this stays rare.
+                    if (not vname and COMMITMENT_DETAIL_LOOKUP
+                            and _commitment_stats["detail_calls"] < COMMITMENT_DETAIL_MAX
+                            and isinstance(c, dict) and c.get("id") is not None):
+                        _commitment_stats["detail_calls"] += 1
+                        try:
+                            detail = request_json(
+                                f"{PROCORE_API_BASE_URL}/rest/v1.0/{path}/{c['id']}",
+                                {"project_id": pid})
+                            if isinstance(detail, dict):
+                                dname, did, _ = commitment_vendor(detail)
+                                if dname:
+                                    vname, vid = dname, (did or vid)
+                                    _commitment_stats["via_detail"] += 1
+                                    c = {**c, **detail}
+                        except Exception:
+                            pass
+                    if vname:
+                        _commitment_stats["with_vendor"] += 1
                     commitments.append({
                         "project_procore_id": pid,
                         "project_name": pname,
@@ -1385,6 +1502,45 @@ FROM silver_vendor_roster
 print("Read this as: whichever source covers more PROJECTS is the one BCI keeps")
 print("current. A large `directory_only` count is expected — the project directory")
 print("holds the owner, architect and inspectors, who never need a prep meeting.")
+print("⚠️  A zero in `vendor_rows_commitment` does NOT mean the tenant has no")
+print("    commitments. Read the next block before concluding anything from it.")
+
+# ---- Did the commitments we fetched survive into the roster? ---------------
+# This block exists because the previous version of this file didn't have it.
+# 1500 contracts were pulled, every one lost its vendor name, the roster's
+# non-empty filter dropped all 1500, and the resulting zero above was written
+# down as "BCI does not use Procore commitments". Bronze count vs silver count,
+# side by side, makes that failure impossible to misread as an absence.
+if PULL_COMMITMENTS:
+    print("\n--- COMMITMENT VENDOR RESOLUTION (bronze in -> roster out) ---")
+    _cs = _commitment_stats
+    print(f"  contracts fetched              : {_cs['rows']}")
+    print(f"  ...with a vendor resolved      : {_cs['with_vendor']}")
+    print(f"  ...resolved via a detail call  : {_cs['via_detail']} "
+          f"({_cs['detail_calls']} detail calls made, cap {COMMITMENT_DETAIL_MAX})")
+    if _commitment_view:
+        for path, view in _commitment_view.items():
+            print(f"  list view used for {path}: {view or 'default'}")
+    if _commitment_paths:
+        print("  where the vendor was found:")
+        for k, n in sorted(_commitment_paths.items(), key=lambda kv: -kv[1]):
+            print(f"    {k}: {n}")
+    survived = spark.sql("""
+        SELECT COUNT(*) AS n FROM silver_vendor_roster WHERE from_commitment
+    """).collect()[0]["n"]
+    print(f"  roster rows from commitments   : {survived}")
+    if _cs["rows"] and not _cs["with_vendor"]:
+        print("  ⚠️  Contracts came back but NONE carried a vendor. That is a SHAPE")
+        print("      problem, not an empty tenant. Print one raw_json from")
+        print("      bronze_vendor_commitments and tell me which key holds the company:")
+        print("        spark.sql('SELECT raw_json FROM bronze_vendor_commitments LIMIT 1')"
+              ".collect()[0][0]")
+    elif _cs["with_vendor"] and not survived:
+        print("  ⚠️  Vendors resolved but no roster rows — check the is_gc filter; the")
+        print("      contracts may all be written against Buffalo Construction itself.")
+    if _cs["detail_calls"] >= COMMITMENT_DETAIL_MAX:
+        print(f"  ⚠️  Hit the detail-call cap ({COMMITMENT_DETAIL_MAX}); some contracts were")
+        print("      left unresolved. Raise COMMITMENT_DETAIL_MAX and re-run.")
 
 print("\n--- MEETING DATE (which key this tenant actually populates) ---")
 for k, n in sorted(_date_fields_used.items(), key=lambda kv: -kv[1]):
