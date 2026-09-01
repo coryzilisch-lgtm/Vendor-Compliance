@@ -267,13 +267,15 @@ var PROCORE_COMPANY_ID=18895;
 function procoreProjectUrl(pid){
   return 'https://app.procore.com/'+encodeURIComponent(pid)+'/project/home';
 }
-/* Meetings tool deep link. The company/project/tool shape matches the create
-   URL the team uses (.../tools/meetings/create/383995), with the meeting id in
-   place of "create/{template}". If Procore ever changes this, it is the only
-   place to edit. */
+/* Meetings tool deep link.
+   VERIFIED against a real Procore URL — the path needs the **/details/**
+   segment: .../tools/meetings/details/{meeting_id}. Deriving it from the create
+   URL the team uses (.../tools/meetings/create/383995) by swapping the id in
+   gives .../tools/meetings/{id}, which 404s. Same shape as the Safety
+   Dashboard's forms link (.../tools/forms/details/{id}). */
 function procoreMeetingUrl(pid, mid){
   return 'https://app.procore.com/webclients/host/companies/'+PROCORE_COMPANY_ID
-    +'/projects/'+encodeURIComponent(pid)+'/tools/meetings/'+encodeURIComponent(mid);
+    +'/projects/'+encodeURIComponent(pid)+'/tools/meetings/details/'+encodeURIComponent(mid);
 }
 function extLink(href, label, title){
   return '<a class="ext" href="'+esc(href)+'" target="_blank" rel="noopener"'

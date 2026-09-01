@@ -185,6 +185,19 @@ list" from "unmatched" — the exact comparison the chart exists to make. That i
 why "meetings that matched no vendor" is its own chart rather than a third line.
 Re-run `scripts/validate_palette.js` before adding any series.
 
+### Procore deep links
+
+| Target | URL |
+|---|---|
+| Project | `https://app.procore.com/{project_id}/project/home` |
+| Meeting | `https://app.procore.com/webclients/host/companies/18895/projects/{project_id}/tools/meetings/`**`details/`**`{meeting_id}` |
+
+⚠️ **The meeting URL needs the `details/` segment.** Deriving it from the create
+URL the team uses (`.../tools/meetings/create/383995`) by swapping the id in
+gives `.../tools/meetings/{id}`, which 404s — that was the first attempt.
+Verified against a real Procore URL. Same shape as the Safety Dashboard's forms
+link. Both URLs are built by one function each in `dashboard/index.html`.
+
 ### The Review Queue is not decoration
 
 Prep meetings that were logged but **can't be credited to any vendor** get their own tab rather
