@@ -16,6 +16,7 @@ import { db } from './client.js';
 let projectMetaProbed = false;
 let projectsHasIsActive = false;
 let hasSuperTables = false;
+let meetingsHaveTitlePadded = false;
 
 /**
  * The mirror pipeline AUTO-CREATES dbo.projects, so its column set follows
@@ -32,15 +33,20 @@ let hasSuperTables = false;
 export async function ensureProjectColumnMeta(): Promise<void> {
   if (projectMetaProbed) return;
   try {
-    const { rows } = await db.query<{ has_active: number | null; has_super: number | null }>(
-      `SELECT COL_LENGTH('dbo.projects','is_active')                  AS has_active,
-              OBJECT_ID('dbo.project_superintendents','U')            AS has_super`,
+    const { rows } = await db.query<{
+      has_active: number | null; has_super: number | null; has_padded: number | null;
+    }>(
+      `SELECT COL_LENGTH('dbo.projects','is_active')                    AS has_active,
+              OBJECT_ID('dbo.project_superintendents','U')              AS has_super,
+              COL_LENGTH('dbo.vendor_prep_meetings','title_padded')     AS has_padded`,
     );
     projectsHasIsActive = rows[0]?.has_active != null;
     hasSuperTables = rows[0]?.has_super != null;
+    meetingsHaveTitlePadded = rows[0]?.has_padded != null;
   } catch {
     projectsHasIsActive = false;
     hasSuperTables = false;
+    meetingsHaveTitlePadded = false;
   }
   if (hasSuperTables) {
     try {
@@ -294,6 +300,44 @@ function vendorSourcePredicate(s: Settings, alias = 'r'): string {
   }
 }
 
+/**
+ * Live title matching for manually-added vendors.
+ *
+ * Depends on `title_padded` — the normalized, space-padded meeting title that
+ * build_vendor_gold emits so the same whole-token test can run here without
+ * re-implementing normalize_company in T-SQL. It's a newer column, so it is
+ * PROBED: a mirror built before that change simply doesn't get live title
+ * matching for manual vendors, rather than failing the whole query with an
+ * invalid-column parse error and blanking the dashboard.
+ */
+function manualTitleMatchBranch(): string {
+  if (!meetingsHaveTitlePadded) return '';
+  return `
+      UNION ALL
+
+      -- Manual vendor, matched on the meeting title. CHARINDEX over the padded
+      -- title is the T-SQL equivalent of the notebook's INSTR(token_pad(...))
+      -- test: ' zip ' matches ' preparatory meeting zip ' but never ' zipper '.
+      SELECT
+          CAST(mv.project_id AS BIGINT),
+          CAST(mv.vendor_normalized AS NVARCHAR(256)),
+          CAST(mtg.meeting_id AS BIGINT),
+          CAST(mtg.title AS NVARCHAR(4000)),
+          CAST(mtg.meeting_date AS DATE),
+          CAST(mtg.held AS NVARCHAR(10)),
+          CAST('title' AS NVARCHAR(16)),
+          CAST(NULL AS NVARCHAR(10)),
+          CAST(NULL AS NVARCHAR(256)),
+          CAST(NULL AS NVARCHAR(64))
+      FROM dbo.vendor_manual_roster mv
+      JOIN proj ON proj.project_id = mv.project_id
+      JOIN dbo.vendor_prep_meetings mtg ON mtg.project_id = mv.project_id
+      WHERE mtg.title_padded IS NOT NULL
+        AND mtg.title_padded <> ''
+        AND LEN(REPLACE(mv.vendor_normalized, ' ', '')) >= 3
+        AND CHARINDEX(' ' + mv.vendor_normalized + ' ', mtg.title_padded) > 0`;
+}
+
 /** Which match rows count, per the settings. */
 function matchPredicate(s: Settings, alias = 'm'): string {
   const parts: string[] = [];
@@ -362,10 +406,65 @@ function vendorStatusCTEs(s: Settings, projectFilter: string): string {
       FROM roster
       GROUP BY project_id, vendor_normalized
   ),
-  eligible AS (
-      SELECT m.*
+  -- Candidate matches, from two places.
+  --
+  -- gold's dbo.vendor_prep_matches only ever sees vendors that were in PROCORE's
+  -- roster, so a vendor an admin adds by hand is invisible to it. Without the
+  -- second and third branches below, adding "K&B Electric" to a project whose
+  -- prep meeting is literally titled "Preparatory Meeting - K&B Electric" would
+  -- leave it reading "not held" forever — the admin action would appear to do
+  -- nothing. That is not hypothetical: the first live run produced ten unmatched
+  -- meetings naming real subs that Procore's project directory has never heard of.
+  --
+  -- Every column is CAST explicitly. The mirror pipeline auto-creates these
+  -- tables, so a column's type follows whatever the last build inferred, and an
+  -- un-cast UNION ALL between an NVARCHAR mirror column and a computed INT is
+  -- exactly the kind of implicit-conversion failure that takes the whole
+  -- dashboard down.
+  eligible_raw AS (
+      SELECT
+          CAST(m.project_id AS BIGINT)                    AS project_id,
+          CAST(m.vendor_normalized AS NVARCHAR(256))      AS vendor_normalized,
+          CAST(m.meeting_id AS BIGINT)                    AS meeting_id,
+          CAST(m.meeting_title AS NVARCHAR(4000))         AS meeting_title,
+          CAST(m.meeting_date AS DATE)                    AS meeting_date,
+          CAST(m.held AS NVARCHAR(10))                    AS held,
+          CAST(m.match_method AS NVARCHAR(16))            AS match_method,
+          CAST(m.attendee_attended AS NVARCHAR(10))       AS attendee_attended,
+          CAST(m.matched_attendee_name AS NVARCHAR(256))  AS matched_attendee_name,
+          CAST(m.attendance_status AS NVARCHAR(64))       AS attendance_status
       FROM dbo.vendor_prep_matches m
       JOIN proj ON proj.project_id = m.project_id
+
+      UNION ALL
+
+      -- Manual vendor, matched on the attendee list. Both sides are already
+      -- normalized keys, so this needs no text processing.
+      SELECT
+          CAST(mv.project_id AS BIGINT),
+          CAST(mv.vendor_normalized AS NVARCHAR(256)),
+          CAST(mtg.meeting_id AS BIGINT),
+          CAST(mtg.title AS NVARCHAR(4000)),
+          CAST(mtg.meeting_date AS DATE),
+          CAST(mtg.held AS NVARCHAR(10)),
+          CAST('attendee' AS NVARCHAR(16)),
+          CAST(MAX(CASE WHEN CAST(a.attended AS NVARCHAR(10)) IN ('1','true','True')
+                        THEN 1 ELSE 0 END) AS NVARCHAR(10)),
+          CAST(MAX(a.attendee_name) AS NVARCHAR(256)),
+          CAST(MAX(a.attendance_status) AS NVARCHAR(64))
+      FROM dbo.vendor_manual_roster mv
+      JOIN proj ON proj.project_id = mv.project_id
+      JOIN dbo.vendor_prep_meetings mtg ON mtg.project_id = mv.project_id
+      JOIN dbo.vendor_prep_attendees a
+             ON a.meeting_id = mtg.meeting_id
+            AND a.company_normalized = mv.vendor_normalized
+      WHERE CAST(a.is_gc AS NVARCHAR(10)) NOT IN ('1','true','True')
+      GROUP BY mv.project_id, mv.vendor_normalized, mtg.meeting_id, mtg.title,
+               mtg.meeting_date, mtg.held
+      ${manualTitleMatchBranch()}
+  ),
+  eligible AS (
+      SELECT * FROM eligible_raw m
       WHERE ${matchPredicate(s, 'm')}
   ),
   -- Best evidence per vendor: an attendee match outranks a title match, then the
