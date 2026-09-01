@@ -114,6 +114,19 @@ export function activeStageFilter(alias = 'p'): string {
 
 export type VendorSource = 'commitment' | 'directory' | 'either';
 
+/**
+ * Who may edit the tracker.
+ *
+ *   'open'       every signed-in user is an admin. The current default, because
+ *                Entra app roles aren't assigned yet — the SWA route already
+ *                requires authentication, so this is "anyone at BCI who can
+ *                reach the app", not "anyone on the internet".
+ *   'allowlist'  only addresses in dbo.vendor_admins (plus the code-level
+ *                bootstrap list, which is permanent). Switch to this once Entra
+ *                roles are in place.
+ */
+export type AdminMode = 'open' | 'allowlist';
+
 export type Settings = {
   /** Which Procore roster defines "every vendor on the project".
    *  Default 'either' (the union) on purpose: it is the only value that cannot
@@ -134,6 +147,8 @@ export type Settings = {
   /** Require Procore's `held` flag. Default OFF: the flag is rarely flipped, so
    *  requiring it makes almost everything read "not held". */
   requireMeetingHeld: 0 | 1;
+  /** See AdminMode. Default 'open' until Entra roles are assigned. */
+  adminMode: AdminMode;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -141,6 +156,7 @@ export const DEFAULT_SETTINGS: Settings = {
   requireVendorPresent: 0,
   allowTitleMatch: 1,
   requireMeetingHeld: 0,
+  adminMode: 'open',
 };
 
 let settingsTableReady = false;
@@ -170,22 +186,41 @@ function coerceSettings(raw: Record<string, string | null>): Settings {
     src === 'commitment' || src === 'directory' || src === 'either'
       ? src
       : DEFAULT_SETTINGS.vendorSource;
+  const am = raw.adminMode;
+  const adminMode: AdminMode =
+    am === 'open' || am === 'allowlist' ? am : DEFAULT_SETTINGS.adminMode;
   return {
     vendorSource,
     requireVendorPresent: bit('requireVendorPresent'),
     allowTitleMatch: bit('allowTitleMatch'),
     requireMeetingHeld: bit('requireMeetingHeld'),
+    adminMode,
   };
 }
 
+/* getSettings is now on the hot path — every request resolves admin rights
+   through it — so memoize briefly. The capacity is shared with three other
+   apps; a settings SELECT per request is exactly the kind of avoidable load
+   that shows up as interactive delay. Writes bust it immediately, so a setting
+   change is still visible on the next request. */
+let settingsCache: { value: Settings; expires: number } | null = null;
+const SETTINGS_TTL_MS = 30_000;
+
+export function bustSettingsCache(): void {
+  settingsCache = null;
+}
+
 export async function getSettings(): Promise<Settings> {
+  if (settingsCache && Date.now() < settingsCache.expires) return settingsCache.value;
   await ensureSettingsTable();
   const { rows } = await db.query<{ setting_key: string; setting_value: string | null }>(
     `SELECT setting_key, setting_value FROM dbo.vendor_settings`,
   );
   const raw: Record<string, string | null> = {};
   for (const r of rows) raw[r.setting_key] = r.setting_value;
-  return coerceSettings(raw);
+  const value = coerceSettings(raw);
+  settingsCache = { value, expires: Date.now() + SETTINGS_TTL_MS };
+  return value;
 }
 
 export async function saveSettings(
@@ -201,6 +236,7 @@ export async function saveSettings(
     requireVendorPresent: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
     allowTitleMatch: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
     requireMeetingHeld: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
+    adminMode: (v) => (v === 'open' || v === 'allowlist' ? String(v) : null),
   };
   for (const [key, value] of Object.entries(patch)) {
     const validate = allowed[key];
@@ -216,7 +252,110 @@ export async function saveSettings(
       { k: key, v: clean, actor },
     );
   }
+  bustSettingsCache();
   return getSettings();
+}
+
+/* ============================================================================
+ * ADMINS
+ *
+ * The list is editable in-app, but the code-level BOOTSTRAP_ADMINS in
+ * functions/_shared.ts are permanent and cannot be removed through the API.
+ * That is the lockout guard: an admin list you can edit is an admin list you
+ * can empty, and this app's only other recovery route would be a SQL console.
+ * ==========================================================================*/
+
+let adminTableReady = false;
+
+async function ensureAdminTable(bootstrap: string[]): Promise<void> {
+  if (adminTableReady) return;
+  await db.query(`
+    IF OBJECT_ID('dbo.vendor_admins','U') IS NULL
+    CREATE TABLE dbo.vendor_admins (
+      email      NVARCHAR(256) NOT NULL PRIMARY KEY,
+      added_by   NVARCHAR(256) NULL,
+      added_at   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+    );`);
+  // Seed the bootstrap accounts once, so the allowlist is never empty the first
+  // time someone switches away from 'open'.
+  for (const email of bootstrap) {
+    await db.query(
+      `IF NOT EXISTS (SELECT 1 FROM dbo.vendor_admins WHERE email = @e)
+       INSERT INTO dbo.vendor_admins (email, added_by) VALUES (@e, 'bootstrap');`,
+      { e: email.toLowerCase() },
+    );
+  }
+  adminTableReady = true;
+}
+
+export async function listAdmins(bootstrap: string[]): Promise<Record<string, unknown>[]> {
+  await ensureAdminTable(bootstrap);
+  const { rows } = await db.query<{ email: string }>(
+    `SELECT email, added_by, added_at FROM dbo.vendor_admins ORDER BY email`,
+  );
+  const boot = new Set(bootstrap.map((e) => e.toLowerCase()));
+  return rows.map((r) => ({ ...r, is_bootstrap: boot.has(String(r.email).toLowerCase()) }));
+}
+
+export async function addAdmin(email: string, actor: string, bootstrap: string[]): Promise<void> {
+  await ensureAdminTable(bootstrap);
+  await db.query(
+    `IF NOT EXISTS (SELECT 1 FROM dbo.vendor_admins WHERE email = @e)
+     INSERT INTO dbo.vendor_admins (email, added_by) VALUES (@e, @actor);`,
+    { e: email.trim().toLowerCase(), actor },
+  );
+}
+
+/**
+ * Remove an admin. Refuses two cases outright rather than letting someone lock
+ * the tracker's administration away:
+ *   - a bootstrap account (permanent by design, the recovery path)
+ *   - the last remaining admin
+ */
+export async function removeAdmin(
+  email: string,
+  bootstrap: string[],
+): Promise<{ ok: boolean; error?: string }> {
+  await ensureAdminTable(bootstrap);
+  const target = email.trim().toLowerCase();
+
+  if (bootstrap.map((e) => e.toLowerCase()).includes(target)) {
+    return {
+      ok: false,
+      error:
+        `${email} is a built-in admin and can't be removed here — that account is the ` +
+        `recovery path if the list is ever emptied.`,
+    };
+  }
+
+  const { rows } = await db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM dbo.vendor_admins`);
+  if ((rows[0]?.n ?? 0) <= 1) {
+    return {
+      ok: false,
+      error: 'Refusing to remove the last admin — someone has to be able to edit the tracker.',
+    };
+  }
+
+  await db.query(`DELETE FROM dbo.vendor_admins WHERE email = @e`, { e: target });
+  return { ok: true };
+}
+
+/** Is this signed-in address allowed to edit? Honors the adminMode setting. */
+export async function isAdminEmail(emails: string[], bootstrap: string[]): Promise<boolean> {
+  const settings = await getSettings();
+  if (settings.adminMode === 'open') return emails.length > 0;
+
+  const lower = emails.map((e) => e.toLowerCase());
+  if (lower.some((e) => bootstrap.map((b) => b.toLowerCase()).includes(e))) return true;
+  if (!lower.length) return false;
+
+  await ensureAdminTable(bootstrap);
+  const { rows } = await db.query<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM dbo.vendor_admins
+      WHERE email IN (${lower.map((_, i) => `@e${i}`).join(',')})`,
+    Object.fromEntries(lower.map((e, i) => [`e${i}`, e])),
+  );
+  return (rows[0]?.n ?? 0) > 0;
 }
 
 /* ============================================================================

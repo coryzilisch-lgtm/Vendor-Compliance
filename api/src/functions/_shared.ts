@@ -1,3 +1,4 @@
+import { getSettings, isAdminEmail } from '../db/queries.js';
 import { HttpRequest, HttpResponseInit } from '@azure/functions';
 
 // ─── Identity & authorization (Entra ID via Static Web Apps) ────────────────
@@ -8,21 +9,26 @@ import { HttpRequest, HttpResponseInit } from '@azure/functions';
 // WRITE endpoints additionally gate on the admin allowlist below.
 
 /**
- * The only identities allowed to change tracker state — mark a prep meeting
- * held, mark a vendor not-applicable, or change the resolution settings.
- * Matched case-insensitively against the signed-in user's email / UPN.
+ * BOOTSTRAP admins — permanent, and the recovery path.
  *
- * Single source of truth: the dashboard reads its admin state from GET /api/me,
- * it does not keep its own copy. To change who can edit, edit this list and
- * redeploy.
+ * The live admin list is `dbo.vendor_admins`, editable from Settings. These
+ * addresses are seeded into it on first use and can never be removed through
+ * the API, so an in-app edit can't leave the tracker with nobody able to
+ * administer it. Changing who is permanent means changing this list and
+ * redeploying; changing who is an admin day-to-day is done in the UI.
+ *
+ * Note this only matters when `adminMode` is 'allowlist'. It currently defaults
+ * to 'open' — every signed-in user can edit — because Entra app roles aren't
+ * assigned yet. The SWA route already requires authentication, so 'open' means
+ * "anyone at BCI who can reach the app", not "anyone".
  */
-export const ADMIN_EMAILS = new Set<string>([
+export const BOOTSTRAP_ADMINS: string[] = [
   'julia.hoff@buffaloconstruction.com',
   'justin.houston@buffaloconstruction.com',
   'robert.burns@buffaloconstruction.com',
   'matthew.frazier@buffaloconstruction.com',
   'cory.zilisch@buffaloconstruction.com',
-]);
+];
 
 export type ClientPrincipal = {
   identityProvider?: string;
@@ -55,9 +61,31 @@ function principalEmails(p: ClientPrincipal): string[] {
   return out.map((e) => e.trim().toLowerCase()).filter(Boolean);
 }
 
-export function isAdmin(request: HttpRequest): boolean {
+/** Emails on the signed-in principal, or [] when unauthenticated. */
+export function requestEmails(request: HttpRequest): string[] {
   const p = getClientPrincipal(request);
-  return !!p && principalEmails(p).some((e) => ADMIN_EMAILS.has(e));
+  return p ? principalEmails(p) : [];
+}
+
+/**
+ * Resolve admin rights for a request.
+ *
+ * In 'open' mode being SIGNED IN is sufficient — deliberately not "signed in
+ * AND has a readable email claim". Depending on how the Entra app is
+ * configured, `userDetails` and the email claims can come back empty, and
+ * gating on an email would silently make everyone read-only, which is exactly
+ * the opposite of what 'open' is for. The SWA route already refuses anonymous
+ * requests before they reach us, so a principal is the real signal.
+ */
+async function resolveAdmin(p: ClientPrincipal | null): Promise<boolean> {
+  if (!p) return false;
+  const settings = await getSettings();
+  if (settings.adminMode === 'open') return true;
+  return isAdminEmail(principalEmails(p), BOOTSTRAP_ADMINS);
+}
+
+export async function isAdmin(request: HttpRequest): Promise<boolean> {
+  return resolveAdmin(getClientPrincipal(request));
 }
 
 /** Best display identity for audit columns on writes. */
@@ -66,14 +94,21 @@ export function actorEmail(request: HttpRequest): string {
   return (p && principalEmails(p)[0]) || 'unknown';
 }
 
-/** Write-side gate: 401 if not signed in, 403 if signed in but not an admin. */
-export function requireAdmin(request: HttpRequest): HttpResponseInit | null {
+/**
+ * Write-side gate: 401 if not signed in, 403 if signed in but not an admin.
+ * Async because the allowlist lives in the database, not in code.
+ */
+export async function requireAdmin(request: HttpRequest): Promise<HttpResponseInit | null> {
   const p = getClientPrincipal(request);
   if (!p) return { status: 401, jsonBody: { error: 'Sign-in required' } };
-  if (!principalEmails(p).some((e) => ADMIN_EMAILS.has(e))) {
+  if (!(await resolveAdmin(p))) {
     return {
       status: 403,
-      jsonBody: { error: 'Admin access required — editing the tracker is restricted.' },
+      jsonBody: {
+        error:
+          'Admin access required — editing the tracker is restricted to the admin list ' +
+          '(Settings → Admin access).',
+      },
     };
   }
   return null;

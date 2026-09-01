@@ -18,7 +18,7 @@ app.http('manualVendors', {
   route: 'manual-vendors',
   handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
-      const denied = requireAdmin(request);
+      const denied = await requireAdmin(request);
       if (denied) return denied;
 
       const body = (await request.json()) as Record<string, unknown>;
@@ -58,7 +58,7 @@ app.http('manualVendorDelete', {
   route: 'manual-vendors/{projectId}/{vendor}',
   handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
-      const denied = requireAdmin(request);
+      const denied = await requireAdmin(request);
       if (denied) return denied;
 
       const projectId = Number(request.params.projectId);

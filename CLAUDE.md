@@ -118,6 +118,26 @@ Gold emits candidate matches; the API resolves them.
 | `requireVendorPresent` | **off** | The Present / Absent / For Distribution Only radio is frequently left at its default in the field. Switching this on before checking the data makes real meetings read as missed. Applies to attendee matches only — a title match has no attendance to inspect. |
 | `requireMeetingHeld` | **off** | Procore's `held` flag is rarely flipped; requiring it makes nearly everything read "not held". |
 
+### Admin access — `open` today, `allowlist` later
+
+`adminMode` defaults to **`open`**: every signed-in user can edit. Entra app
+roles aren't assigned yet, and the SWA route already refuses anonymous requests,
+so this means "anyone at BCI who can reach the app" — not the public. Flip it to
+`allowlist` in Settings once roles exist.
+
+Two deliberate details:
+
+- **In `open` mode, having a principal is enough** — the check does NOT also
+  require a readable email claim. Depending on how the Entra app is configured
+  `userDetails` and the email claims can come back empty, and gating on an email
+  would silently make everyone read-only, which is the exact opposite of what
+  `open` is for.
+- **`BOOTSTRAP_ADMINS` (in `_shared.ts`) can never be removed through the API**,
+  and the API refuses to remove the last remaining admin. An editable admin list
+  is an emptiable one, and the only other recovery route here would be a SQL
+  console. Both refusals return 409 with the reason, so the UI can say which
+  rule was hit rather than failing silently.
+
 ### The Review Queue is not decoration
 
 Prep meetings that were logged but **can't be credited to any vendor** get their own tab rather
@@ -220,6 +240,7 @@ docs/setup.md                        the deploy runbook — start here for anyth
 | `GET /api/settings` · `POST` (admin) | the four settings + live roster-coverage comparison |
 | `GET /api/overrides` · `POST` (admin) · `DELETE /{pid}/{vendor}` | the manual overrides |
 | `POST /api/manual-vendors` (admin) · `DELETE /{pid}/{vendor}` | vendors not in either Procore roster |
+| `GET /api/admins` · `POST` (admin) · `DELETE /{email}` | the in-app admin list |
 | `GET /api/me` · `/api/health` · `/api/sync-status` | identity/admin flag, liveness, mirror freshness |
 
 `?fresh=1` on any read bypasses the in-Function cache and returns `Cache-Control: no-store`.

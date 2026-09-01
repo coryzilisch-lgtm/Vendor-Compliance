@@ -25,7 +25,7 @@ app.http('settings', {
         return meta(settings, { coverage }, 0);
       }
 
-      const denied = requireAdmin(request);
+      const denied = await requireAdmin(request);
       if (denied) return denied;
 
       const body = (await request.json()) as Record<string, unknown>;
