@@ -129,10 +129,20 @@ _prep_source   = {}   # how each prep meeting was identified (template vs title)
 _company_paths = {}   # which JSON path yielded each attendee's company
 _attendee_keys = {}   # top-level keys seen on attendee objects
 _endpoint_status = {} # (endpoint, http status) -> count, to tell 403 from empty
+_date_key_samples = {}  # date-ish keys actually present on meeting records
 
 # ---- What to pull -----------------------------------------------------------
 PULL_MEETINGS    = True
-PULL_COMMITMENTS = True        # work order + purchase order contracts
+# MEASURED 2026-08 across 90/90 projects: work_order_contracts and
+# purchase_order_contracts both return HTTP 200 with ZERO rows. BCI does not
+# write subcontracts in Procore. Those two calls per project were 180 of the
+# run's 532 calls — 34% of the API budget — producing nothing.
+#
+# Left OFF by default. Flip it True occasionally (say monthly, or when someone
+# says Procore commitments are being adopted) to re-check; the COVERAGE
+# DIAGNOSTIC will show them the moment they exist, and the vendorSource setting
+# can then switch to the cleaner denominator with no code change.
+PULL_COMMITMENTS = False       # work order + purchase order contracts
 PULL_DIRECTORY   = True        # project directory vendor list
 # The attendee -> company bridge. A meeting attendee carries only a person id
 # and an email, so the company has to come from the project directory people
@@ -276,7 +286,14 @@ def request_json(url, params=None, allow_404=True):
             if response.status_code == 429:
                 reset_ts = int(response.headers.get("X-Rate-Limit-Reset", 0))
                 wait = max(10, reset_ts - time.time()) + 3
-                print(f"    429 — sleeping {wait:.0f}s until reset...")
+                # Count this against the pause budget. An earlier version didn't,
+                # so a run that spent 21 of its 28 minutes asleep on one 429
+                # cheerfully reported "5% of the run" — the single most
+                # misleading number the ingest produced.
+                _stats["sleep"] += wait
+                _stats["pauses"] += 1
+                print(f"    429 — hourly budget exhausted, sleeping {wait/60:.1f} min "
+                      f"until the window resets...")
                 time.sleep(wait)
                 continue
             if allow_404 and response.status_code in (403, 404):
@@ -474,6 +491,18 @@ def normalize_company(name):
 
 
 GC_NORMALIZED = {normalize_company(n) for n in GC_COMPANY_NAMES}
+# Email domains belonging to the general contractor, derived from the same list
+# so there is one place to edit.
+GC_EMAIL_STEMS = {n.replace(" ", "") for n in GC_NORMALIZED if n}
+
+
+def is_gc_email(email):
+    if not email or "@" not in str(email):
+        return False
+    domain = str(email).rsplit("@", 1)[1].lower()
+    stem = re.sub(r"[^a-z0-9]", "", domain.split(".")[0])
+    return any(stem == g or (len(stem) >= 6 and (stem in g or g in stem))
+               for g in GC_EMAIL_STEMS)
 
 
 def is_gc(name):
@@ -489,6 +518,52 @@ PREP_TITLE_RE = [re.compile(p, re.I) for p in PREP_TITLE_PATTERNS]
 def looks_like_prep_meeting(title):
     t = str(title or "")
     return any(rx.search(t) for rx in PREP_TITLE_RE)
+
+
+# Every key Procore might put the meeting's date under. The first live run came
+# back with meeting_date NULL on all 81 meetings, so "date"/"scheduled_date"/
+# "meeting_date" are all absent in this tenant — same class of problem as the
+# attendee company. DATE_FIELDS is probed in order and the key that actually
+# won is reported by the MEETING DATE diagnostic, so this stops being guesswork.
+DATE_FIELDS = [
+    "meeting_date", "date", "scheduled_date", "scheduled_at", "datetime",
+    "date_time", "start_date", "start_time", "starts_at", "start_at",
+    "occurred_at", "held_at", "actual_start_time", "created_at",
+]
+
+_date_fields_used = {}
+
+
+def meeting_date_of(meeting):
+    """The meeting's date, from whichever key this tenant populates."""
+    if not isinstance(meeting, dict):
+        return None
+    for key in DATE_FIELDS:
+        v = meeting.get(key)
+        if isinstance(v, dict):
+            v = pick(v, "date", "value", "start", "start_time")
+        if v not in (None, "", [], {}):
+            _date_fields_used[key] = _date_fields_used.get(key, 0) + 1
+            return v
+    _date_fields_used["<none>"] = _date_fields_used.get("<none>", 0) + 1
+    return None
+
+
+def date_like_keys(meeting):
+    """Any key on the record whose name or value looks like a date. Used only by
+    the diagnostic, so a tenant that puts the date somewhere unexpected reports
+    itself instead of needing another round-trip."""
+    out = {}
+    if not isinstance(meeting, dict):
+        return out
+    for k, v in meeting.items():
+        if isinstance(v, (dict, list)) or v in (None, ""):
+            continue
+        sv = str(v)
+        if re.search(r"(date|time|day|when|start|end)", str(k), re.I) or \
+           re.match(r"^\d{4}-\d{2}-\d{2}", sv):
+            out[str(k)] = sv[:32]
+    return out
 
 
 def template_id_of(meeting):
@@ -1026,6 +1101,8 @@ for pi, project in enumerate(scope, start=1):
                 if not isinstance(detail, dict):
                     detail = m  # fall back to the list record so the meeting isn't lost
 
+                for _k, _v in date_like_keys(detail).items():
+                    _date_key_samples.setdefault(_k, _v)
                 d_title = pick(detail, "title", "name") or title
                 atts = extract_attendee_list(detail)
 
@@ -1037,8 +1114,8 @@ for pi, project in enumerate(scope, start=1):
                     "series_name": pick(detail, "series_name") or pick_name(detail.get("series")),
                     "number": pick(detail, "number", "meeting_number"),
                     "template_id": template_id_of(detail) or tmpl,
-                    "meeting_date": pick(detail, "date", "scheduled_date", "meeting_date"),
-                    "held_at": pick(detail, "held_at", "actual_date"),
+                    "meeting_date": meeting_date_of(detail),
+                    "held_at": pick(detail, "held_at", "actual_date", "actual_start_time"),
                     "held": detail.get("held"),
                     "status": pick(detail, "status", "meeting_status"),
                     "location": pick(detail, "location"),
@@ -1075,6 +1152,13 @@ for pi, project in enumerate(scope, start=1):
                         cname = company_from_email(email, project_vendor_norms)
                         if cname:
                             csource = "email_domain"
+                    if not cname and email and is_gc_email(email):
+                        # A Buffalo employee who isn't in this project's directory.
+                        # They are the GC, never the vendor, so resolving them here
+                        # keeps them out of the "unresolved" pile where they'd look
+                        # like a data problem.
+                        cname = GC_COMPANY_NAMES[0].title()
+                        csource = "gc_email_domain"
                     if not cname:
                         csource = "unresolved"
                     _company_paths[f"resolved:{csource}"] = _company_paths.get(f"resolved:{csource}", 0) + 1
@@ -1277,6 +1361,20 @@ FROM silver_vendor_roster
 print("Read this as: whichever source covers more PROJECTS is the one BCI keeps")
 print("current. A large `directory_only` count is expected — the project directory")
 print("holds the owner, architect and inspectors, who never need a prep meeting.")
+
+print("\n--- MEETING DATE (which key this tenant actually populates) ---")
+for k, n in sorted(_date_fields_used.items(), key=lambda kv: -kv[1]):
+    print(f"  {k}: {n}")
+if _date_fields_used.get("<none>"):
+    print(f"  ⚠️  {_date_fields_used['<none>']} meeting(s) had NO recognized date key.")
+    print("      Date-ish keys actually present on the meeting records:")
+    if _date_key_samples:
+        for k, v in sorted(_date_key_samples.items()):
+            mark = "  <-- add this to DATE_FIELDS" if k not in DATE_FIELDS else ""
+            print(f"        {k} = {v}{mark}")
+    else:
+        print("        (none at all — the meeting record carries no date; the tracker")
+        print("         will show meetings without dates, which is cosmetic only)")
 
 print("\n--- meeting template id exposure ---")
 if template_id_hits:

@@ -372,6 +372,57 @@ WHERE x.meeting_id IS NULL
 ORDER BY m.meeting_date DESC
 """).show(25, truncate=False)
 
+# The unmatched meetings name real subcontractors ("Escar Construction",
+# "K&B Electric", "Patriot Pipeline") that have no row in Procore's project
+# VENDOR directory — so the tracker's denominator can't see them and their prep
+# meeting can never be credited. But those companies DO show up on the project
+# PEOPLE list, because someone from them was given project access.
+#
+# This is quantified, not acted on. Folding people-companies into the roster
+# would silently change every project's denominator, which is the safety team's
+# call, not a side effect of a notebook run. If the number below is large, the
+# options are: add the missing companies to Procore's project directory (best),
+# add them per-project in the tracker's admin UI, or ask for a vendorSource
+# option that includes them.
+if table_exists("bronze_vendor_project_users"):
+    print("\n--- companies with PEOPLE on a project but NO vendor-directory row ---")
+    spark.sql("""
+    WITH people AS (
+        SELECT DISTINCT
+            CAST(project_procore_id AS BIGINT) AS project_id,
+            company_normalized,
+            MAX(company_name) OVER (PARTITION BY company_normalized) AS company_name
+        FROM bronze_vendor_project_users
+        WHERE COALESCE(company_normalized, '') <> ''
+          AND LOWER(COALESCE(is_gc, 'false')) <> 'true'
+    )
+    SELECT p.company_name,
+           COUNT(DISTINCT p.project_id) AS projects_present_as_people
+    FROM people p
+    LEFT JOIN gold_vendor_roster r
+           ON r.project_id = p.project_id
+          AND r.vendor_normalized = p.company_normalized
+    WHERE r.vendor_normalized IS NULL
+    GROUP BY p.company_name
+    ORDER BY projects_present_as_people DESC
+    """).show(20, truncate=False)
+    spark.sql("""
+    WITH people AS (
+        SELECT DISTINCT CAST(project_procore_id AS BIGINT) AS project_id, company_normalized
+        FROM bronze_vendor_project_users
+        WHERE COALESCE(company_normalized, '') <> ''
+          AND LOWER(COALESCE(is_gc, 'false')) <> 'true'
+    )
+    SELECT COUNT(*) AS company_project_pairs_missing_from_roster,
+           COUNT(DISTINCT company_normalized) AS distinct_companies
+    FROM people p
+    LEFT JOIN gold_vendor_roster r
+           ON r.project_id = p.project_id AND r.vendor_normalized = p.company_normalized
+    WHERE r.vendor_normalized IS NULL
+    """).show(truncate=False)
+    print("These are companies working on the job whose prep meeting the tracker")
+    print("currently CANNOT credit, because they aren't on the checklist at all.")
+
 print("--- vendors filtered out as never-needs-a-prep-meeting ---")
 spark.sql("""
 SELECT vendor_name, COUNT(DISTINCT project_id) AS projects
