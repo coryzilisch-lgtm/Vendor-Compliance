@@ -129,6 +129,8 @@ _prep_source   = {}   # how each prep meeting was identified (template vs title)
 _company_paths = {}   # which JSON path yielded each attendee's company
 _attendee_keys = {}   # top-level keys seen on attendee objects
 _endpoint_status = {} # (endpoint, http status) -> count, to tell 403 from empty
+_withheld = {}        # endpoint -> projects where Total exceeded the rows returned
+_last_total = {"value": None}  # Procore's Total header from the most recent response
 _date_key_samples = {}  # date-ish keys actually present on meeting records
 
 # ---- What to pull -----------------------------------------------------------
@@ -313,6 +315,7 @@ def request_json(url, params=None, allow_404=True):
             # turned a ~10 minute run into an all-day one. We now only pause when
             # the budget is genuinely almost gone, sleep exactly to the reset,
             # and let the 429 handler above be the real backstop.
+            _last_total["value"] = response.headers.get("Total", response.headers.get("total"))
             remaining = int(response.headers.get("X-Rate-Limit-Remaining", 999))
             reset_ts  = int(response.headers.get("X-Rate-Limit-Reset", 0))
             _stats["calls"] += 1
@@ -334,9 +337,21 @@ def request_json(url, params=None, allow_404=True):
     raise last_exc
 
 
-def _note_status(label, status):
+def _note_status(label, status, total=None, returned=None):
     key = (label, status)
     _endpoint_status[key] = _endpoint_status.get(key, 0) + 1
+    # Procore's `Total` header is the full server-side count. When it exceeds
+    # what we were handed, rows are being WITHHELD by tool permissions rather
+    # than being absent — the same failure mode that hid private Observations
+    # from the safety dashboard. Recording it here means an empty result can
+    # never again be mistaken for an empty dataset.
+    if total is not None and returned is not None:
+        try:
+            t = int(total)
+        except (TypeError, ValueError):
+            return
+        if t > returned:
+            _withheld[label] = _withheld.get(label, 0) + 1
 
 
 def get_paginated(url, params=None, per_page=100, max_pages=100, label=None):
@@ -347,7 +362,9 @@ def get_paginated(url, params=None, per_page=100, max_pages=100, label=None):
     while page <= max_pages:
         payload, status = request_json(url, {**base, "page": page, "per_page": per_page})
         if label and page == 1:
-            _note_status(label, status)
+            chunk0 = payload.get("data") if isinstance(payload, dict) else payload
+            _note_status(label, status, _last_total.get("value"),
+                         len(chunk0) if isinstance(chunk0, list) else 0)
         if payload is None:
             break
         chunk = payload.get("data") if isinstance(payload, dict) else payload
@@ -1423,6 +1440,14 @@ if any(s in (403, 404) for (lbl, s) in _endpoint_status
     print("      the COVERAGE DIAGNOSTIC above may therefore mean 'no access', not 'no")
     print("      contracts' — grant the API service account read on Commitments before")
     print("      concluding BCI doesn't use them.")
+
+if _withheld:
+    print("\n  ⚠️  ROWS WITHHELD — Procore's Total header exceeded the rows actually returned:")
+    for lbl, n in sorted(_withheld.items(), key=lambda kv: -kv[1]):
+        print(f"        {lbl}: on {n} project(s)")
+    print("      The data EXISTS and this service account cannot see all of it. That is a tool")
+    print("      permission in Procore, not an empty dataset. Same failure mode that hid private")
+    print("      Observations from the safety dashboard. Run fabric/diagnose_commitments.py.")
 
 print("\n--- ATTENDEE SHAPE (where the company name actually lives) ---")
 print("  top-level keys seen on attendee objects:")
