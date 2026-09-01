@@ -244,7 +244,7 @@ button.sec-t.closed .cnt{background:var(--muted)}
 'use strict';
 
 /* ── state ─────────────────────────────────────────────── */
-var ADMIN=false, PROJECTS=[], TOTALS={}, SETTINGS={}, COVERAGE={}, REVIEW=[],
+var ADMIN=false, ME=null, PROJECTS=[], TOTALS={}, SETTINGS={}, COVERAGE={}, REVIEW=[],
     ADMINS=[], FILTER='all', SCOPE='active', CURRENT=null;
 
 /* Sort state for the projects table. Default: worst-performing LAST — the user
@@ -793,8 +793,19 @@ async function loadSettings(){
       h+='<button class="hbtn primary" id="save-settings" style="color:#fff">Save settings</button>'
         +' <span id="save-msg" style="font-size:12px;color:var(--muted)"></span>';
     }else{
-      h+='<div class="note">You\'re signed in as a viewer. Settings and overrides are '
-        +'restricted to tracker admins.</div>';
+      // Never just say "you're a viewer" — say why, because the two causes look
+      // identical from the outside: genuinely not on the list, versus the API
+      // failing to resolve admin rights at all.
+      var why = (ME && ME.reason) ? ME.reason : 'Admin rights could not be determined.';
+      var degraded = ME && ME.settings_degraded;
+      h+='<div class="note'+(degraded?' err':' warn')+'"><b>You\'re signed in as a viewer.</b><br>'
+        +esc(why)
+        +(ME && ME.email ? '<br>Signed in as '+esc(ME.email) : '')
+        +(degraded ? '<br><b>The settings table could not be read:</b> '+esc(degraded)
+            +'<br>This usually means the service principal has Read but not <b>Write all data</b> '
+            +'on the Fabric SQL database — this app creates its own settings/override tables, '
+            +'unlike the read-only Safety Dashboard.' : '')
+        +'</div>';
     }
 
     h+='<div id="admin-panel"></div>';
@@ -1216,8 +1227,12 @@ $('btn-settings').onclick=function(){ showTab('settings'); };
 (async function init(){
   try{
     var me = await api('/me');
-    ADMIN = !!(me.data && me.data.is_admin);
-  }catch(e){ ADMIN=false; }
+    ME = me.data || null;
+    ADMIN = !!(ME && ME.is_admin);
+  }catch(e){
+    ADMIN=false;
+    ME={reason:'Could not reach /api/me: '+e.message};
+  }
   if(ADMIN){ $('btn-settings').style.display=''; }
   $('tab-settings').style.display='';
   await loadProjects(false);

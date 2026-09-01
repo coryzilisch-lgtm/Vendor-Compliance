@@ -156,7 +156,7 @@ export const DEFAULT_SETTINGS: Settings = {
   requireVendorPresent: 0,
   allowTitleMatch: 1,
   requireMeetingHeld: 0,
-  adminMode: 'open',
+  adminMode: 'allowlist',
 };
 
 let settingsTableReady = false;
@@ -204,14 +204,50 @@ function coerceSettings(raw: Record<string, string | null>): Settings {
    that shows up as interactive delay. Writes bust it immediately, so a setting
    change is still visible on the next request. */
 let settingsCache: { value: Settings; expires: number } | null = null;
+let lastGoodSettings: Settings | null = null;
+let settingsDegraded: string | null = null;
 const SETTINGS_TTL_MS = 30_000;
 
 export function bustSettingsCache(): void {
   settingsCache = null;
 }
 
+/** Non-null when the last settings read failed and defaults/stale values are in
+ *  use. Surfaced by GET /api/me so a degraded state is visible, not silent. */
+export function settingsHealth(): string | null {
+  return settingsDegraded;
+}
+
+/**
+ * Settings, with a deliberate fail-soft.
+ *
+ * This is on the hot path for EVERY request (admin rights resolve through it),
+ * so a transient failure here used to take out /api/me entirely and — because
+ * the dashboard treats a failed /api/me as "not an admin" — silently demoted
+ * everyone to viewer. Now: serve the last good value if we have one, else the
+ * documented defaults, and record why.
+ *
+ * On the security of defaulting to adminMode 'open' when the table is
+ * unreadable: if this table can't be read, it can't be written either, so every
+ * write path behind the admin UI fails anyway. The fallback grants the ability
+ * to see buttons that will not work — not the ability to change anything.
+ * ⚠️ If adminMode is ever switched to 'allowlist' as the production norm,
+ * change DEFAULT_SETTINGS.adminMode to match so the failure mode follows it.
+ */
 export async function getSettings(): Promise<Settings> {
   if (settingsCache && Date.now() < settingsCache.expires) return settingsCache.value;
+  try {
+    return await readSettings();
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    settingsDegraded = msg;
+    console.error('[settings] read failed — using ' +
+      (lastGoodSettings ? 'last known good values' : 'defaults') + ':', msg);
+    return lastGoodSettings ?? { ...DEFAULT_SETTINGS };
+  }
+}
+
+async function readSettings(): Promise<Settings> {
   await ensureSettingsTable();
   const { rows } = await db.query<{ setting_key: string; setting_value: string | null }>(
     `SELECT setting_key, setting_value FROM dbo.vendor_settings`,
@@ -220,6 +256,8 @@ export async function getSettings(): Promise<Settings> {
   for (const r of rows) raw[r.setting_key] = r.setting_value;
   const value = coerceSettings(raw);
   settingsCache = { value, expires: Date.now() + SETTINGS_TTL_MS };
+  lastGoodSettings = value;
+  settingsDegraded = null;
   return value;
 }
 
@@ -276,8 +314,7 @@ async function ensureAdminTable(bootstrap: string[]): Promise<void> {
       added_by   NVARCHAR(256) NULL,
       added_at   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
     );`);
-  // Seed the bootstrap accounts once, so the allowlist is never empty the first
-  // time someone switches away from 'open'.
+  // Seed the bootstrap accounts, so the allowlist is never empty.
   for (const email of bootstrap) {
     await db.query(
       `IF NOT EXISTS (SELECT 1 FROM dbo.vendor_admins WHERE email = @e)
@@ -285,6 +322,19 @@ async function ensureAdminTable(bootstrap: string[]): Promise<void> {
       { e: email.toLowerCase() },
     );
   }
+
+  // ...and RECONCILE. Rows whose added_by is 'bootstrap' are code-owned: if a
+  // name is dropped from BOOTSTRAP_ADMINS it must actually lose access, not
+  // linger as a stale seed nobody remembers granting. Rows added through the UI
+  // carry the granting admin's address instead and are deliberately untouched.
+  const keep = bootstrap.map((e) => e.toLowerCase());
+  await db.query(
+    `DELETE FROM dbo.vendor_admins
+      WHERE added_by = 'bootstrap'
+        AND email NOT IN (${keep.map((_, i) => `@k${i}`).join(',') || `''`});`,
+    Object.fromEntries(keep.map((e, i) => [`k${i}`, e])),
+  );
+
   adminTableReady = true;
 }
 

@@ -118,12 +118,31 @@ Gold emits candidate matches; the API resolves them.
 | `requireVendorPresent` | **off** | The Present / Absent / For Distribution Only radio is frequently left at its default in the field. Switching this on before checking the data makes real meetings read as missed. Applies to attendee matches only — a title match has no attendance to inspect. |
 | `requireMeetingHeld` | **off** | Procore's `held` flag is rarely flipped; requiring it makes nearly everything read "not held". |
 
-### Admin access — `open` today, `allowlist` later
+### Admin access — `allowlist`, two people
 
-`adminMode` defaults to **`open`**: every signed-in user can edit. Entra app
-roles aren't assigned yet, and the SWA route already refuses anonymous requests,
-so this means "anyone at BCI who can reach the app" — not the public. Flip it to
-`allowlist` in Settings once roles exist.
+`adminMode` defaults to **`allowlist`**. Admins are `cory.zilisch@` and
+`justin.houston@buffaloconstruction.com` (`BOOTSTRAP_ADMINS` in `_shared.ts`);
+everyone else who signs in is **read-only**. More can be added in Settings.
+
+Sign-in is plain OIDC through SWA — the app registration needs only
+**`User.Read`** (delegated) plus a redirect URI, ID tokens, and a client secret.
+**Add the `email` optional claim**: the allowlist matches the principal's
+address, and a token with no readable email/UPN claim matches nothing.
+
+Three properties worth not breaking:
+
+- **Bootstrap seeds are RECONCILED, not just inserted.** Rows in
+  `dbo.vendor_admins` with `added_by = 'bootstrap'` are code-owned: dropping a
+  name from `BOOTSTRAP_ADMINS` actually deletes their row on next start, rather
+  than leaving a stale seed nobody remembers granting. Rows added through the UI
+  carry the granting admin's address and are left alone.
+- **`BOOTSTRAP_ADMINS` can't be removed through the API**, and the API refuses
+  to remove the last admin. Both return 409 with the reason.
+- **`ADMIN_MODE` env var is the break-glass.** Set it to `open` in the SWA
+  Configuration blade to override the stored setting with no deploy. It exists
+  for exactly one failure: an Entra token arriving with no email claim, where
+  the allowlist has nothing to match and the fix would otherwise be a code
+  change. `/api/me` reports `emails_seen` so that is diagnosable in one click.
 
 Two deliberate details:
 

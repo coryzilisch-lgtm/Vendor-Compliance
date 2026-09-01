@@ -11,24 +11,35 @@ import { HttpRequest, HttpResponseInit } from '@azure/functions';
 /**
  * BOOTSTRAP admins — permanent, and the recovery path.
  *
- * The live admin list is `dbo.vendor_admins`, editable from Settings. These
- * addresses are seeded into it on first use and can never be removed through
- * the API, so an in-app edit can't leave the tracker with nobody able to
- * administer it. Changing who is permanent means changing this list and
- * redeploying; changing who is an admin day-to-day is done in the UI.
+ * These are seeded into `dbo.vendor_admins` and can never be removed through the
+ * API, so an in-app edit can't leave the tracker with nobody able to administer
+ * it. More admins can be added from Settings; those are user-owned rows and are
+ * left alone. Rows seeded from THIS list are code-owned and reconciled on every
+ * start, so shrinking this list actually removes people rather than leaving
+ * stale seeds behind.
  *
- * Note this only matters when `adminMode` is 'allowlist'. It currently defaults
- * to 'open' — every signed-in user can edit — because Entra app roles aren't
- * assigned yet. The SWA route already requires authentication, so 'open' means
- * "anyone at BCI who can reach the app", not "anyone".
+ * Everyone else who signs in is read-only.
  */
 export const BOOTSTRAP_ADMINS: string[] = [
-  'julia.hoff@buffaloconstruction.com',
-  'justin.houston@buffaloconstruction.com',
-  'robert.burns@buffaloconstruction.com',
-  'matthew.frazier@buffaloconstruction.com',
   'cory.zilisch@buffaloconstruction.com',
+  'justin.houston@buffaloconstruction.com',
 ];
+
+/**
+ * Break-glass override, settable in the SWA Configuration blade without a code
+ * deploy: ADMIN_MODE=open temporarily makes every signed-in user an admin.
+ *
+ * This exists for one specific failure. `adminMode` is now 'allowlist', which
+ * matches the signed-in principal's email against the list — and if the Entra
+ * token arrives WITHOUT a readable email/UPN claim there is nothing to match,
+ * so nobody can administer the app and the fix would otherwise be a code change
+ * and a redeploy. /api/me reports `emails_seen` so this is diagnosable in one
+ * click; this makes it recoverable in one setting.
+ */
+export function adminModeOverride(): 'open' | 'allowlist' | null {
+  const v = String(process.env.ADMIN_MODE ?? '').trim().toLowerCase();
+  return v === 'open' || v === 'allowlist' ? v : null;
+}
 
 export type ClientPrincipal = {
   identityProvider?: string;
@@ -79,9 +90,16 @@ export function requestEmails(request: HttpRequest): string[] {
  */
 async function resolveAdmin(p: ClientPrincipal | null): Promise<boolean> {
   if (!p) return false;
-  const settings = await getSettings();
-  if (settings.adminMode === 'open') return true;
+  const override = adminModeOverride();
+  const mode = override ?? (await getSettings()).adminMode;
+  if (mode === 'open') return true;
   return isAdminEmail(principalEmails(p), BOOTSTRAP_ADMINS);
+}
+
+/** The mode actually in force, including the env override. For /api/me. */
+export async function effectiveAdminMode(): Promise<string> {
+  const override = adminModeOverride();
+  return override ? `${override} (ADMIN_MODE env override)` : (await getSettings()).adminMode;
 }
 
 export async function isAdmin(request: HttpRequest): Promise<boolean> {
