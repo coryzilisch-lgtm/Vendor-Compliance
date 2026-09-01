@@ -9,6 +9,9 @@
           "openIdIssuer": "https://login.microsoftonline.com/765713ef-2ac8-4410-98f0-08ea9552c506/v2.0",
           "clientIdSettingName": "AAD_CLIENT_ID",
           "clientSecretSettingName": "AAD_CLIENT_SECRET"
+        },
+        "login": {
+          "loginParameters": ["scope=openid profile email"]
         }
       }
     }

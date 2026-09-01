@@ -72,6 +72,10 @@ app.http('me', {
         is_admin: admin,
         admin_mode: mode,
         emails_seen: emails,
+        // Claim TYPES only — enough to see whether an email/upn claim arrived at
+        // all without echoing the whole token back. When emails_seen is empty
+        // this is the thing that says why.
+        claim_types: (p.claims ?? []).map((c) => c.typ).filter(Boolean),
         reason: why,
         settings_degraded: settingsHealth(),
       },
