@@ -15,7 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     name: Build and Deploy Job
     permissions:
-      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v4
@@ -29,18 +28,6 @@ jobs:
       - name: Typecheck API
         run: npm ci --prefix api && npm run typecheck --prefix api
 
-      - name: Install OIDC Client from Core Package
-        run: npm install @actions/core@1.6.0 @actions/http-client
-
-      - name: Get Id Token
-        uses: actions/github-script@v6
-        id: idtoken
-        with:
-          script: |
-            const coredemo = require('@actions/core')
-            return await coredemo.getIDToken()
-          result-encoding: string
-
       - name: Build And Deploy
         id: builddeploy
         uses: Azure/static-web-apps-deploy@v1
@@ -50,7 +37,6 @@ jobs:
           app_location: "dashboard"   # static, no build step
           api_location: "api"         # Oryx runs `npm install` + `npm run build`
           output_location: ""
-          github_id_token: ${{ steps.idtoken.outputs.result }}
 
   # Without the token on this job the "Close Pull Request" step fails on every
   # merged PR — the same bug the Safety Dashboard had to fix.
