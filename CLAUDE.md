@@ -185,6 +185,19 @@ list" from "unmatched" — the exact comparison the chart exists to make. That i
 why "meetings that matched no vendor" is its own chart rather than a third line.
 Re-run `scripts/validate_palette.js` before adding any series.
 
+### Procore deep links
+
+| Target | URL |
+|---|---|
+| Project | `https://app.procore.com/{project_id}/project/home` |
+| Meeting | `https://app.procore.com/webclients/host/companies/18895/projects/{project_id}/tools/meetings/`**`details/`**`{meeting_id}` |
+
+⚠️ **The meeting URL needs the `details/` segment.** Deriving it from the create
+URL the team uses (`.../tools/meetings/create/383995`) by swapping the id in
+gives `.../tools/meetings/{id}`, which 404s — that was the first attempt.
+Verified against a real Procore URL. Same shape as the Safety Dashboard's forms
+link. Both URLs are built by one function each in `dashboard/index.html`.
+
 ### The Review Queue is not decoration
 
 Prep meetings that were logged but **can't be credited to any vendor** get their own tab rather
@@ -225,7 +238,7 @@ Four of the five unknowns are now settled against real data:
 | Question | Answer |
 |---|---|
 | **Is the meeting template id exposed?** | **Yes** — `383995` appeared on 10 meetings. And it is *necessary*: the title heuristic found only **3 of those 10**, because 7 prep meetings have no "prep" in the title. `PREP_MATCH_MODE` now defaults to the union of template + title. (The old `PREP_REQUIRE_TEMPLATE_ID` flag AND-ed them, so enabling it would have returned 3 — the intersection — and made things worse.) |
-| **Which vendor roster does BCI maintain?** | **The project directory.** Commitments return HTTP 200 with zero rows on every project — a real absence, not a 403. ~22 directory vendors per project. The commitments pull stays (2 cheap calls) so a future switch to Procore subcontracts needs no code change. |
+| **Which vendor roster does BCI maintain?** | **Unresolved — do not repeat the earlier claim.** The directory works (~22 vendors/project). Commitments returned HTTP 200 with zero rows on all 90 projects, and that was written up as "BCI doesn't use commitments". That over-claims: Procore list endpoints are **permission-filtered**, so 200-with-zero-rows also happens when the service account can't see the tool — the exact failure that hid private Observations from the safety dashboard. The decisive test is Procore's **`Total` response header** (`Total > 0` with 0 rows = withheld, not absent). `fabric/diagnose_commitments.py` probes it across 8 endpoint variants; the ingest now records it too and warns. Settle this before telling anyone the directory is the only roster. |
 | **Where is the attendee's company?** | **Nowhere on the attendee.** The record is only `{id, status, login_information:{id, login, name}}`. Procore's UI resolves that column by joining the person to the project directory, so the ingest pulls `/projects/{id}/users` and does the same. Resolution went from **0/60 to 60/60**. An email-domain fallback (`…@jjfloresroofing.co` → "JJ Flores Roofing") covers people missing from the directory, bounded to vendors already on that project. |
 | **Does the attendance field parse?** | **Yes** — Procore returns `'Present'`, `'For Distribution Only'`, `'Absent'`, all understood. The 11 "unknown" rows carry **no status field at all** (nobody ticked a box), which is different from an unrecognized value. |
 
