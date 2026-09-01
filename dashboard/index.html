@@ -190,6 +190,9 @@ button.sec-t.closed .cnt{background:var(--muted)}
   <button data-tab="settings" id="tab-settings" style="display:none">Settings</button>
 </nav>
 
+<div id="signin" style="display:none;background:#fdf0dc;border-bottom:2px solid var(--warning);
+  color:#8a5a05;padding:14px 24px;font-size:13px"></div>
+
 <main>
   <!-- ── Projects ─────────────────────────────────────────── -->
   <section class="panel on" id="panel-projects">
@@ -244,7 +247,7 @@ button.sec-t.closed .cnt{background:var(--muted)}
 'use strict';
 
 /* ── state ─────────────────────────────────────────────── */
-var ADMIN=false, ME=null, PROJECTS=[], TOTALS={}, SETTINGS={}, COVERAGE={}, REVIEW=[],
+var ADMIN=false, ME=null, SIGNED_IN=false, PROJECTS=[], TOTALS={}, SETTINGS={}, COVERAGE={}, REVIEW=[],
     ADMINS=[], FILTER='all', SCOPE='active', CURRENT=null;
 
 /* Sort state for the projects table. Default: worst-performing LAST — the user
@@ -797,6 +800,12 @@ async function loadSettings(){
       // identical from the outside: genuinely not on the list, versus the API
       // failing to resolve admin rights at all.
       var why = (ME && ME.reason) ? ME.reason : 'Admin rights could not be determined.';
+      if(!SIGNED_IN){
+        why = 'You are not signed in — Static Web Apps attached no identity to the request, so '
+            + 'the app cannot tell who you are. Use the Sign in button at the top of the page. '
+            + 'If signing in does nothing, the Entra provider is not configured on the Static '
+            + 'Web App itself (see /.auth/me).';
+      }
       var degraded = ME && ME.settings_degraded;
       h+='<div class="note'+(degraded?' err':' warn')+'"><b>You\'re signed in as a viewer.</b><br>'
         +esc(why)
@@ -1105,6 +1114,29 @@ async function loadMetrics(fresh){
   }
 }
 
+/* ── not signed in ─────────────────────────────────────────
+   If /api/me comes back 401 there is no Entra session at all. The app must not
+   quietly render as a read-only viewer in that state — it looks like working
+   software with an odd permission, when in fact nobody is authenticated and
+   Static Web Apps is not enforcing its own route rules. Say so, and offer the
+   sign-in link directly. */
+function renderSignInBanner(){
+  var el=$('signin');
+  if(!el) return;
+  el.style.display='';
+  el.innerHTML='<div style="max-width:1400px;margin:0 auto;display:flex;gap:14px;'
+    +'align-items:center;flex-wrap:wrap">'
+    +'<b>You are not signed in.</b>'
+    +'<span style="flex:1;min-width:260px">Static Web Apps did not attach an identity to this '
+    +'request. Everything below is read-only until you sign in.</span>'
+    +'<a class="hbtn primary" style="color:#fff;text-decoration:none;padding:8px 16px" '
+    +'href="/.auth/login/aad?post_login_redirect_uri=' + encodeURIComponent(location.pathname)
+    +'">Sign in with Microsoft</a>'
+    +'<a class="hbtn" style="text-decoration:none;padding:8px 16px" href="/.auth/me" '
+    +'target="_blank" rel="noopener">Check /.auth/me</a>'
+    +'</div>';
+}
+
 /* ── admin access ──────────────────────────────────────── */
 function renderAdminPanel(){
   var open = SETTINGS.adminMode !== 'allowlist';
@@ -1228,10 +1260,12 @@ $('btn-settings').onclick=function(){ showTab('settings'); };
   try{
     var me = await api('/me');
     ME = me.data || null;
+    SIGNED_IN = true;
     ADMIN = !!(ME && ME.is_admin);
   }catch(e){
-    ADMIN=false;
+    ADMIN=false; SIGNED_IN=false;
     ME={reason:'Could not reach /api/me: '+e.message};
+    renderSignInBanner();
   }
   if(ADMIN){ $('btn-settings').style.display=''; }
   $('tab-settings').style.display='';
