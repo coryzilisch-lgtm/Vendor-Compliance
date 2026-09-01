@@ -138,6 +138,34 @@ Two deliberate details:
   console. Both refusals return 409 with the reason, so the UI can say which
   rule was hit rather than failing silently.
 
+### The Metrics tab, and the two numbers it refuses to show
+
+`GET /api/metrics?months=` → adoption snapshot, monthly series, project
+leaderboard, most-seen vendors. Charts mirror the Safety Dashboard's
+`drawChart`: inline SVG, dashed gridlines, 2px polylines, hover targets, legend.
+
+**No "coverage over time" chart exists, deliberately.** The vendor roster is a
+current snapshot mirrored from Procore — there is no record of who was on a
+job's roster last March — so a past-month percentage would be measured against a
+denominator we do not have. The monthly charts count only things that actually
+happened: meetings held, projects participating, vendors credited, how each
+meeting was recorded, whether attendance was ticked.
+
+**Coverage % is shown but labelled as what it is.** Its denominator is every
+company in the project directory, which includes owners, architects, inspectors
+and suppliers. Until those are marked *Not applicable* it reads ~2% and badly
+understates reality — so the tile says "coverage of all directory companies" and
+a note points at **project adoption** as the trustworthy headline instead.
+
+**Series colours: orange `#FF5F00` then steel `#2A6496`, fixed order, max two
+per chart.** That is not aesthetic preference — it is the only pair inside
+Buffalo's palette that survives an all-pairs colour-vision check. The obvious
+three-way good/ok/bad painting fails outright: orange↔amber is **ΔE 4.6 under
+deuteranopia**, so a red-green colourblind reader could not separate "attendee
+list" from "unmatched" — the exact comparison the chart exists to make. That is
+why "meetings that matched no vendor" is its own chart rather than a third line.
+Re-run `scripts/validate_palette.js` before adding any series.
+
 ### The Review Queue is not decoration
 
 Prep meetings that were logged but **can't be credited to any vendor** get their own tab rather

@@ -43,6 +43,7 @@ app.http('manualVendors', {
       });
 
       cacheBust('tracker:');
+      cacheBust('metrics:');
       cacheBust(`project:${projectId}`);
       return meta({ ok: true, project_id: projectId, vendor_normalized: vendorNormalized }, undefined, 0);
     } catch (err) {
@@ -68,6 +69,7 @@ app.http('manualVendorDelete', {
       }
       await removeManualVendor(projectId, vendor);
       cacheBust('tracker:');
+      cacheBust('metrics:');
       cacheBust(`project:${projectId}`);
       return meta({ ok: true }, undefined, 0);
     } catch (err) {

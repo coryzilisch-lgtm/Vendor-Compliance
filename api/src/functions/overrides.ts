@@ -62,6 +62,7 @@ app.http('overrides', {
       }
 
       cacheBust('tracker:');
+      cacheBust('metrics:');
       cacheBust(`project:${projectId}`);
       return meta({ ok: true, project_id: projectId, vendor_normalized: vendorNormalized }, undefined, 0);
     } catch (err) {
@@ -87,6 +88,7 @@ app.http('overrideDelete', {
       }
       await clearOverride(projectId, vendor);
       cacheBust('tracker:');
+      cacheBust('metrics:');
       cacheBust(`project:${projectId}`);
       return meta({ ok: true }, undefined, 0);
     } catch (err) {

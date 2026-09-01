@@ -32,6 +32,7 @@ app.http('settings', {
       const settings = await saveSettings(body, actorEmail(request));
 
       cacheBust('tracker:');
+      cacheBust('metrics:');
       cacheBust('project:');
       return meta(settings, undefined, 0);
     } catch (err) {

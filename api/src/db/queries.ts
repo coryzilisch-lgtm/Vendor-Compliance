@@ -934,6 +934,138 @@ export async function removeManualVendor(
  * MISC
  * ==========================================================================*/
 
+/* ============================================================================
+ * METRICS
+ *
+ * ⚠️ One thing is deliberately NOT computed here: **coverage percentage over
+ * time.** The vendor roster is a CURRENT snapshot mirrored from Procore — there
+ * is no history of who was on a project's roster in March — so a chart claiming
+ * "42% of vendors had their prep meeting in March" would be inventing its own
+ * denominator. Coverage is reported as a present-day figure only; what IS
+ * honestly derivable month over month is what actually happened: meetings held,
+ * projects participating, vendors credited, and how well the meetings were
+ * recorded. The dashboard says as much next to the charts.
+ * ==========================================================================*/
+
+export async function getMetrics(months: number): Promise<Record<string, unknown>> {
+  await ensureProjectColumnMeta();
+  await ensureAdminTables();
+  const s = await getSettings();
+  const win = Math.max(1, Math.min(60, Math.floor(months)));
+
+  // ── Current adoption + coverage snapshot ────────────────────────────────
+  const { rows: snap } = await db.query(`
+    WITH ${vendorStatusCTEs(s, activeStageFilter('p'))},
+    per_project AS (
+        SELECT project_id,
+               SUM(CASE WHEN status <> 'not_applicable' THEN 1 ELSE 0 END) AS tracked,
+               SUM(CASE WHEN status = 'held' THEN 1 ELSE 0 END)            AS held
+        FROM resolved GROUP BY project_id
+    )
+    SELECT
+        (SELECT COUNT(*) FROM proj)                                    AS active_projects,
+        (SELECT COUNT(DISTINCT m.project_id) FROM dbo.vendor_prep_meetings m
+          JOIN proj ON proj.project_id = m.project_id)                 AS projects_with_meetings,
+        COALESCE(SUM(pp.tracked), 0)                                   AS vendors_tracked,
+        COALESCE(SUM(pp.held), 0)                                      AS vendors_held,
+        (SELECT COUNT(*) FROM dbo.vendor_prep_meetings m
+          JOIN proj ON proj.project_id = m.project_id)                 AS total_meetings,
+        (SELECT COUNT(*) FROM dbo.vendor_prep_meetings m
+          JOIN proj ON proj.project_id = m.project_id
+          LEFT JOIN (SELECT DISTINCT meeting_id FROM dbo.vendor_prep_matches) x
+                 ON x.meeting_id = m.meeting_id
+         WHERE x.meeting_id IS NULL)                                   AS unmatched_meetings
+    FROM per_project pp;`);
+
+  // ── Month-by-month, from what actually happened ─────────────────────────
+  // Each meeting is classified by its BEST evidence: an attendee match beats a
+  // title-only match beats nothing. Counting a meeting once, at its strongest
+  // signal, keeps the three series a partition of the total rather than
+  // overlapping sets that sum to more than the meetings held.
+  const { rows: monthly } = await db.query(
+    `
+    WITH mtg AS (
+        SELECT m.meeting_id,
+               m.project_id,
+               CONVERT(CHAR(7), m.meeting_date, 23) AS ym,
+               MAX(CASE WHEN x.match_method = 'attendee' THEN 1 ELSE 0 END) AS has_attendee,
+               MAX(CASE WHEN x.match_method = 'title'    THEN 1 ELSE 0 END) AS has_title
+        FROM dbo.vendor_prep_meetings m
+        LEFT JOIN dbo.vendor_prep_matches x ON x.meeting_id = m.meeting_id
+        WHERE m.meeting_date IS NOT NULL
+          AND m.meeting_date >= DATEADD(MONTH, -@win, CAST(GETUTCDATE() AS DATE))
+        GROUP BY m.meeting_id, m.project_id, CONVERT(CHAR(7), m.meeting_date, 23)
+    ),
+    att AS (
+        SELECT CONVERT(CHAR(7), m.meeting_date, 23) AS ym,
+               COUNT(*) AS attendees,
+               SUM(CASE WHEN a.attendance_status IN ('present','conference','absent','distribution')
+                        THEN 1 ELSE 0 END) AS attendees_with_status,
+               SUM(CASE WHEN CAST(a.is_gc AS NVARCHAR(10)) NOT IN ('1','true','True')
+                        THEN 1 ELSE 0 END) AS vendor_attendees
+        FROM dbo.vendor_prep_attendees a
+        JOIN dbo.vendor_prep_meetings m ON m.meeting_id = a.meeting_id
+        WHERE m.meeting_date IS NOT NULL
+          AND m.meeting_date >= DATEADD(MONTH, -@win, CAST(GETUTCDATE() AS DATE))
+        GROUP BY CONVERT(CHAR(7), m.meeting_date, 23)
+    ),
+    ven AS (
+        SELECT CONVERT(CHAR(7), x.meeting_date, 23) AS ym,
+               COUNT(DISTINCT CONCAT(CAST(x.project_id AS NVARCHAR(20)), '|', x.vendor_normalized))
+                 AS vendors_credited
+        FROM dbo.vendor_prep_matches x
+        WHERE x.meeting_date IS NOT NULL
+          AND x.meeting_date >= DATEADD(MONTH, -@win, CAST(GETUTCDATE() AS DATE))
+        GROUP BY CONVERT(CHAR(7), x.meeting_date, 23)
+    )
+    SELECT
+        mtg.ym                                                        AS month,
+        COUNT(*)                                                      AS meetings,
+        COUNT(DISTINCT mtg.project_id)                                AS projects,
+        SUM(CASE WHEN mtg.has_attendee = 1 THEN 1 ELSE 0 END)         AS attendee_matched,
+        SUM(CASE WHEN mtg.has_attendee = 0 AND mtg.has_title = 1 THEN 1 ELSE 0 END) AS title_only,
+        SUM(CASE WHEN mtg.has_attendee = 0 AND mtg.has_title = 0 THEN 1 ELSE 0 END) AS unmatched,
+        MAX(COALESCE(att.attendees, 0))             AS attendees,
+        MAX(COALESCE(att.attendees_with_status, 0)) AS attendees_with_status,
+        MAX(COALESCE(att.vendor_attendees, 0))      AS vendor_attendees,
+        MAX(COALESCE(ven.vendors_credited, 0))      AS vendors_credited
+    FROM mtg
+    LEFT JOIN att ON att.ym = mtg.ym
+    LEFT JOIN ven ON ven.ym = mtg.ym
+    GROUP BY mtg.ym
+    ORDER BY mtg.ym;`,
+    { win },
+  );
+
+  // ── Per-project leaderboard (current coverage) ──────────────────────────
+  const { rows: leaderboard } = await db.query(`
+    WITH ${vendorStatusCTEs(s, activeStageFilter('p'))}
+    SELECT
+        proj.project_id, proj.project_name, proj.superintendent_name, proj.project_manager,
+        SUM(CASE WHEN r.status <> 'not_applicable' THEN 1 ELSE 0 END) AS tracked,
+        SUM(CASE WHEN r.status = 'held' THEN 1 ELSE 0 END)            AS held,
+        (SELECT COUNT(*) FROM dbo.vendor_prep_meetings m
+          WHERE m.project_id = proj.project_id)                       AS meetings
+    FROM proj
+    LEFT JOIN resolved r ON r.project_id = proj.project_id
+    GROUP BY proj.project_id, proj.project_name, proj.superintendent_name, proj.project_manager
+    ORDER BY proj.project_name;`);
+
+  // ── Vendors appearing in the most prep meetings ─────────────────────────
+  const { rows: topVendors } = await db.query(`
+    SELECT TOP 15
+           x.vendor_name,
+           COUNT(DISTINCT x.meeting_id) AS meetings,
+           COUNT(DISTINCT x.project_id) AS projects,
+           MAX(CASE WHEN x.match_method = 'attendee' THEN 1 ELSE 0 END) AS ever_on_attendee_list
+    FROM dbo.vendor_prep_matches x
+    WHERE COALESCE(x.vendor_name,'') <> ''
+    GROUP BY x.vendor_name
+    ORDER BY COUNT(DISTINCT x.meeting_id) DESC, x.vendor_name;`);
+
+  return { snapshot: snap[0] ?? {}, monthly, leaderboard, topVendors, months: win };
+}
+
 export async function getSyncStatus(): Promise<Record<string, unknown>> {
   const { rows } = await db.query(`
     SELECT

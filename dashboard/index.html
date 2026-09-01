@@ -95,6 +95,22 @@ td a.ext{font-size:11px}
 .pill.info{background:#e2ecf5;color:var(--info)}
 .pill.manual{background:#fff;border:1.5px solid var(--orange);color:var(--orange)}
 
+/* ── Metrics ────────────────────────────────────────────── */
+.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr));gap:16px;margin-bottom:20px}
+.card{background:#fff;border:1px solid var(--border);border-radius:var(--r-md);padding:16px 18px}
+.card h3{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.09em;color:var(--navy)}
+.card .sub{font-size:11.5px;color:var(--muted);margin:3px 0 12px;line-height:1.45}
+.chart-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:11px;color:var(--muted)}
+.chart-legend span{display:inline-flex;align-items:center;gap:5px}
+.chart-legend i{width:11px;height:3px;border-radius:2px;display:inline-block}
+.ctip{position:fixed;background:var(--navy);color:#fff;padding:6px 10px;border-radius:var(--r-sm);
+  font-size:11.5px;pointer-events:none;z-index:200;display:none;box-shadow:0 4px 14px rgba(0,0,0,.25);white-space:nowrap}
+.ctip b{color:var(--orange)}
+.cdot{cursor:pointer}
+.mini-bar{height:7px;background:var(--border);border-radius:4px;overflow:hidden;min-width:70px}
+.mini-bar>i{display:block;height:100%;background:var(--orange)}
+.mini-bar>i.done{background:var(--success)}
+
 /* ── Modal ──────────────────────────────────────────────── */
 .overlay{position:fixed;inset:0;background:rgba(23,28,38,.6);z-index:100;display:none;padding:24px;overflow:auto}
 .overlay.on{display:block}
@@ -169,6 +185,7 @@ button.sec-t.closed .cnt{background:var(--muted)}
 
 <nav class="tabs">
   <button data-tab="projects" class="on">Projects</button>
+  <button data-tab="metrics">Metrics</button>
   <button data-tab="review">Review Queue<span class="badge" id="badge-review" style="display:none">0</span></button>
   <button data-tab="settings" id="tab-settings" style="display:none">Settings</button>
 </nav>
@@ -191,6 +208,17 @@ button.sec-t.closed .cnt{background:var(--muted)}
     <div id="projects-out"><div class="empty">Loading…</div></div>
   </section>
 
+  <!-- ── Metrics ──────────────────────────────────────────── -->
+  <section class="panel" id="panel-metrics">
+    <div class="toolbar">
+      <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)">Range</span>
+      <button class="chip" data-months="6">6 months</button>
+      <button class="chip on" data-months="12">12 months</button>
+      <button class="chip" data-months="24">24 months</button>
+    </div>
+    <div id="metrics-out"><div class="empty">Loading…</div></div>
+  </section>
+
   <!-- ── Review queue ─────────────────────────────────────── -->
   <section class="panel" id="panel-review">
     <div class="note">
@@ -208,6 +236,7 @@ button.sec-t.closed .cnt{background:var(--muted)}
   </section>
 </main>
 
+<div class="ctip" id="ctip"></div>
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 
 <script>
@@ -803,6 +832,268 @@ async function loadSettings(){
   }
 }
 
+
+/* ── Charts ────────────────────────────────────────────────
+   Mirrors the Safety Dashboard's drawChart: inline SVG, dashed gridlines,
+   2px polylines, invisible hover targets over each point, legend below.
+
+   Categorical order is FIXED — orange, steel blue, amber — and never cycled.
+   That trio was validated for colour-vision separation (worst adjacent pair
+   ΔE 36 normal / 22 protan); the obvious "good/bad" choice of orange + red
+   fails it outright at ΔE 14.5, which is why match quality is not painted
+   green-amber-red here. Series colour is never the only signal: every chart
+   with more than one series carries a legend, and the tables below repeat the
+   same numbers. */
+var SERIES_COLORS=['var(--orange)','var(--info)','var(--warning)'];
+
+function drawChart(id, series, labels, opts){
+  var el=$(id);
+  if(!el) return;
+  opts=opts||{};
+  if(!labels||!labels.length){
+    el.innerHTML='<div class="empty" style="padding:24px">No meetings in this range.</div>';
+    return;
+  }
+  var W=320,H=118,PL=34,PR=10,PT=10,PB=22;
+  var all=[]; series.forEach(function(sr){ (sr.values||[]).forEach(function(v){ if(v!=null) all.push(Number(v)); }); });
+  var isPct = opts.unit==='%';
+  var maxY = opts.max!=null ? opts.max : (isPct ? 100 : Math.max(1, Math.ceil(Math.max.apply(null,all.concat([0]))*1.1)));
+  var n=labels.length;
+  var X=function(i){ return PL + (n<=1 ? (W-PL-PR)/2 : (W-PL-PR)*i/(n-1)); };
+  var Y=function(v){ return PT + (H-PT-PB)*(1-Math.min(1,Math.max(0,Number(v)/maxY))); };
+  var fmt=function(v){ return isPct ? Math.round(v)+'%' : String(Math.round(v)); };
+
+  var svg='<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="display:block;overflow:visible">';
+  [0,0.25,0.5,0.75,1].forEach(function(f){
+    var yy=Y(maxY*f);
+    svg+='<line x1="'+PL+'" y1="'+yy.toFixed(1)+'" x2="'+(W-PR)+'" y2="'+yy.toFixed(1)
+      +'" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="3,3"/>'
+      +'<text x="'+(PL-4)+'" y="'+(yy+3.5).toFixed(1)+'" font-size="8" fill="var(--muted)" '
+      +'text-anchor="end">'+fmt(maxY*f)+'</text>';
+  });
+  svg+='<line x1="'+PL+'" y1="'+(H-PB)+'" x2="'+(W-PR)+'" y2="'+(H-PB)+'" stroke="var(--border)"/>'
+     + '<line x1="'+PL+'" y1="'+PT+'" x2="'+PL+'" y2="'+(H-PB)+'" stroke="var(--border)"/>';
+
+  series.forEach(function(sr,si){
+    var col=sr.color||SERIES_COLORS[si%SERIES_COLORS.length];
+    var pts=(sr.values||[]).map(function(v,i){ return X(i).toFixed(1)+','+Y(v).toFixed(1); }).join(' ');
+    if(pts) svg+='<polyline points="'+pts+'" fill="none" stroke="'+col
+      +'" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>';
+    // A single point would draw nothing as a polyline, so mark it.
+    if((sr.values||[]).length===1) svg+='<circle cx="'+X(0).toFixed(1)+'" cy="'+Y(sr.values[0]).toFixed(1)
+      +'" r="3" fill="'+col+'"/>';
+  });
+  series.forEach(function(sr,si){
+    var col=sr.color||SERIES_COLORS[si%SERIES_COLORS.length];
+    (sr.values||[]).forEach(function(v,i){
+      svg+='<circle class="cdot" cx="'+X(i).toFixed(1)+'" cy="'+Y(v).toFixed(1)+'" r="7" '
+        +'fill="transparent" data-t="'+esc(labels[i]+' · '+(sr.name?sr.name+': ':'')+fmt(v))+'"/>';
+    });
+  });
+  var step=Math.max(1,Math.ceil(n/6)), idxs=[];
+  for(var i=0;i<n;i+=step) idxs.push(i);
+  if(idxs[idxs.length-1]!==n-1){
+    if(n-1-idxs[idxs.length-1] < Math.ceil(step*0.6)) idxs.pop();
+    idxs.push(n-1);
+  }
+  idxs.forEach(function(i){
+    svg+='<text x="'+X(i).toFixed(1)+'" y="'+(H-5)+'" font-size="8" fill="var(--muted)" '
+      +'text-anchor="middle">'+esc(labels[i])+'</text>';
+  });
+  svg+='</svg>';
+
+  if(series.length>1){
+    svg+='<div class="chart-legend">'+series.map(function(sr,si){
+      return '<span><i style="background:'+(sr.color||SERIES_COLORS[si%SERIES_COLORS.length])+'"></i>'
+        +esc(sr.name||'')+'</span>';
+    }).join('')+'</div>';
+  }
+  el.innerHTML=svg;
+
+  Array.prototype.forEach.call(el.querySelectorAll('.cdot'),function(c){
+    c.onmouseenter=function(ev){
+      var t=$('ctip'); t.textContent=c.getAttribute('data-t');
+      t.style.display='block';
+      t.style.left=(ev.clientX+12)+'px'; t.style.top=(ev.clientY-30)+'px';
+    };
+    c.onmouseleave=function(){ $('ctip').style.display='none'; };
+  });
+}
+
+/* ── Metrics ───────────────────────────────────────────── */
+var METRICS=null, MONTHS=12;
+
+/* SQL only returns months that had meetings. Charting those consecutively
+   would compress a six-month gap into one flat step and misrepresent the
+   trend, so the missing months are filled with real zeros. */
+function fillMonths(rows, months){
+  var have={}; (rows||[]).forEach(function(r){ have[r.month]=r; });
+  var out=[], d=new Date();
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth()-(months-1));
+  for(var i=0;i<months;i++){
+    var key=d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0');
+    out.push(have[key] || {month:key, meetings:0, projects:0, attendee_matched:0,
+                           title_only:0, unmatched:0, attendees:0,
+                           attendees_with_status:0, vendors_credited:0});
+    d.setUTCMonth(d.getUTCMonth()+1);
+  }
+  return out;
+}
+function monthLabel(ym){
+  var p=String(ym).split('-');
+  return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][Number(p[1])-1]
+    +" '"+String(p[0]).slice(2);
+}
+
+function renderMetrics(){
+  if(!METRICS){ return; }
+  var snap=METRICS.snapshot||{}, rows=fillMonths(METRICS.monthly, MONTHS);
+  var labels=rows.map(function(r){ return monthLabel(r.month); });
+  var num=function(v){ return Number(v||0); };
+
+  var adoption = num(snap.active_projects)
+    ? Math.round(100*num(snap.projects_with_meetings)/num(snap.active_projects)) : null;
+  var coverage = num(snap.vendors_tracked)
+    ? Math.round(100*num(snap.vendors_held)/num(snap.vendors_tracked)) : null;
+
+  var h='<div class="kpis">'
+    +kpi(num(snap.active_projects),'Active projects','')
+    +kpi(num(snap.projects_with_meetings)+' / '+num(snap.active_projects),'Projects holding prep meetings','orange')
+    +kpi(adoption==null?'—':adoption+'%','Project adoption','orange')
+    +kpi(num(snap.vendors_held)+' / '+num(snap.vendors_tracked),'Vendors with a prep meeting','')
+    +kpi(coverage==null?'—':coverage+'%','Coverage of all directory companies','')
+    +kpi(num(snap.unmatched_meetings),'Meetings needing review',
+         num(snap.unmatched_meetings)>0?'err':'')
+    +'</div>';
+
+  h+='<div class="note"><b>Read the coverage figure carefully.</b> Its denominator is every '
+    +'company in the Procore project directory — which also holds owners, architects, inspectors '
+    +'and suppliers who never need a prep meeting. Until those are marked <b>Not applicable</b> on '
+    +'each project, coverage understates the real picture badly. <b>Project adoption</b> and the '
+    +'monthly charts are the trustworthy headline today.</div>'
+    +'<div class="note"><b>Why there is no "coverage over time" chart.</b> The vendor roster is a '
+    +'current snapshot from Procore with no history — there is no record of who was on a job\'s '
+    +'roster last March — so any past-month percentage would be measured against a denominator we '
+    +'do not have. The monthly charts therefore count only things that actually happened.</div>';
+
+  h+='<div class="chart-grid">'
+    +card('mc1','Prep meetings held per month',
+          'Raw volume. The first thing to watch — the process is only as good as its adoption.')
+    +card('mc2','Projects holding prep meetings',
+          'How many distinct jobs took part each month. Flat and low means the practice is '
+          +'concentrated in a few crews rather than spreading.')
+    +card('mc3','How each meeting was recorded',
+          'Each meeting counted once, at its strongest evidence. "Attendee list" is the one to '
+          +'grow: it is the only signal that proves who was actually in the room.')
+    +card('mc5','Meetings that matched no vendor',
+          'Held, logged, and creditable to nobody — usually titled with a person rather than a '
+          +'company, or naming a sub who is not in the Procore project directory. These are the '
+          +'Review Queue.')
+    +card('mc4','Attendance actually ticked',
+          'Share of attendees with Present / Absent / Distribution recorded. This has to be high '
+          +'before "require the vendor to be marked Present" can be switched on in Settings.')
+    +'</div>';
+
+  h+='<div class="card" style="margin-bottom:16px"><h3>Project coverage</h3>'
+    +'<div class="sub">Current vendor coverage per active project, worst first — where the next '
+    +'conversation should happen.</div><div id="mc-lead"></div></div>';
+  h+='<div class="card"><h3>Vendors appearing in the most prep meetings</h3>'
+    +'<div class="sub">Across every project. A vendor never seen on an attendee list is one '
+    +'whose meetings are only being matched by title.</div><div id="mc-vend"></div></div>';
+
+  $('metrics-out').innerHTML=h;
+
+  drawChart('mc1',[{name:'Meetings',values:rows.map(function(r){return num(r.meetings);})}],labels,{unit:'count'});
+  drawChart('mc2',[{name:'Projects',values:rows.map(function(r){return num(r.projects);}),
+                    color:'var(--info)'}],labels,{unit:'count'});
+  // Two series here, not three. "Unmatched" got its own chart below because the
+  // only third colour available inside Buffalo's palette was amber, and
+  // amber↔orange measures ΔE 4.6 under deuteranopia — a red-green colourblind
+  // reader could not separate the best evidence from the worst, which is
+  // exactly the comparison this chart exists to make. Orange↔steel is ΔE 22.
+  drawChart('mc3',[
+    {name:'Attendee list',values:rows.map(function(r){return num(r.attendee_matched);})},
+    {name:'Title only',   values:rows.map(function(r){return num(r.title_only);})}
+  ],labels,{unit:'count'});
+  drawChart('mc5',[{name:'Unmatched',values:rows.map(function(r){return num(r.unmatched);}),
+                    color:'var(--error)'}],labels,{unit:'count'});
+  drawChart('mc4',[{name:'Attendance recorded',
+    values:rows.map(function(r){ return num(r.attendees) ? Math.round(100*num(r.attendees_with_status)/num(r.attendees)) : 0; })
+  }],labels,{unit:'%',max:100});
+
+  renderLeaderboard();
+  renderTopVendors();
+}
+
+function kpi(n,label,cls){
+  return '<div class="kpi"><div class="n '+(cls||'')+'">'+esc(n)+'</div><div class="l">'+esc(label)+'</div></div>';
+}
+function card(id,title,sub){
+  return '<div class="card"><h3>'+esc(title)+'</h3><div class="sub">'+esc(sub)+'</div>'
+    +'<div id="'+id+'"></div></div>';
+}
+
+function renderLeaderboard(){
+  var rows=(METRICS.leaderboard||[]).map(function(r){
+    var tracked=Number(r.tracked||0), held=Number(r.held||0);
+    return {r:r, tracked:tracked, held:held, pct: tracked?Math.round(100*held/tracked):null};
+  });
+  // Worst first, but projects with no vendors at all sink — no vendors is not a
+  // score, and ranking them "worst" would send people to the wrong jobs.
+  rows.sort(function(a,b){
+    if(a.tracked===0 && b.tracked===0) return 0;
+    if(a.tracked===0) return 1;
+    if(b.tracked===0) return -1;
+    return a.pct-b.pct;
+  });
+  if(!rows.length){ $('mc-lead').innerHTML='<div class="empty">No active projects.</div>'; return; }
+  var h='<table><thead><tr><th>Project</th><th>Superintendent</th><th class="num">Vendors</th>'
+    +'<th class="num">Held</th><th>Coverage</th><th class="num">Meetings</th></tr></thead><tbody>';
+  rows.forEach(function(x){
+    h+='<tr class="click" data-pid="'+esc(x.r.project_id)+'">'
+      +'<td class="pname">'+esc(x.r.project_name||x.r.project_id)+'</td>'
+      +'<td>'+esc(x.r.superintendent_name||x.r.project_manager||'—')+'</td>'
+      +'<td class="num">'+x.tracked+'</td><td class="num">'+x.held+'</td>'
+      +'<td>'+(x.tracked===0 ? '<span class="pill warn">No vendors</span>'
+          : '<div style="display:flex;align-items:center;gap:8px"><span class="mini-bar" style="flex:1">'
+            +'<i class="'+(x.pct===100?'done':'')+'" style="width:'+x.pct+'%"></i></span>'
+            +'<b style="font-variant-numeric:tabular-nums">'+x.pct+'%</b></div>')+'</td>'
+      +'<td class="num">'+esc(x.r.meetings||0)+'</td></tr>';
+  });
+  h+='</tbody></table>';
+  $('mc-lead').innerHTML=h;
+  Array.prototype.forEach.call($('mc-lead').querySelectorAll('tr.click'),function(tr){
+    tr.onclick=function(){ openProject(Number(tr.getAttribute('data-pid'))); };
+  });
+}
+
+function renderTopVendors(){
+  var rows=METRICS.topVendors||[];
+  if(!rows.length){ $('mc-vend').innerHTML='<div class="empty">No matched vendors yet.</div>'; return; }
+  var h='<table><thead><tr><th>Vendor</th><th class="num">Prep meetings</th>'
+    +'<th class="num">Projects</th><th>Evidence</th></tr></thead><tbody>';
+  rows.forEach(function(v){
+    h+='<tr><td class="pname">'+esc(v.vendor_name)+'</td>'
+      +'<td class="num">'+esc(v.meetings)+'</td><td class="num">'+esc(v.projects)+'</td>'
+      +'<td>'+(Number(v.ever_on_attendee_list)===1
+          ? '<span class="pill held">On attendee list</span>'
+          : '<span class="pill warn">Title match only</span>')+'</td></tr>';
+  });
+  h+='</tbody></table>';
+  $('mc-vend').innerHTML=h;
+}
+
+async function loadMetrics(fresh){
+  try{
+    var r=await api('/api/metrics?months='+MONTHS+(fresh?'&fresh=1':''));
+    METRICS=r.data||null;
+    renderMetrics();
+  }catch(e){
+    $('metrics-out').innerHTML=errNote(e.message);
+  }
+}
+
 /* ── admin access ──────────────────────────────────────── */
 function renderAdminPanel(){
   var open = SETTINGS.adminMode !== 'allowlist';
@@ -894,11 +1185,19 @@ function showTab(name){
     p.classList.toggle('on', p.id==='panel-'+name);
   });
   if(name==='settings') loadSettings();
+  if(name==='metrics' && !METRICS) loadMetrics();
 }
 
 document.addEventListener('click',function(e){
   var t=e.target;
   if(t.matches && t.matches('nav.tabs button[data-tab]')) showTab(t.getAttribute('data-tab'));
+  if(t.matches && t.matches('.chip[data-months]')){
+    MONTHS=Number(t.getAttribute('data-months'));
+    Array.prototype.forEach.call(document.querySelectorAll('.chip[data-months]'),function(c){
+      c.classList.toggle('on', c===t);
+    });
+    loadMetrics(true);
+  }
   if(t.matches && t.matches('.chip[data-filter]')){
     FILTER=t.getAttribute('data-filter');
     Array.prototype.forEach.call(document.querySelectorAll('.chip[data-filter]'),function(c){
@@ -911,7 +1210,7 @@ $('overlay').onclick=function(e){ if(e.target===$('overlay')) closeModal(); };
 document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeModal(); });
 $('q').oninput=renderProjects;
 $('scope').onchange=function(){ SCOPE=$('scope').value; loadProjects(true); loadReview(); };
-$('btn-refresh').onclick=function(){ loadProjects(true); loadReview(); };
+$('btn-refresh').onclick=function(){ loadProjects(true); loadReview(); if(METRICS) loadMetrics(true); };
 $('btn-settings').onclick=function(){ showTab('settings'); };
 
 (async function init(){
