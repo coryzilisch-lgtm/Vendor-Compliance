@@ -65,8 +65,27 @@ from pyspark.sql.functions import current_timestamp, lit
 # meetings carry it — at which point you can tighten this to an exact template
 # match by setting PREP_REQUIRE_TEMPLATE_ID = True.
 PREP_TITLE_PATTERNS = [r"\bprep"]          # case-insensitive regex, ANY match wins
-PREP_MEETING_TEMPLATE_ID = 383995          # from the create URL; may not be exposed by the API
-PREP_REQUIRE_TEMPLATE_ID = False           # True = template id must match (only once verified)
+PREP_MEETING_TEMPLATE_ID = 383995          # from the create URL
+
+# ---- How a meeting is identified as a prep meeting --------------------------
+# CONFIRMED 2026-08 against live data: the API **does** expose the template id,
+# and it is strictly better than the title heuristic. In a 20-project sample the
+# title filter found 3 prep meetings while template 383995 was on 10 — seven
+# meetings were created from the prep template but titled something without the
+# word "prep" in it.
+#
+#   "template_or_title"  (default) UNION of both. Catches every meeting off the
+#                        prep template, PLUS any prep meeting created some other
+#                        way but titled like one. Most complete.
+#   "template"           template id only. Most precise; drops a correctly-named
+#                        meeting that was built from a different template.
+#   "title"              the old heuristic. Kept for a tenant that doesn't
+#                        expose the template id.
+#
+# ⚠️ An earlier version of this had a `PREP_REQUIRE_TEMPLATE_ID` flag that
+# AND-ed the two tests. That was backwards — it returned the intersection, so
+# switching it on made the result *worse* (3 instead of 10). It's a union.
+PREP_MATCH_MODE = "template_or_title"
 
 # Candidate keys that might carry the template id on a meeting record. Procore's
 # meetings API is not consistent about this across tenants, so we probe several
@@ -93,6 +112,12 @@ RATE_LIMIT_FLOOR     = 3
 RATE_LIMIT_MAX_SLEEP = 90      # never block longer than this on one call
 
 _stats = {"calls": 0, "sleep": 0.0, "pauses": 0, "remaining": None}
+
+# Diagnostics collected during the run and printed at the end.
+_prep_source   = {}   # how each prep meeting was identified (template vs title)
+_company_paths = {}   # which JSON path yielded each attendee's company
+_attendee_keys = {}   # top-level keys seen on attendee objects
+_endpoint_status = {} # (endpoint, http status) -> count, to tell 403 from empty
 
 # ---- What to pull -----------------------------------------------------------
 PULL_MEETINGS    = True
@@ -277,13 +302,20 @@ def request_json(url, params=None, allow_404=True):
     raise last_exc
 
 
-def get_paginated(url, params=None, per_page=100, max_pages=100):
+def _note_status(label, status):
+    key = (label, status)
+    _endpoint_status[key] = _endpoint_status.get(key, 0) + 1
+
+
+def get_paginated(url, params=None, per_page=100, max_pages=100, label=None):
     """Follow pages until a short page comes back. Handles both v1.x bare arrays
     and v2.0 {"data": [...]} envelopes."""
     out, page = [], 1
     base = dict(params or {})
     while page <= max_pages:
         payload, status = request_json(url, {**base, "page": page, "per_page": per_page})
+        if label and page == 1:
+            _note_status(label, status)
         if payload is None:
             break
         chunk = payload.get("data") if isinstance(payload, dict) else payload
@@ -509,26 +541,78 @@ def attendance_status(att):
     return "unknown"
 
 
+COMPANY_KEY_RE = re.compile(r"(company|vendor|business|organization|firm)", re.I)
+
+
+def _deep_company(node, depth=0):
+    """Walk the attendee object looking for anything company-shaped, at any
+    depth. Returns (name, dotted_path_where_found).
+
+    This exists because the first live run came back with the company missing on
+    17 of 17 attendees while attendance status parsed fine — i.e. the data is in
+    there, just not under any key that was guessed. Rather than guess again,
+    search, and report the path so the shape gets documented instead of
+    re-discovered.
+    """
+    if depth > 4 or not isinstance(node, (dict, list)):
+        return None, None
+    if isinstance(node, list):
+        for item in node:
+            n, p = _deep_company(item, depth + 1)
+            if n:
+                return n, p
+        return None, None
+    for key, value in node.items():
+        if not COMPANY_KEY_RE.search(str(key)):
+            continue
+        if isinstance(value, str) and value.strip():
+            return value, key
+        name = pick_name(value)
+        if name:
+            return name, f"{key}.name"
+    for key, value in node.items():
+        if isinstance(value, (dict, list)):
+            n, p = _deep_company(value, depth + 1)
+            if n:
+                return n, f"{key}.{p}"
+    return None, None
+
+
 def attendee_company(att):
-    """Company name for an attendee, wherever the API decided to put it."""
+    """Company name for an attendee, wherever the API decided to put it.
+
+    Tries the documented shapes first (cheap, predictable), then falls back to a
+    recursive search. Records which path produced the answer so the run can
+    print it — see the ATTENDEE SHAPE diagnostic.
+    """
     if not isinstance(att, dict):
         return None
     for key in ("company", "vendor", "business", "organization"):
         n = pick_name(att.get(key))
         if n:
+            _company_paths[key] = _company_paths.get(key, 0) + 1
             return n
     direct = pick(att, "company_name", "vendor_name", "business_name", "organization_name")
     if direct:
+        _company_paths["<direct>"] = _company_paths.get("<direct>", 0) + 1
         return direct
-    login = att.get("login_information") or att.get("user") or att.get("person")
-    if isinstance(login, dict):
-        for key in ("company", "vendor", "business"):
-            n = pick_name(login.get(key))
+    for outer in ("login_information", "user", "person", "contact"):
+        sub = att.get(outer)
+        if isinstance(sub, dict):
+            for key in ("company", "vendor", "business"):
+                n = pick_name(sub.get(key))
+                if n:
+                    _company_paths[f"{outer}.{key}"] = _company_paths.get(f"{outer}.{key}", 0) + 1
+                    return n
+            n = pick(sub, "company_name", "vendor_name")
             if n:
+                _company_paths[f"{outer}.company_name"] = _company_paths.get(f"{outer}.company_name", 0) + 1
                 return n
-        n = pick(login, "company_name", "vendor_name")
-        if n:
-            return n
+    name, path = _deep_company(att)
+    if name:
+        _company_paths[f"deep:{path}"] = _company_paths.get(f"deep:{path}", 0) + 1
+        return name
+    _company_paths["<none>"] = _company_paths.get("<none>", 0) + 1
     return None
 
 
@@ -704,7 +788,8 @@ for pi, project in enumerate(scope, start=1):
         try:
             meetings = get_paginated(
                 f"{PROCORE_API_BASE_URL}/rest/v1.1/projects/{pid}/meetings",
-                {"company_id": company_id}, per_page=MEETINGS_PER_PAGE)
+                {"company_id": company_id}, per_page=MEETINGS_PER_PAGE,
+                label="meetings")
 
             # Some tenants nest meetings inside series groups.
             flat = []
@@ -720,9 +805,18 @@ for pi, project in enumerate(scope, start=1):
                 if tmpl:
                     template_id_hits[tmpl] = template_id_hits.get(tmpl, 0) + 1
 
-                is_prep = looks_like_prep_meeting(title)
-                if PREP_REQUIRE_TEMPLATE_ID:
-                    is_prep = is_prep and tmpl == str(PREP_MEETING_TEMPLATE_ID)
+                by_title    = looks_like_prep_meeting(title)
+                by_template = tmpl == str(PREP_MEETING_TEMPLATE_ID)
+                if PREP_MATCH_MODE == "template":
+                    is_prep = by_template
+                elif PREP_MATCH_MODE == "title":
+                    is_prep = by_title
+                else:                                   # template_or_title
+                    is_prep = by_template or by_title
+                if is_prep:
+                    which = ("both" if (by_template and by_title)
+                             else "template_only" if by_template else "title_only")
+                    _prep_source[which] = _prep_source.get(which, 0) + 1
 
                 meeting_summaries.append({
                     "project_procore_id": pid,
@@ -773,6 +867,9 @@ for pi, project in enumerate(scope, start=1):
                 })
 
                 for a in atts:
+                    if isinstance(a, dict):
+                        for k in a.keys():
+                            _attendee_keys[k] = _attendee_keys.get(k, 0) + 1
                     st = attendance_status(a)
                     attendance_shapes[st] = attendance_shapes.get(st, 0) + 1
                     cname = attendee_company(a)
@@ -798,7 +895,8 @@ for pi, project in enumerate(scope, start=1):
                            ("purchase_order", "purchase_order_contracts")):
             try:
                 rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.0/{path}",
-                                     {"project_id": pid}, per_page=VENDOR_PAGE_SIZE)
+                                     {"project_id": pid}, per_page=VENDOR_PAGE_SIZE,
+                                     label=path)
                 for c in rows:
                     vendor = c.get("vendor") if isinstance(c, dict) else None
                     vname = pick_name(vendor) or pick(c, "vendor_name", "contract_company_name")
@@ -828,7 +926,8 @@ for pi, project in enumerate(scope, start=1):
     if PULL_DIRECTORY:
         try:
             rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.1/projects/{pid}/vendors",
-                                 {"company_id": company_id}, per_page=VENDOR_PAGE_SIZE)
+                                 {"company_id": company_id}, per_page=VENDOR_PAGE_SIZE,
+                                 label="project_vendors")
             for v in rows:
                 vname = pick(v, "name", "company_name")
                 trade = v.get("trade") if isinstance(v, dict) else None
@@ -1037,6 +1136,56 @@ else:
     print("  none of", TEMPLATE_ID_FIELDS, "appeared on any meeting record.")
     print("  => the API does not expose the originating template; the title match is")
     print("     the only available filter. Leave PREP_REQUIRE_TEMPLATE_ID = False.")
+
+print("\n--- how each prep meeting was identified ---")
+for k in ("both", "template_only", "title_only"):
+    if k in _prep_source:
+        print(f"  {k}: {_prep_source[k]}")
+if _prep_source.get("template_only"):
+    print(f"  => {_prep_source['template_only']} meeting(s) came from the prep template but")
+    print("     do NOT have 'prep' in the title. The title heuristic alone would have")
+    print("     missed them — this is why PREP_MATCH_MODE defaults to the union.")
+if _prep_source.get("title_only"):
+    print(f"  => {_prep_source['title_only']} meeting(s) are titled like prep meetings but were")
+    print("     built from a different template. Worth a look: either they belong and the")
+    print("     union is doing its job, or someone free-typed a meeting that isn't one.")
+
+print("\n--- endpoint reachability (tells 'no data' apart from 'no permission') ---")
+for (label, status), n in sorted(_endpoint_status.items()):
+    note = ""
+    if status in (403, 404):
+        note = ("  <-- NOT a 'no rows' answer: the tool is disabled for this project or the "
+                "API user lacks permission on it")
+    print(f"  {label:<28} HTTP {status}: {n} project(s){note}")
+if any(s in (403, 404) for (lbl, s) in _endpoint_status
+       if lbl in ("work_order_contracts", "purchase_order_contracts")):
+    print("  ⚠️  Commitments returned 403/404 on some projects. A zero commitment count in")
+    print("      the COVERAGE DIAGNOSTIC above may therefore mean 'no access', not 'no")
+    print("      contracts' — grant the API service account read on Commitments before")
+    print("      concluding BCI doesn't use them.")
+
+print("\n--- ATTENDEE SHAPE (where the company name actually lives) ---")
+print("  top-level keys seen on attendee objects:")
+for k, n in sorted(_attendee_keys.items(), key=lambda kv: -kv[1])[:30]:
+    print(f"    {k}: {n}")
+print("  path that produced the company name:")
+for k, n in sorted(_company_paths.items(), key=lambda kv: -kv[1]):
+    print(f"    {k}: {n}")
+if _company_paths.get("<none>"):
+    print(f"  ⚠️  {_company_paths['<none>']} attendee(s) yielded no company even after a deep")
+    print("      search of the whole object. The attendee record probably only references a")
+    print("      person id, with the UI resolving the company by joining the project")
+    print("      directory. Paste one row of the sample below and the extractor can be")
+    print("      pointed at the right field (or switched to a directory join).")
+    try:
+        _sample = spark.sql("""
+            SELECT raw_json FROM bronze_vendor_meeting_attendees
+            WHERE raw_json IS NOT NULL LIMIT 1""").collect()
+        if _sample:
+            print("\n  SAMPLE ATTENDEE RECORD (copy this back):")
+            print("  " + str(_sample[0]["raw_json"])[:1500])
+    except Exception as _e:
+        print(f"  (couldn't read a sample row: {_e})")
 
 print("\n--- attendance status shapes seen ---")
 for st, n in sorted(attendance_shapes.items(), key=lambda kv: -kv[1]):
