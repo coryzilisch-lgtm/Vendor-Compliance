@@ -1,15 +1,22 @@
 # ============================================================
 # Fabric Notebook Cell: VENDOR COMPLIANCE INGESTION (bronze + silver)
 # ------------------------------------------------------------
-# Feeds the Prep-Phase Meeting Tracker. Three pulls, one project loop:
+# Feeds the Prep-Phase Meeting Tracker. Four pulls, one project loop, in this
+# order (the rosters must be built BEFORE meetings — see #4):
 #
-#   1. Prep meetings   <- GET /rest/v1.1/projects/{id}/meetings   (list, then
-#                         detail ONLY for meetings whose title matches a prep
-#                         pattern — this is what keeps the run to minutes rather
-#                         than the hours the all-meetings detail pull takes)
+#   1. Project people  <- GET /rest/v1.0/projects/{id}/users
+#                         The attendee -> company bridge. A meeting attendee
+#                         carries ONLY {id, status, login_information:{id, login,
+#                         name}} — there is no company on it. Procore's UI fills
+#                         that column by joining the person against the project
+#                         directory, so this does the same.
 #   2. Vendor roster A <- GET /rest/v1.0/work_order_contracts?project_id={id}
 #                         + /rest/v1.0/purchase_order_contracts   (commitments)
 #   3. Vendor roster B <- GET /rest/v1.1/projects/{id}/vendors     (directory)
+#   4. Prep meetings   <- GET /rest/v1.1/projects/{id}/meetings   (list, then
+#                         detail ONLY for meetings that look like prep meetings —
+#                         this is what keeps the run to minutes rather than the
+#                         hours an all-meetings detail pull takes)
 #
 # BOTH vendor rosters are ingested on purpose. Which one drives the tracker's
 # checklist is a dashboard setting (`vendorSource`), not a decision baked into
@@ -26,7 +33,8 @@
 # Writes:
 #   bronze_vendor_meeting_summaries      bronze_vendor_meeting_details
 #   bronze_vendor_meeting_attendees      bronze_vendor_commitments
-#   bronze_vendor_directory              bronze_vendor_sync_errors
+#   bronze_vendor_directory              bronze_vendor_project_users
+#   bronze_vendor_sync_errors
 #   silver_vendor_prep_meetings          silver_vendor_prep_attendees
 #   silver_vendor_roster
 #
@@ -60,10 +68,8 @@ from pyspark.sql.functions import current_timestamp, lit
 # applied to the LIST response, so we only pay for a detail call on meetings that
 # already look like prep meetings.
 #
-# If Procore turns out to expose the originating template id on the meeting
-# record, TEMPLATE_ID_FIELDS below picks it up and the run prints how many
-# meetings carry it — at which point you can tighten this to an exact template
-# match by setting PREP_REQUIRE_TEMPLATE_ID = True.
+# The title alone is NOT sufficient — see PREP_MATCH_MODE below. Confirmed
+# against live data: 7 of 10 real prep meetings had no "prep" in the title.
 PREP_TITLE_PATTERNS = [r"\bprep"]          # case-insensitive regex, ANY match wins
 PREP_MEETING_TEMPLATE_ID = 383995          # from the create URL
 
@@ -123,6 +129,10 @@ _endpoint_status = {} # (endpoint, http status) -> count, to tell 403 from empty
 PULL_MEETINGS    = True
 PULL_COMMITMENTS = True        # work order + purchase order contracts
 PULL_DIRECTORY   = True        # project directory vendor list
+# The attendee -> company bridge. A meeting attendee carries only a person id
+# and an email, so the company has to come from the project directory people
+# list. Turning this off leaves title matching as the only signal.
+PULL_PROJECT_USERS = True
 
 # ---- Project scope ----------------------------------------------------------
 # Mirrors ingest_safety.py: build scope from the FULL project list so completed
@@ -637,6 +647,60 @@ def attendee_name(att):
     return f"{first} {last}".strip() or None
 
 
+def attendee_person_id(att):
+    """The Procore user id behind an attendee, which is the join key into the
+    project directory people list."""
+    if not isinstance(att, dict):
+        return None
+    for key in ("login_information", "user", "person", "contact"):
+        sub = att.get(key)
+        if isinstance(sub, dict) and sub.get("id") is not None:
+            return str(sub["id"])
+    for key in ("user_id", "login_id", "person_id"):
+        if att.get(key) is not None:
+            return str(att[key])
+    return None
+
+
+def attendee_email(att):
+    if not isinstance(att, dict):
+        return None
+    for key in ("login_information", "user", "person", "contact"):
+        sub = att.get(key)
+        if isinstance(sub, dict):
+            e = pick(sub, "login", "email", "email_address")
+            if e and "@" in str(e):
+                return str(e)
+    e = pick(att, "email", "email_address", "login")
+    return str(e) if e and "@" in str(e) else None
+
+
+def company_from_email(email, vendor_index):
+    """Last-resort resolution: match the email's domain against this project's
+    vendor names. robertmartinez@jjfloresroofing.co -> "jjfloresroofing", which
+    equals normalize_company("JJ Flores Roofing") with spaces removed.
+
+    `vendor_index` maps that space-stripped key -> the vendor's REAL name, and
+    the real name is what comes back. Returning the stripped key instead would
+    be silently wrong: it re-normalizes to "jjfloresroofing" (no spaces), which
+    never equals the roster's "jj flores roofing", so the match would be thrown
+    away by the very join it exists to satisfy.
+
+    Only consulted after the directory join fails, and only against vendors
+    already on THIS project, so it cannot invent a company out of nothing.
+    """
+    if not email or "@" not in email or not vendor_index:
+        return None
+    domain = email.rsplit("@", 1)[1].lower()
+    stem = re.sub(r"[^a-z0-9]", "", domain.split(".")[0])
+    if len(stem) < 4:
+        return None
+    for key, real_name in vendor_index.items():
+        if key and (key == stem or (len(stem) >= 6 and (stem in key or key in stem))):
+            return real_name
+    return None
+
+
 def extract_attendee_list(detail):
     """Every attendee-ish collection on a meeting detail, de-duplicated."""
     if not isinstance(detail, dict):
@@ -771,9 +835,9 @@ print(f"  {len(all_projects)} projects total; {len(scope)} in scope.\n")
 # ============================================================
 # 6. The pull
 # ============================================================
-meeting_summaries, meeting_details, meeting_attendees = [], [], []
+meeting_summaries, meeting_details, meeting_attendees, project_users = [], [], [], []
 commitments, directory_vendors, sync_errors = [], [], []
-template_id_hits, attendance_shapes = {}, {}
+template_id_hits, attendance_shapes, raw_status_values = {}, {}, {}
 
 _t0, _n = time.time(), len(scope)
 
@@ -783,7 +847,117 @@ for pi, project in enumerate(scope, start=1):
         continue
     pname = project.get("name")
 
-    # ---- 6a. Meetings ------------------------------------------------------
+    # ---- 6a. Project directory PEOPLE (the attendee -> company bridge) -----
+    # A meeting attendee record carries only { id, status, login_information:
+    # { id, login, name } } — there is NO company on it. Procore's UI fills that
+    # "Company" column by joining the person against the project directory, so
+    # the tracker has to do the same. One extra call per project buys the single
+    # most important matching signal.
+    person_company = {}
+    project_vendor_norms = {}   # space-stripped key -> the vendor's real name
+    if PULL_PROJECT_USERS:
+        try:
+            rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.0/projects/{pid}/users",
+                                 {"company_id": company_id}, per_page=VENDOR_PAGE_SIZE,
+                                 label="project_users")
+            for u in rows:
+                if not isinstance(u, dict):
+                    continue
+                vendor = u.get("vendor")
+                cname = pick_name(vendor) or pick(u, "company_name", "company")
+                if isinstance(cname, dict):
+                    cname = pick_name(cname)
+                uid = u.get("id")
+                email = pick(u, "email_address", "email", "login")
+                if uid is not None and cname:
+                    person_company[str(uid)] = cname
+                project_users.append({
+                    "project_procore_id": pid,
+                    "person_procore_id": uid,
+                    "name": pick(u, "name"),
+                    "email": email,
+                    "company_name": cname,
+                    "company_normalized": normalize_company(cname),
+                    "is_employee": u.get("is_employee"),
+                    "is_gc": is_gc(cname),
+                })
+        except Exception as e:
+            print(f"  project users failed: project={pid}: {e}")
+            sync_errors.append({"project_procore_id": pid, "stage": "project_users",
+                                "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
+
+    # ---- 6b. Commitments (work orders + purchase orders) -------------------
+    if PULL_COMMITMENTS:
+        for kind, path in (("work_order", "work_order_contracts"),
+                           ("purchase_order", "purchase_order_contracts")):
+            try:
+                rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.0/{path}",
+                                     {"project_id": pid}, per_page=VENDOR_PAGE_SIZE,
+                                     label=path)
+                for c in rows:
+                    vendor = c.get("vendor") if isinstance(c, dict) else None
+                    vname = pick_name(vendor) or pick(c, "vendor_name", "contract_company_name")
+                    vid   = vendor.get("id") if isinstance(vendor, dict) else pick(c, "vendor_id")
+                    commitments.append({
+                        "project_procore_id": pid,
+                        "project_name": pname,
+                        "contract_procore_id": c.get("id"),
+                        "contract_kind": kind,
+                        "contract_number": pick(c, "number", "contract_number"),
+                        "contract_title": pick(c, "title", "description"),
+                        "contract_status": pick(c, "status"),
+                        "vendor_procore_id": vid,
+                        "vendor_name": vname,
+                        "vendor_normalized": normalize_company(vname),
+                        "is_gc": is_gc(vname),
+                        "executed": c.get("executed"),
+                        "created_at": c.get("created_at"),
+                        "raw_json": safe_json_dumps(c),
+                    })
+            except Exception as e:
+                print(f"  {kind} failed: project={pid}: {e}")
+                sync_errors.append({"project_procore_id": pid, "stage": kind,
+                                    "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
+
+    # ---- 6c. Project directory vendors -------------------------------------
+    if PULL_DIRECTORY:
+        try:
+            rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.1/projects/{pid}/vendors",
+                                 {"company_id": company_id}, per_page=VENDOR_PAGE_SIZE,
+                                 label="project_vendors")
+            for v in rows:
+                vname = pick(v, "name", "company_name")
+                trade = v.get("trade") if isinstance(v, dict) else None
+                directory_vendors.append({
+                    "project_procore_id": pid,
+                    "project_name": pname,
+                    "vendor_procore_id": v.get("id"),
+                    "vendor_name": vname,
+                    "vendor_normalized": normalize_company(vname),
+                    "is_gc": is_gc(vname),
+                    "trade_name": pick_name(trade),
+                    "is_active": v.get("is_active", v.get("active")),
+                    "business_type": pick(v, "business_type", "company_type"),
+                    "created_at": v.get("created_at"),
+                    "raw_json": safe_json_dumps(v),
+                })
+        except Exception as e:
+            print(f"  directory vendors failed: project={pid}: {e}")
+            sync_errors.append({"project_procore_id": pid, "stage": "directory_vendors",
+                                "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
+        # Feed the email-domain fallback: this project's vendor names, normalized
+        # with spaces removed, so "JJ Flores Roofing" can be matched against the
+        # domain in robertmartinez@jjfloresroofing.co.
+        project_vendor_norms = {
+            normalize_company(v["vendor_name"]).replace(" ", ""): v["vendor_name"]
+            for v in directory_vendors
+            if v["project_procore_id"] == pid and v.get("vendor_name")
+        }
+        project_vendor_norms.pop("", None)
+
+    # ---- 6d. Meetings ------------------------------------------------------
+    # LAST on purpose: attendee company resolution needs the project-user and
+    # vendor maps built by 6a-6c above.
     if PULL_MEETINGS:
         try:
             meetings = get_paginated(
@@ -872,14 +1046,39 @@ for pi, project in enumerate(scope, start=1):
                             _attendee_keys[k] = _attendee_keys.get(k, 0) + 1
                     st = attendance_status(a)
                     attendance_shapes[st] = attendance_shapes.get(st, 0) + 1
+                    _raw_st = a.get("status") if isinstance(a, dict) else None
+                    if _raw_st is not None:
+                        raw_status_values[str(_raw_st)] = raw_status_values.get(str(_raw_st), 0) + 1
+
+                    # Resolution order, best evidence first:
+                    #   1. the attendee object itself (some tenants do embed it)
+                    #   2. person id -> project directory people  <-- the real one here
+                    #   3. email domain -> a vendor already on this project
+                    person_id = attendee_person_id(a)
+                    email = attendee_email(a)
                     cname = attendee_company(a)
+                    csource = "attendee_object" if cname else None
+                    if not cname and person_id:
+                        cname = person_company.get(person_id)
+                        if cname:
+                            csource = "directory_join"
+                    if not cname:
+                        cname = company_from_email(email, project_vendor_norms)
+                        if cname:
+                            csource = "email_domain"
+                    if not cname:
+                        csource = "unresolved"
+                    _company_paths[f"resolved:{csource}"] = _company_paths.get(f"resolved:{csource}", 0) + 1
                     meeting_attendees.append({
                         "project_procore_id": pid,
                         "meeting_procore_id": mid,
                         "attendee_procore_id": a.get("id") if isinstance(a, dict) else None,
                         "attendee_name": attendee_name(a),
+                        "attendee_person_id": person_id,
+                        "attendee_email": email,
                         "company_name": cname,
                         "company_normalized": normalize_company(cname),
+                        "company_source": csource,
                         "is_gc": is_gc(cname),
                         "attendance_status": st,
                         "raw_json": safe_json_dumps(a),
@@ -888,67 +1087,6 @@ for pi, project in enumerate(scope, start=1):
             print(f"  meetings failed: project={pid}: {e}")
             sync_errors.append({"project_procore_id": pid, "stage": "meetings",
                                 "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
-
-    # ---- 6b. Commitments (work orders + purchase orders) -------------------
-    if PULL_COMMITMENTS:
-        for kind, path in (("work_order", "work_order_contracts"),
-                           ("purchase_order", "purchase_order_contracts")):
-            try:
-                rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.0/{path}",
-                                     {"project_id": pid}, per_page=VENDOR_PAGE_SIZE,
-                                     label=path)
-                for c in rows:
-                    vendor = c.get("vendor") if isinstance(c, dict) else None
-                    vname = pick_name(vendor) or pick(c, "vendor_name", "contract_company_name")
-                    vid   = vendor.get("id") if isinstance(vendor, dict) else pick(c, "vendor_id")
-                    commitments.append({
-                        "project_procore_id": pid,
-                        "project_name": pname,
-                        "contract_procore_id": c.get("id"),
-                        "contract_kind": kind,
-                        "contract_number": pick(c, "number", "contract_number"),
-                        "contract_title": pick(c, "title", "description"),
-                        "contract_status": pick(c, "status"),
-                        "vendor_procore_id": vid,
-                        "vendor_name": vname,
-                        "vendor_normalized": normalize_company(vname),
-                        "is_gc": is_gc(vname),
-                        "executed": c.get("executed"),
-                        "created_at": c.get("created_at"),
-                        "raw_json": safe_json_dumps(c),
-                    })
-            except Exception as e:
-                print(f"  {kind} failed: project={pid}: {e}")
-                sync_errors.append({"project_procore_id": pid, "stage": kind,
-                                    "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
-
-    # ---- 6c. Project directory vendors -------------------------------------
-    if PULL_DIRECTORY:
-        try:
-            rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.1/projects/{pid}/vendors",
-                                 {"company_id": company_id}, per_page=VENDOR_PAGE_SIZE,
-                                 label="project_vendors")
-            for v in rows:
-                vname = pick(v, "name", "company_name")
-                trade = v.get("trade") if isinstance(v, dict) else None
-                directory_vendors.append({
-                    "project_procore_id": pid,
-                    "project_name": pname,
-                    "vendor_procore_id": v.get("id"),
-                    "vendor_name": vname,
-                    "vendor_normalized": normalize_company(vname),
-                    "is_gc": is_gc(vname),
-                    "trade_name": pick_name(trade),
-                    "is_active": v.get("is_active", v.get("active")),
-                    "business_type": pick(v, "business_type", "company_type"),
-                    "created_at": v.get("created_at"),
-                    "raw_json": safe_json_dumps(v),
-                })
-        except Exception as e:
-            print(f"  directory vendors failed: project={pid}: {e}")
-            sync_errors.append({"project_procore_id": pid, "stage": "directory_vendors",
-                                "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
-
     if pi % 10 == 0 or pi == _n:
         el = time.time() - _t0
         eta = (el / pi) * (_n - pi)
@@ -992,6 +1130,10 @@ write_delta(commitments, "bronze_vendor_commitments",
             empty_cols=["project_procore_id", "contract_procore_id", "vendor_name",
                         "vendor_normalized", "contract_kind"],
             merge_project_ids=merge_ids)
+write_delta(project_users, "bronze_vendor_project_users",
+            empty_cols=["project_procore_id", "person_procore_id", "name", "email",
+                        "company_name", "company_normalized"],
+            merge_project_ids=merge_ids)
 write_delta(directory_vendors, "bronze_vendor_directory",
             empty_cols=["project_procore_id", "vendor_procore_id", "vendor_name",
                         "vendor_normalized"],
@@ -1034,8 +1176,11 @@ SELECT
     CAST(meeting_procore_id AS BIGINT)  AS meeting_procore_id,
     CAST(attendee_procore_id AS BIGINT) AS attendee_procore_id,
     attendee_name,
+    attendee_person_id,
+    attendee_email,
     company_name,
     company_normalized,
+    company_source,
     CAST(is_gc AS BOOLEAN)              AS is_gc,
     attendance_status,
     -- "For Distribution Only" means the agenda was sent, not that anyone sat in
@@ -1188,6 +1333,11 @@ if _company_paths.get("<none>"):
         print(f"  (couldn't read a sample row: {_e})")
 
 print("\n--- attendance status shapes seen ---")
+print("  raw `status` values returned by Procore:")
+for v, n in sorted(raw_status_values.items(), key=lambda kv: -kv[1]):
+    known = attendance_status({"status": v})
+    mark = "" if known != "unknown" else "   <-- NOT recognized; add a hint for it"
+    print(f"    {v!r} -> {known}{mark}")
 for st, n in sorted(attendance_shapes.items(), key=lambda kv: -kv[1]):
     print(f"  {st}: {n}")
 if attendance_shapes.get("unknown", 0) > sum(attendance_shapes.values()) * 0.5:
