@@ -17,8 +17,9 @@ Those two facts — the title and the attendee list — are the two signals the 
 
 ## ⚡ Resume Here — Current State (2026-08-12)
 
-**Built end-to-end this session, from an empty repo.** Nothing has been run against live Procore
-data yet, so the numbers below are all "should" — see *What is unverified* at the end.
+**Built end-to-end this session, from an empty repo.** The **ingest is now confirmed against live
+Procore data** (20-project sample) — see *Answered by the first live runs* below. The gold, mirror
+and dashboard layers are still stub-verified only.
 
 ```
 Procore ─▶ fabric/ingest_vendor_compliance.py ─▶ silver_vendor_*
@@ -42,10 +43,12 @@ filter and project names), which the existing Procore→safety mirror chain alre
 1. **Vendor roster = both sources, with a toggle.** Both Procore commitments
    (`work_order_contracts` + `purchase_order_contracts`) *and* the project directory
    (`/projects/{id}/vendors`) are ingested. Which one forms the checklist's denominator is the
-   live `vendorSource` setting, defaulting to **`either`** (the union). We do not yet know which
-   tool BCI actually keeps current — the ingest's **COVERAGE DIAGNOSTIC** and the settings screen
-   both answer that empirically once real data lands. `either` is the default because it is the
-   only value that cannot silently *hide* a vendor.
+   live `vendorSource` setting, defaulting to **`either`** (the union).
+   **Now measured: BCI does not use commitments** (HTTP 200, zero rows, every project), so the
+   directory is the roster and `either` is currently equivalent to `directory`. The default stays
+   `either` deliberately — it is the only value that cannot silently *hide* a vendor, and it means
+   the better denominator appears automatically the day someone starts writing subcontracts in
+   Procore.
 
 2. **This app shares the Safety-Dash Fabric SQL DB.** It does not get its own. Fabric's
    `Sql Usage` meter looks allocation-based (an idle database still bills a flat share of the
@@ -110,7 +113,7 @@ Gold emits candidate matches; the API resolves them.
 
 | Setting | Default | Reasoning behind the default |
 |---|---|---|
-| `vendorSource` | `either` | Only value that can't hide a vendor. Narrow after reading the coverage numbers. |
+| `vendorSource` | `either` | Only value that can't hide a vendor. Currently equivalent to `directory` — BCI has no commitments in Procore — so leaving it alone is both correct now and future-proof. |
 | `allowTitleMatch` | **on** | This is how BCI names these meetings. Off drops most historical matches. |
 | `requireVendorPresent` | **off** | The Present / Absent / For Distribution Only radio is frequently left at its default in the field. Switching this on before checking the data makes real meetings read as missed. Applies to attendee matches only — a title match has no attendance to inspect. |
 | `requireMeetingHeld` | **off** | Procore's `held` flag is rarely flipped; requiring it makes nearly everything read "not held". |
@@ -148,23 +151,33 @@ mirror pipeline on purpose — a Copy activity's pre-copy `DELETE` would wipe ev
   clean diagonal, plus explicit negative controls (`Excel` ∌ `Excelsior`, `ZIP` ∌ `Zipper`,
   `Clark Construction` ∌ "Clark FDG assignment").
 
-### ⚠️ What is NOT verified — read before trusting a number
+### ✅ Answered by the first live runs (2026-08, 20-project sample)
 
-Nothing here has touched live Procore data. Specifically:
+Four of the five unknowns are now settled against real data:
 
-1. **The attendee shape is a guess.** BCI's Procore returns attendees with Name / Company /
-   Present / Absent / For Distribution Only / Conference (per the screenshot), but the JSON keys
-   behind those columns aren't documented and I couldn't call the API. `attendee_company()` and
-   `attendance_status()` probe a **list of candidate keys** and every attendee keeps its
-   `raw_json`, so a wrong guess is recoverable by extending the list — no re-ingest of anything
-   else. The ingest prints an **attendee company coverage** and **attendance status shapes**
-   diagnostic precisely to catch this on the first run.
-2. **The template id may not be exposed.** `383995` comes from the create URL. Whether the API
-   returns it on a meeting record is unknown, so the prep filter is currently the title substring
-   `"prep"` — which does match all nine real titles. The ingest reports every template id it saw;
-   if `383995` appears, flip `PREP_REQUIRE_TEMPLATE_ID = True` for an exact filter.
-3. **Which vendor roster is real** — the whole point of the coverage diagnostic.
-4. **`dbo.projects` column assumptions.** Confirmed against `build_gold.py`: it has
+| Question | Answer |
+|---|---|
+| **Is the meeting template id exposed?** | **Yes** — `383995` appeared on 10 meetings. And it is *necessary*: the title heuristic found only **3 of those 10**, because 7 prep meetings have no "prep" in the title. `PREP_MATCH_MODE` now defaults to the union of template + title. (The old `PREP_REQUIRE_TEMPLATE_ID` flag AND-ed them, so enabling it would have returned 3 — the intersection — and made things worse.) |
+| **Which vendor roster does BCI maintain?** | **The project directory.** Commitments return HTTP 200 with zero rows on every project — a real absence, not a 403. ~22 directory vendors per project. The commitments pull stays (2 cheap calls) so a future switch to Procore subcontracts needs no code change. |
+| **Where is the attendee's company?** | **Nowhere on the attendee.** The record is only `{id, status, login_information:{id, login, name}}`. Procore's UI resolves that column by joining the person to the project directory, so the ingest pulls `/projects/{id}/users` and does the same. Resolution went from **0/60 to 60/60**. An email-domain fallback (`…@jjfloresroofing.co` → "JJ Flores Roofing") covers people missing from the directory, bounded to vendors already on that project. |
+| **Does the attendance field parse?** | **Yes** — Procore returns `'Present'`, `'For Distribution Only'`, `'Absent'`, all understood. The 11 "unknown" rows carry **no status field at all** (nobody ticked a box), which is different from an unrecognized value. |
+
+**The one finding that matters operationally:** in that 20-project sample only
+**one** project (AEP Eagle Pass Service Center) had any prep meetings at all —
+all 10 of them. Adoption is the story the tracker will tell first; expect most
+projects to read 0% until the process spreads.
+
+### ⚠️ What is still NOT verified
+
+Specifically:
+
+1. **The gold + API layers have not run against real rows yet.** Everything above was validated
+   at the ingest stage; `build_vendor_gold.py`, the mirror pipeline and the dashboard have only
+   been exercised against stubs and synthetic fixtures.
+2. **The `title_only` match count is unmeasured at scale.** In the sample every prep meeting was
+   found by template, and 3 also matched on title. A meeting matching on title *only* would be
+   one built from a different template — worth eyeballing when it appears.
+3. **`dbo.projects` column assumptions.** Confirmed against `build_gold.py`: it has
    `id, name, project_number, stage, is_active, project_manager, actual_start, projected_finish`
    and **no superintendent column** — the superintendent needs
    `dbo.project_superintendents` → `dbo.superintendents`. An early draft referenced
