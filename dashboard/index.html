@@ -733,9 +733,11 @@ async function loadReview(){
 }
 
 /* ── settings ──────────────────────────────────────────── */
-function radio(name,value,current,label,hint){
-  return '<div class="opt"><input type="radio" name="'+name+'" id="'+name+'-'+value+'" value="'+value+'"'
-    +(String(current)===String(value)?' checked':'')+(ADMIN?'':' disabled')+'>'
+function radio(name,value,current,label,hint,disabled){
+  var on = String(current)===String(value);
+  return '<div class="opt"'+(disabled&&!on?' style="opacity:.55"':'')+'>'
+    +'<input type="radio" name="'+name+'" id="'+name+'-'+value+'" value="'+value+'"'
+    +(on?' checked':'')+((ADMIN && !(disabled&&!on))?'':' disabled')+'>'
     +'<label for="'+name+'-'+value+'">'+esc(label)+'<div class="hint">'+hint+'</div></label></div>';
 }
 
@@ -746,6 +748,24 @@ async function loadSettings(){
     COVERAGE = (r.meta&&r.meta.coverage)||{};
     var c=COVERAGE;
 
+    var nCommit=Number(c.vendor_rows_commitment||0), nDir=Number(c.vendor_rows_directory||0);
+    // The union, not the sum — a vendor in both rosters is one vendor.
+    var nAny=Number(c.vendor_rows_any!=null ? c.vendor_rows_any : Math.max(nCommit,nDir));
+    var srcCount=function(n){
+      return ' <span class="pill '+(n>0?'info':'notheld')+'">'+n+' vendor'+(n===1?'':'s')+'</span>';
+    };
+    // If the CURRENT choice yields nothing, say so at the top rather than
+    // leaving every project looking mysteriously empty.
+    var emptyNow = (SETTINGS.vendorSource==='commitment' && nCommit===0)
+                || (SETTINGS.vendorSource==='directory' && nDir===0);
+    // Two separate notes, concatenated. They were one variable and the second
+    // assignment silently clobbered the first — losing the empty-source warning
+    // in exactly the case it exists for.
+    var emptyNote = emptyNow
+      ? '<div class="note err"><b>The current vendor source has no vendors in it, so every '
+        +'project is showing an empty checklist.</b> Switch to <b>Project directory only</b> '
+        +'(or Both sources) below and save.</div>'
+      : '';
     var coverageNote='';
     if(c.projects_with_any!=null){
       coverageNote='<div class="note"><b>What Procore actually has, across active projects.</b><br>'
@@ -758,18 +778,30 @@ async function loadSettings(){
         +'inspectors, who never need a prep meeting.</div>';
     }
 
-    var h=coverageNote
+    var h=emptyNote+coverageNote
       +'<div class="fieldset"><h3>Which vendors belong on the checklist</h3>'
       +'<p>The denominator every project\'s percentage is measured against.</p>'
-      +radio('vendorSource','either',SETTINGS.vendorSource,'Both sources (widest)',
+      +radio('vendorSource','either',SETTINGS.vendorSource,
+          'Both sources (widest)'+srcCount(nAny),
           'Every company from either Procore list. Nothing gets missed, but companies that never '
           +'need a prep meeting show up as outstanding until someone marks them N/A.')
-      +radio('vendorSource','commitment',SETTINGS.vendorSource,'Commitments only',
-          'Companies with a subcontract or purchase order on the job. Closest to "vendors doing '
-          +'work" — but only correct if every sub\'s contract is written in Procore.')
-      +radio('vendorSource','directory',SETTINGS.vendorSource,'Project directory only',
+      +radio('vendorSource','commitment',SETTINGS.vendorSource,
+          'Commitments only'+srcCount(nCommit),
+          nCommit===0
+            ? '<b style="color:var(--error)">Unavailable — Procore returns no commitments for any '
+              +'project.</b> Buffalo doesn\'t write subcontracts or purchase orders in Procore, so '
+              +'choosing this empties every project\'s vendor list. Verified across all active '
+              +'jobs: the endpoints answer normally, there is simply nothing in them. If that '
+              +'changes, set <code>PULL_COMMITMENTS = True</code> in the ingest cell and re-run — '
+              +'the option enables itself once rows appear.'
+            : 'Companies with a subcontract or purchase order on the job. Closest to "vendors doing '
+              +'work" — but only correct if every sub\'s contract is written in Procore.',
+          nCommit===0)
+      +radio('vendorSource','directory',SETTINGS.vendorSource,
+          'Project directory only'+srcCount(nDir),
           'Every company in the project directory. Complete, but includes the owner, architect '
-          +'and inspectors.')
+          +'and inspectors — mark those <b>Not applicable</b> per project to make coverage mean '
+          +'something.')
       +'</div>'
 
       +'<div class="fieldset"><h3>What counts as the meeting having happened</h3>'

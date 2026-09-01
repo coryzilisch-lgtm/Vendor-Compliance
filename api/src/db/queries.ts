@@ -1143,7 +1143,8 @@ export async function getRosterCoverage(): Promise<Record<string, unknown>> {
                THEN 1 ELSE 0 END) AS vendor_rows_commitment,
       SUM(CASE WHEN CAST(r.from_directory AS NVARCHAR(10)) IN ('1','true','True')
                THEN 1 ELSE 0 END) AS vendor_rows_directory,
-      COUNT(DISTINCT r.project_id) AS projects_with_any
+      COUNT(DISTINCT r.project_id) AS projects_with_any,
+      COUNT(*)                     AS vendor_rows_any
     FROM dbo.vendor_roster r
     JOIN dbo.projects p ON p.id = r.project_id
     WHERE ${activeStageFilter('p')};`);
