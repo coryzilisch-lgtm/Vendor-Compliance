@@ -76,9 +76,23 @@ TEMPLATE_ID_FIELDS = [
     "source_meeting_template_id", "origin_id",
 ]
 
-THROTTLE_SEC = 0.35
+THROTTLE_SEC = 0.25
 MEETINGS_PER_PAGE = 100
+# The project directory runs ~200 companies on a busy job; 1000/page turns that
+# from three calls into one. Same trick that gave the incidents ingest its
+# biggest speedup.
+VENDOR_PAGE_SIZE = 1000
 VENDOR_TEST_LIMIT = None       # None = every project in scope; set a number to test
+
+# ---- Rate limiting ----------------------------------------------------------
+# Pause only when the budget is genuinely almost gone. Procore's window here
+# resets every few seconds, so `remaining` hovers near its floor during a busy
+# run — a high threshold makes the ingest sleep on nearly every call for no
+# reason. The 429 handler is the real backstop.
+RATE_LIMIT_FLOOR     = 3
+RATE_LIMIT_MAX_SLEEP = 90      # never block longer than this on one call
+
+_stats = {"calls": 0, "sleep": 0.0, "pauses": 0, "remaining": None}
 
 # ---- What to pull -----------------------------------------------------------
 PULL_MEETINGS    = True
@@ -96,6 +110,42 @@ PULL_DIRECTORY   = True        # project directory vendor list
 # merge.
 INCLUDE_ALL_PROJECTS = True
 PROJECTS_SINCE       = "2024-01-01"
+
+# ---- Only pull jobs the tracker can actually display ------------------------
+# THIS IS THE SETTING THAT CONTROLS RUNTIME. The tracker is a *current*
+# operational checklist: it shows Course-of-Construction projects, and a prep
+# meeting on a job that finished last year is never scored. Pulling the full
+# 2024-forward history therefore spends ~4 API calls per project on ~170
+# projects whose rows nothing will ever read.
+#
+# True  => keep only projects Procore still marks active AND whose stage isn't
+#          finished/pre-construction. Typically cuts ~245 projects to ~70 and
+#          the run from hours to minutes.
+# False => the full PROJECTS_SINCE window. Use for a one-off historical
+#          backfill, or if you later want the tracker's "All projects" scope to
+#          have real data behind it.
+#
+# Safe to flip either way: it only narrows what gets FETCHED. Rows for projects
+# outside the scope are preserved by the project-level merge (merge_ids below),
+# exactly like SKIP_COMPLETED_PROJECTS.
+ACTIVE_PROJECTS_ONLY = True
+
+# Stage strings that mean this job will never need a prep meeting again —
+# it is finished, dead, or paused.
+#
+# Note what is deliberately NOT here: **preconstruction and awarded jobs are
+# KEPT.** A preparatory meeting happens *before* the vendor starts work, so
+# those are exactly the jobs where prep meetings are being held right now. They
+# won't show on the tracker until the stage flips to Course of Construction, but
+# by then their meetings are already ingested and the checklist is correct on
+# day one instead of a day late.
+FINISHED_STAGE_HINTS = [
+    "post construction", "post-construction", "postconstruction",
+    "closeout", "close out", "complete", "warranty",
+    "final payment",             # "Waiting on Final Payment" — work is done
+    "hold",                      # "Construction Hold" — paused mid-flight
+    "bidding", "lost", "pending",
+]
 
 SKIP_COMPLETED_PROJECTS = False
 COMPLETED_GRACE_DAYS    = 120
@@ -198,11 +248,26 @@ def request_json(url, params=None, allow_404=True):
             response.raise_for_status()
 
             # Proactive pacing so a long run never bursts into continuous 429s.
+            #
+            # The threshold is deliberately LOW. Procore's window here resets
+            # every few seconds, not hourly, so `remaining` sits near its floor
+            # for most of a busy run — an earlier version tripped at <= 15 and
+            # added a +3s buffer, which made it sleep on nearly every call and
+            # turned a ~10 minute run into an all-day one. We now only pause when
+            # the budget is genuinely almost gone, sleep exactly to the reset,
+            # and let the 429 handler above be the real backstop.
             remaining = int(response.headers.get("X-Rate-Limit-Remaining", 999))
             reset_ts  = int(response.headers.get("X-Rate-Limit-Reset", 0))
-            if remaining <= 15 and reset_ts > 0:
-                wait = max(0, reset_ts - time.time()) + 3
-                print(f"    rate limit low ({remaining} left) — sleeping {wait:.0f}s...")
+            _stats["calls"] += 1
+            _stats["remaining"] = remaining
+            if remaining <= RATE_LIMIT_FLOOR and reset_ts > 0:
+                wait = min(max(0.0, reset_ts - time.time()) + 1, RATE_LIMIT_MAX_SLEEP)
+                _stats["sleep"] += wait
+                _stats["pauses"] += 1
+                # Only narrate a genuinely long pause; the short ones are normal
+                # and printing each one buries the progress lines.
+                if wait >= 10:
+                    print(f"    rate limit floor ({remaining} left) — sleeping {wait:.0f}s...")
                 time.sleep(wait)
             return (response.json() if response.text else None), response.status_code
         except Exception as e:
@@ -551,6 +616,24 @@ def looks_completed(p):
     return (datetime.now(timezone.utc) - end).days > COMPLETED_GRACE_DAYS
 
 
+def is_finished_stage(p):
+    """Stage says this job is done, dead or paused. Reads the stage off the LIST
+    response — no per-project detail call needed."""
+    stage = str(p.get("project_stage") or p.get("stage") or "").lower()
+    return any(h in stage for h in FINISHED_STAGE_HINTS)
+
+
+def is_live_project(p):
+    """Worth spending API calls on: Procore still marks it active and its stage
+    isn't finished/dead/paused. Pre-construction and awarded jobs count as live
+    — see FINISHED_STAGE_HINTS."""
+    if p.get("active") is False:
+        return False
+    if str(p.get("status") or "").lower() in ("inactive", "closed", "archived"):
+        return False
+    return not is_finished_stage(p)
+
+
 print("\nBuilding project scope...")
 all_projects = _g.get("all_projects_vendor_cache")
 if not all_projects:
@@ -567,6 +650,20 @@ else:
         and str(p.get("status") or "").lower() not in ("inactive", "closed", "archived")]
 
 merge_ids = None
+
+# The runtime lever. Narrowing to live jobs only affects what gets FETCHED —
+# out-of-scope projects keep their existing rows through the project-level merge
+# below, so this is safe to flip in either direction.
+if ACTIVE_PROJECTS_ONLY and not ONLY_PROJECT_IDS:
+    before = len(scope)
+    scope = [p for p in scope if is_live_project(p)]
+    merge_ids = [p.get("id") for p in scope]
+    print(f"  ACTIVE_PROJECTS_ONLY: {before} -> {len(scope)} projects "
+          f"(dropped {before - len(scope)} finished/dead/inactive; their existing "
+          f"rows are preserved).")
+    print(f"  ~{len(scope) * 4} API calls for rosters + 1 meetings call per project. "
+          f"Set ACTIVE_PROJECTS_ONLY = False for a full historical backfill.")
+
 if ONLY_PROJECT_IDS:
     wanted = {str(i) for i in ONLY_PROJECT_IDS}
     scope = [p for p in scope if str(p.get("id")) in wanted]
@@ -701,7 +798,7 @@ for pi, project in enumerate(scope, start=1):
                            ("purchase_order", "purchase_order_contracts")):
             try:
                 rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.0/{path}",
-                                     {"project_id": pid})
+                                     {"project_id": pid}, per_page=VENDOR_PAGE_SIZE)
                 for c in rows:
                     vendor = c.get("vendor") if isinstance(c, dict) else None
                     vname = pick_name(vendor) or pick(c, "vendor_name", "contract_company_name")
@@ -731,7 +828,7 @@ for pi, project in enumerate(scope, start=1):
     if PULL_DIRECTORY:
         try:
             rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.1/projects/{pid}/vendors",
-                                 {"company_id": company_id})
+                                 {"company_id": company_id}, per_page=VENDOR_PAGE_SIZE)
             for v in rows:
                 vname = pick(v, "name", "company_name")
                 trade = v.get("trade") if isinstance(v, dict) else None
@@ -753,16 +850,30 @@ for pi, project in enumerate(scope, start=1):
             sync_errors.append({"project_procore_id": pid, "stage": "directory_vendors",
                                 "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
 
-    if pi % 25 == 0 or pi == _n:
+    if pi % 10 == 0 or pi == _n:
         el = time.time() - _t0
         eta = (el / pi) * (_n - pi)
         print(f"  [{pi}/{_n}] {el/60:.1f} min elapsed, ~{eta/60:.1f} min left — "
               f"prep={len(meeting_details)} commitments={len(commitments)} "
-              f"directory={len(directory_vendors)}")
+              f"directory={len(directory_vendors)} | {_stats['calls']} calls, "
+              f"{_stats['sleep']/60:.1f} min in rate-limit pauses "
+              f"(budget left: {_stats['remaining']})")
 
 print(f"\nTotals: meetings_seen={len(meeting_summaries)} prep_meetings={len(meeting_details)} "
       f"attendees={len(meeting_attendees)} commitments={len(commitments)} "
       f"directory={len(directory_vendors)} errors={len(sync_errors)}")
+
+_elapsed = time.time() - _t0
+print(f"API: {_stats['calls']} calls in {_elapsed/60:.1f} min; "
+      f"{_stats['pauses']} rate-limit pauses costing {_stats['sleep']/60:.1f} min "
+      f"({100*_stats['sleep']/max(_elapsed,1):.0f}% of the run).")
+if _stats["sleep"] > _elapsed * 0.4:
+    print("  ⚠️  Most of this run was spent waiting on Procore's rate limit. Either")
+    print("      another notebook is pulling from Procore at the same time (check the")
+    print("      Procore Nightly / Friday Sweep schedules — they share the same API")
+    print("      budget), or the scope is still too wide. ACTIVE_PROJECTS_ONLY = True")
+    print("      is the biggest lever; VENDOR_TEST_LIMIT = 20 proves the run works")
+    print("      before committing to the full scope.")
 
 # ============================================================
 # 7. Bronze writes

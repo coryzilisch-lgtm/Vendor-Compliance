@@ -54,8 +54,18 @@ comes from the existing **Procore Nightly incremental** → **mirror-procore-to-
 already runs. Nothing to do; just be aware that a brand-new project won't appear in the tracker
 until that chain has seen it.
 
-First run: leave the defaults. It pulls meetings, commitments and directory vendors for every
-project dated on/after `PROJECTS_SINCE` (2024-01-01).
+First run: leave the defaults. `ACTIVE_PROJECTS_ONLY = True` scopes it to jobs that are still
+live — typically ~70 of the ~250 projects since 2024 — because a prep meeting on a job that
+finished last year is never scored. Pre-construction and awarded jobs are **kept**: a preparatory
+meeting happens *before* the vendor starts work, so those are exactly where they're being held now.
+
+Set `ACTIVE_PROJECTS_ONLY = False` only for a one-off historical backfill. Narrowing the scope is
+safe either way — out-of-scope projects keep their existing rows via the project-level merge.
+
+**If it spends most of its time in rate-limit pauses**, the run prints a warning telling you so.
+The usual cause is another notebook pulling from Procore at the same time — **Procore Nightly
+incremental** and **Procore Friday Full Sweep** share the same hourly API budget. Stagger them, or
+prove the run works first with `VENDOR_TEST_LIMIT = 20`.
 
 **It only fetches meeting *details* for meetings whose title matches a prep pattern**, which is
 what keeps this to minutes rather than the hours the Safety Dashboard's all-meetings pull takes.
