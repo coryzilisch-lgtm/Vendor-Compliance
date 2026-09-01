@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { getSyncStatus, getUnmatchedMeetings, settingsHealth } from '../db/queries.js';
-import { effectiveAdminMode, errorResponse, getClientPrincipal, isAdmin, meta, requestEmails } from './_shared.js';
+import { BOOTSTRAP_ADMIN_LIST, effectiveAdminMode, errorResponse, getClientPrincipal, isAdmin, meta, requestEmails } from './_shared.js';
 
 /** GET /api/health — liveness only; deliberately does not touch SQL. */
 app.http('health', {
@@ -60,7 +60,11 @@ app.http('me', {
         : admin
           ? 'Your address is on the admin list.'
           : emails.length
-            ? `Admin mode is "allowlist" and none of ${emails.join(', ')} is on it.`
+            ? `Admin mode is "allowlist". Your identity is [${emails.join(' | ')}]; the admin ` +
+              `list is [${BOOTSTRAP_ADMIN_LIST().join(' | ')}]. Nothing matched — Entra is ` +
+              `sending a different string than the list expects. Add the exact value above to ` +
+              `the ADMIN_EMAILS app setting (comma-separated) and it takes effect on the next ` +
+              `request, no deploy needed.`
             : 'Admin mode is "allowlist" and the sign-in token carried no email/UPN claim to match ' +
               'against. Add the "email" optional claim to the Entra app registration, or switch ' +
               'admin mode back to "open".';
@@ -76,6 +80,10 @@ app.http('me', {
         // all without echoing the whole token back. When emails_seen is empty
         // this is the thing that says why.
         claim_types: (p.claims ?? []).map((c) => c.typ).filter(Boolean),
+        // Both sides of the comparison. This is an internal tool and the list is
+        // two work addresses; showing it turns "why am I not an admin" from a
+        // support round-trip into something self-evident on screen.
+        admin_list: BOOTSTRAP_ADMIN_LIST(),
         reason: why,
         settings_degraded: settingsHealth(),
       },

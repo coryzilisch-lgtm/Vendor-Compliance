@@ -1,7 +1,7 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { addAdmin, getSettings, listAdmins, removeAdmin } from '../db/queries.js';
 import { cacheBust } from '../cache.js';
-import { BOOTSTRAP_ADMINS, actorEmail, errorResponse, meta, requireAdmin } from './_shared.js';
+import { BOOTSTRAP_ADMIN_LIST, actorEmail, errorResponse, meta, requireAdmin } from './_shared.js';
 
 /**
  * GET    /api/admins            the admin list + the current admin mode
@@ -20,7 +20,7 @@ app.http('admins', {
     try {
       if (request.method === 'GET') {
         const [admins, settings] = await Promise.all([
-          listAdmins(BOOTSTRAP_ADMINS),
+          listAdmins(BOOTSTRAP_ADMIN_LIST()),
           getSettings(),
         ]);
         return meta(admins, { adminMode: settings.adminMode }, 0);
@@ -39,9 +39,9 @@ app.http('admins', {
         return { status: 400, jsonBody: { error: 'A valid email address is required.' } };
       }
 
-      await addAdmin(email, actorEmail(request), BOOTSTRAP_ADMINS);
+      await addAdmin(email, actorEmail(request), BOOTSTRAP_ADMIN_LIST());
       cacheBust('tracker:');
-      return meta(await listAdmins(BOOTSTRAP_ADMINS), { added: email }, 0);
+      return meta(await listAdmins(BOOTSTRAP_ADMIN_LIST()), { added: email }, 0);
     } catch (err) {
       return errorResponse(err);
     }
@@ -63,11 +63,11 @@ app.http('adminDelete', {
       // removeAdmin refuses to delete a bootstrap account or the last admin;
       // surface its reason rather than a bare failure, because both refusals are
       // deliberate and the user needs to know which one they hit.
-      const result = await removeAdmin(email, BOOTSTRAP_ADMINS);
+      const result = await removeAdmin(email, BOOTSTRAP_ADMIN_LIST());
       if (!result.ok) return { status: 409, jsonBody: { error: result.error } };
 
       cacheBust('tracker:');
-      return meta(await listAdmins(BOOTSTRAP_ADMINS), { removed: email }, 0);
+      return meta(await listAdmins(BOOTSTRAP_ADMIN_LIST()), { removed: email }, 0);
     } catch (err) {
       return errorResponse(err);
     }

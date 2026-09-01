@@ -809,7 +809,10 @@ async function loadSettings(){
       var degraded = ME && ME.settings_degraded;
       h+='<div class="note'+(degraded?' err':' warn')+'"><b>You\'re signed in as a viewer.</b><br>'
         +esc(why)
-        +(ME && ME.email ? '<br>Signed in as '+esc(ME.email) : '')
+        +(ME && ME.emails_seen && ME.emails_seen.length
+            ? '<br><b>Entra sent:</b> <code>'+esc(ME.emails_seen.join(' | '))+'</code>' : '')
+        +(ME && ME.admin_list
+            ? '<br><b>Admin list:</b> <code>'+esc(ME.admin_list.join(' | '))+'</code>' : '')
         +(degraded ? '<br><b>The settings table could not be read:</b> '+esc(degraded)
             +'<br>This usually means the service principal has Read but not <b>Write all data</b> '
             +'on the Fabric SQL database — this app creates its own settings/override tables, '

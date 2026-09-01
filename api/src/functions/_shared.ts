@@ -20,10 +20,33 @@ import { HttpRequest, HttpResponseInit } from '@azure/functions';
  *
  * Everyone else who signs in is read-only.
  */
-export const BOOTSTRAP_ADMINS: string[] = [
+const CODE_ADMINS: string[] = [
   'cory.zilisch@buffaloconstruction.com',
   'justin.houston@buffaloconstruction.com',
 ];
+
+/**
+ * Extra admins from the `ADMIN_EMAILS` app setting (comma or semicolon
+ * separated), merged with the code list above.
+ *
+ * This exists because the identity string Entra actually sends is not always
+ * the address you expect — it can be the onmicrosoft.com UPN, an alias, or a
+ * display name, depending on how the tenant and the app registration are
+ * configured. When it doesn't match, the fix should be pasting the real value
+ * into an app setting, not a code change and a redeploy. /api/me prints both
+ * the identity it saw AND the list it compared against, so the mismatch is
+ * visible rather than deduced.
+ */
+export function BOOTSTRAP_ADMIN_LIST(): string[] {
+  const extra = String(process.env.ADMIN_EMAILS ?? '')
+    .split(/[,;]/)
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return Array.from(new Set([...CODE_ADMINS.map((e) => e.toLowerCase()), ...extra]));
+}
+
+/** Kept as a value for call sites that just need the current list. */
+export const BOOTSTRAP_ADMINS: string[] = CODE_ADMINS;
 
 /**
  * Break-glass override, settable in the SWA Configuration blade without a code
@@ -93,7 +116,7 @@ async function resolveAdmin(p: ClientPrincipal | null): Promise<boolean> {
   const override = adminModeOverride();
   const mode = override ?? (await getSettings()).adminMode;
   if (mode === 'open') return true;
-  return isAdminEmail(principalEmails(p), BOOTSTRAP_ADMINS);
+  return isAdminEmail(principalEmails(p), BOOTSTRAP_ADMIN_LIST());
 }
 
 /** The mode actually in force, including the env override. For /api/me. */
