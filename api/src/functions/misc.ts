@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
-import { getSettings, getSyncStatus, getUnmatchedMeetings, settingsHealth } from '../db/queries.js';
-import { errorResponse, getClientPrincipal, isAdmin, meta, requestEmails } from './_shared.js';
+import { getSyncStatus, getUnmatchedMeetings, settingsHealth } from '../db/queries.js';
+import { effectiveAdminMode, errorResponse, getClientPrincipal, isAdmin, meta, requestEmails } from './_shared.js';
 
 /** GET /api/health — liveness only; deliberately does not touch SQL. */
 app.http('health', {
@@ -45,8 +45,7 @@ app.http('me', {
     let failure: string | null = null;
 
     try {
-      const settings = await getSettings();
-      mode = settings.adminMode;
+      mode = await effectiveAdminMode();
       admin = await isAdmin(request);
     } catch (err) {
       failure = (err as Error)?.message ?? String(err);
@@ -56,7 +55,7 @@ app.http('me', {
     // Everything the "why am I a viewer?" question needs, without a log dive.
     const why = failure
       ? `Admin could not be resolved: ${failure}`
-      : mode === 'open'
+      : String(mode).indexOf('open') === 0
         ? 'Admin mode is "open" — every signed-in user can edit.'
         : admin
           ? 'Your address is on the admin list.'

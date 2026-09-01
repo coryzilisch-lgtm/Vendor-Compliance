@@ -156,7 +156,7 @@ export const DEFAULT_SETTINGS: Settings = {
   requireVendorPresent: 0,
   allowTitleMatch: 1,
   requireMeetingHeld: 0,
-  adminMode: 'open',
+  adminMode: 'allowlist',
 };
 
 let settingsTableReady = false;
@@ -314,8 +314,7 @@ async function ensureAdminTable(bootstrap: string[]): Promise<void> {
       added_by   NVARCHAR(256) NULL,
       added_at   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
     );`);
-  // Seed the bootstrap accounts once, so the allowlist is never empty the first
-  // time someone switches away from 'open'.
+  // Seed the bootstrap accounts, so the allowlist is never empty.
   for (const email of bootstrap) {
     await db.query(
       `IF NOT EXISTS (SELECT 1 FROM dbo.vendor_admins WHERE email = @e)
@@ -323,6 +322,19 @@ async function ensureAdminTable(bootstrap: string[]): Promise<void> {
       { e: email.toLowerCase() },
     );
   }
+
+  // ...and RECONCILE. Rows whose added_by is 'bootstrap' are code-owned: if a
+  // name is dropped from BOOTSTRAP_ADMINS it must actually lose access, not
+  // linger as a stale seed nobody remembers granting. Rows added through the UI
+  // carry the granting admin's address instead and are deliberately untouched.
+  const keep = bootstrap.map((e) => e.toLowerCase());
+  await db.query(
+    `DELETE FROM dbo.vendor_admins
+      WHERE added_by = 'bootstrap'
+        AND email NOT IN (${keep.map((_, i) => `@k${i}`).join(',') || `''`});`,
+    Object.fromEntries(keep.map((e, i) => [`k${i}`, e])),
+  );
+
   adminTableReady = true;
 }
 

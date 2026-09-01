@@ -139,10 +139,27 @@ Schedule it right after the existing nightly Procore run (the capacity is shared
    `mssql`/`tedious` at all — it fails with `ESOCKET` about 20ms after the TLS handshake and no
    auth type, driver option or retry fixes it.
 
-5. **Entra app registration** for sign-in: redirect URI
-   `https://<your-swa-host>/.auth/login/aad/callback`, enable **ID tokens**, create a client
-   secret, and put the **Secret Value** (the long random string — *not* the Secret ID GUID, which
-   produces `AADSTS700054`) into `AAD_CLIENT_SECRET`.
+5. **Entra app registration** for sign-in.
+
+   | Setting | Value |
+   |---|---|
+   | Redirect URI (Web) | `https://<your-swa-host>/.auth/login/aad/callback` |
+   | Authentication → **ID tokens** | ✅ enabled |
+   | API permissions | **`User.Read`** (delegated, Microsoft Graph) — added by default, and it is the *only* one needed |
+   | Certificates & secrets | new client secret → `AAD_CLIENT_SECRET` |
+
+   ⚠️ Copy the secret's **Value**, not the Secret **ID** (a GUID) — the GUID gives `AADSTS700054`.
+
+   Sign-in is plain OpenID Connect. `openid` / `profile` / `email` are OIDC scopes, not Graph
+   permissions, so there is nothing else to consent to. **But** Buffalo's tenant is set to *"Do not
+   allow user consent"*, so even `User.Read` can raise a "Need admin approval" wall on first
+   sign-in — IT clicks **Grant admin consent** once on the app registration and it's done for
+   everyone.
+
+   **Add the `email` optional claim** (Token configuration → Add optional claim → ID → `email`).
+   The admin allowlist matches the signed-in principal's address; if the token carries no readable
+   email or UPN claim there is nothing to match and nobody can administer the app. `GET /api/me`
+   reports `emails_seen` so you can confirm the claim is arriving.
 
 6. The service principal needs **both** grants in the Fabric portal, or every call returns
    `Login failed for user '<token-identified principal>'`:
@@ -154,7 +171,18 @@ Schedule it right after the existing nightly Procore run (the capacity is shared
 
 ## 5. Configure the tracker
 
-Sign in as an admin (see `ADMIN_EMAILS` in `api/src/functions/_shared.ts`) → **Settings**.
+Sign in as an admin → **Settings**.
+
+**Admin access.** `adminMode` defaults to **`allowlist`**: only
+`cory.zilisch@buffaloconstruction.com` and `justin.houston@buffaloconstruction.com` can edit;
+everyone else who signs in is read-only. More admins can be added in Settings → Admin access.
+Those two are the code-level `BOOTSTRAP_ADMINS` and cannot be removed through the UI, so the list
+can never be emptied.
+
+**If you get locked out** — the likeliest cause is an Entra token with no email claim, so the
+allowlist has nothing to match. Check `GET /api/me` → `emails_seen`. To recover without a deploy,
+add an app setting **`ADMIN_MODE`** = **`open`** in the SWA Configuration blade; it overrides the
+stored setting and makes every signed-in user an admin. Remove it once sign-in is fixed.
 
 The settings screen shows the same coverage numbers the ingest printed. Set **vendor source** to
 whichever roster covers more projects. Leave the other three at their defaults until you've
