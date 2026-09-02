@@ -418,6 +418,16 @@ docs/setup.md                        the deploy runbook — start here for anyth
   by `NOT_COURSE_OF_CONSTRUCTION`, kept verbatim in sync with Safety-Dash.
 - **Fabric SQL DB has no `TRUNCATE TABLE`** (`Msg 22424`) — pipeline pre-copy scripts must use
   `DELETE FROM` or they silently no-op and the destination stacks a fresh snapshot every night.
+- **"Auto create table" is create-if-MISSING, so a widened gold table breaks the Copy.**
+  `ErrorCode=SqlColumnNameNotExist … Column 'x' does not exist in the target table` means the
+  destination was built from an older gold schema and never altered since; the pre-copy `DELETE`
+  empties rows, not columns. Fix: `DROP TABLE IF EXISTS dbo.<the one named>;` and re-run — the
+  four mirrored tables are pure mirrors, rebuilt in full from the lakehouse. 🛑 Never drop
+  `vendor_settings` / `vendor_prep_overrides` / `vendor_manual_roster`: they are API-managed,
+  outside the pipeline by design, and hold the only data here that exists nowhere else.
+  (Making the pre-copy script a `DROP` would self-heal this, at the cost of rebuilding the table
+  nightly and a brief window where reads find nothing — not worth it for a once-per-schema-change
+  problem, so the convention stays `DELETE`.)
 - **SWA caps a deployment at ~15,000 files**, and the error is the opaque "Failure during content
   distribution". Count files, not bytes; `.funcignore` does *not* shrink what SWA zips. This API
   has 2 runtime deps to stay well clear — check any new dependency's file count first.
