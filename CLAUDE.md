@@ -218,8 +218,21 @@ mirror pipeline on purpose — a Copy activity's pre-copy `DELETE` would wipe ev
 
 ### What was verified, and how
 
-- `api/` `tsc --noEmit` clean; both fabric cells pass `py_compile`; dashboard `<script>` passes
-  `node --check`; all JSON + the workflow YAML parse.
+- `api/` `tsc --noEmit` clean; both fabric cells pass `py_compile`; all JSON + the workflow YAML
+  parse.
+- **`node scripts/smoke_dashboard.js` — the dashboard is LOADED, not just parsed.** Serves
+  `dashboard/` against a stub API, drives all four tabs and the project drilldown in headless
+  Chromium, and fails on any uncaught error, same-origin console error or 4xx. External origins
+  (Google Fonts) are ignored on purpose — failing on a blocked CDN would train people to ignore
+  the test. Run it before every push that touches `dashboard/index.html`.
+
+  ⚠️ **`node --check` was the only gate, and it shipped a dead dashboard.** Markdown `**` around
+  a URL path inside a block comment put a comment terminator *inside* the comment: it ended
+  early, left a bare `details` as a live statement, and the page threw
+  `ReferenceError: details is not defined` before a single handler bound — nothing rendered,
+  nothing clickable. A bare identifier is valid syntax, so the parser was happy and review saw
+  a normal-looking comment. **A syntax check cannot catch a runtime error; only running it can.**
+  The smoke test was verified by re-introducing both shipped bugs and confirming each fails it.
 - **256 emitted SQL statements** captured with the db stubbed, across **all 24 setting
   permutations** (3 vendor sources × 8 flag combinations) plus every write path — checked for
   balanced parentheses, bind parameters used but not bound, and references to CTEs that don't
