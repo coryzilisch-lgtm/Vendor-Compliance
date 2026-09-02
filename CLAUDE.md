@@ -44,11 +44,9 @@ filter and project names), which the existing Procore→safety mirror chain alre
    (`work_order_contracts` + `purchase_order_contracts`) *and* the project directory
    (`/projects/{id}/vendors`) are ingested. Which one forms the checklist's denominator is the
    live `vendorSource` setting, defaulting to **`either`** (the union).
-   **Now measured: BCI does not use commitments** (HTTP 200, zero rows, every project), so the
-   directory is the roster and `either` is currently equivalent to `directory`. The default stays
-   `either` deliberately — it is the only value that cannot silently *hide* a vendor, and it means
-   the better denominator appears automatically the day someone starts writing subcontracts in
-   Procore.
+   **Commitments DO exist** — see *The commitments bug* below; an earlier claim that BCI didn't
+   use them was a bug being misread as a fact. The default stays `either` deliberately: it is the
+   only value that cannot silently *hide* a vendor, whichever roster a given project keeps current.
 
 2. **This app shares the Safety-Dash Fabric SQL DB.** It does not get its own. Fabric's
    `Sql Usage` meter looks allocation-based (an idle database still bills a flat share of the
@@ -113,7 +111,7 @@ Gold emits candidate matches; the API resolves them.
 
 | Setting | Default | Reasoning behind the default |
 |---|---|---|
-| `vendorSource` | `either` | Only value that can't hide a vendor. Currently equivalent to `directory` — BCI has no commitments in Procore — so leaving it alone is both correct now and future-proof. |
+| `vendorSource` | `either` | Only value that can't hide a vendor. Both rosters are real in this tenant (the directory on ~every project, commitments on the jobs that have subcontracts written), and `either` is the union of them. |
 | `allowTitleMatch` | **on** | This is how BCI names these meetings. Off drops most historical matches. |
 | `requireVendorPresent` | **off** | The Present / Absent / For Distribution Only radio is frequently left at its default in the field. Switching this on before checking the data makes real meetings read as missed. Applies to attendee matches only — a title match has no attendance to inspect. |
 | `requireMeetingHeld` | **off** | Procore's `held` flag is rarely flipped; requiring it makes nearly everything read "not held". |
@@ -238,9 +236,48 @@ Four of the five unknowns are now settled against real data:
 | Question | Answer |
 |---|---|
 | **Is the meeting template id exposed?** | **Yes** — `383995` appeared on 10 meetings. And it is *necessary*: the title heuristic found only **3 of those 10**, because 7 prep meetings have no "prep" in the title. `PREP_MATCH_MODE` now defaults to the union of template + title. (The old `PREP_REQUIRE_TEMPLATE_ID` flag AND-ed them, so enabling it would have returned 3 — the intersection — and made things worse.) |
-| **Which vendor roster does BCI maintain?** | **Unresolved — do not repeat the earlier claim.** The directory works (~22 vendors/project). Commitments returned HTTP 200 with zero rows on all 90 projects, and that was written up as "BCI doesn't use commitments". That over-claims: Procore list endpoints are **permission-filtered**, so 200-with-zero-rows also happens when the service account can't see the tool — the exact failure that hid private Observations from the safety dashboard. The decisive test is Procore's **`Total` response header** (`Total > 0` with 0 rows = withheld, not absent). `fabric/diagnose_commitments.py` probes it across 8 endpoint variants; the ingest now records it too and warns. Settle this before telling anyone the directory is the only roster. |
+| **Which vendor roster does BCI maintain?** | **Both.** The directory covers ~every project (~22 companies each, but that includes owner/architect/inspectors). Commitments are real too — see *The commitments bug* below. Keep `vendorSource = either`. |
 | **Where is the attendee's company?** | **Nowhere on the attendee.** The record is only `{id, status, login_information:{id, login, name}}`. Procore's UI resolves that column by joining the person to the project directory, so the ingest pulls `/projects/{id}/users` and does the same. Resolution went from **0/60 to 60/60**. An email-domain fallback (`…@jjfloresroofing.co` → "JJ Flores Roofing") covers people missing from the directory, bounded to vendors already on that project. |
 | **Does the attendance field parse?** | **Yes** — Procore returns `'Present'`, `'For Distribution Only'`, `'Absent'`, all understood. The 11 "unknown" rows carry **no status field at all** (nobody ticked a box), which is different from an unrecognized value. |
+
+### The commitments bug — and why it read as a fact about the business
+
+Symptom the user hit: switching *vendor source* to **Commitments** emptied every
+project's vendor list. The conclusion recorded here at the time — *"BCI does not
+use Procore commitments; HTTP 200, zero rows, every project"* — was wrong, and
+each step of getting it wrong is worth keeping:
+
+1. `fabric/diagnose_commitments.py` (read-only, 8 endpoint variants per project,
+   `prime_contracts` as a control) shows commitments plainly: project **3119932
+   returns 20 work orders and 10 purchase orders**, with Procore's `Total` header
+   agreeing, on **the exact endpoint the ingest was already calling**.
+2. The full 90-project run had in fact ingested **1500 rows** into
+   `bronze_vendor_commitments`. So the API call was never the problem.
+3. Every one of those rows had an **empty `vendor_name`** — the v1.0 list
+   response is slim and doesn't carry `vendor`, and the extraction read only
+   `contract["vendor"]`. `silver_vendor_roster` filters
+   `WHERE vendor_normalized <> ''`, so all 1500 were dropped.
+4. The coverage diagnostic then printed `vendor_rows_commitment: 0`, and **a
+   count of rows that had been thrown away was written down as an observation
+   about how BCI works.** A run that "succeeds" while discarding its input looks
+   exactly like a tenant that has no input.
+
+Fixed by resolving the vendor the same way an attendee's company is —
+documented keys → recursive `_deep_company` search → a bounded per-contract
+detail call (`COMMITMENT_DETAIL_MAX`, default 600) — plus a one-time per-endpoint
+probe of `view=extended`, kept only if it actually yields vendors this default
+view didn't. `PULL_COMMITMENTS` is back **on**.
+
+The guard against a repeat is the new **COMMITMENT VENDOR RESOLUTION**
+diagnostic: contracts fetched → vendors resolved → roster rows out, side by
+side, with the JSON path each vendor was found at. A bronze-in/silver-out gap is
+now impossible to mistake for an absence. The coverage diagnostic also refuses
+to let a zero stand on its own — it points at that block.
+
+Note also that some contracts are titled `TEMPLATE` / `PO Template` with
+`status: Draft`. They are deliberately **not** status-filtered: a template
+carries no vendor, so it falls out of the roster on its own, and filtering on
+status risks hiding a real sub whose contract hasn't been executed yet.
 
 **The one finding that matters operationally:** in that 20-project sample only
 **one** project (AEP Eagle Pass Service Center) had any prep meetings at all —
@@ -311,6 +348,13 @@ docs/setup.md                        the deploy runbook — start here for anyth
 
 - **`mssql`/`tedious` cannot connect to `*.datawarehouse.fabric.microsoft.com`.** Fabric **SQL
   Database** (`*.database.fabric.microsoft.com`) only. Not fixable by any driver option.
+- **A count of zero is never evidence on its own.** It is what an empty tenant, a
+  permission-filtered endpoint, and a row-dropping filter all look like from the outside. Procore
+  list endpoints are permission-filtered (this is how private Observations hid from the safety
+  dashboard), and a silver `WHERE x <> ''` will discard a whole ingest without failing. Before
+  writing a zero down as a fact, check Procore's **`Total` response header** (`Total > 0` with 0
+  rows = withheld, not absent) and compare **bronze rows in against silver rows out**. Both
+  checks are built into the ingest now; `fabric/diagnose_commitments.py` does the first ad hoc.
 - **Never reference a `dbo.projects` column without probing.** The mirror auto-creates the table,
   so its column set follows whichever `build_gold` ran last; naming a missing column is a parse
   error that blanks the whole dashboard. See `ensureProjectColumnMeta()`.
