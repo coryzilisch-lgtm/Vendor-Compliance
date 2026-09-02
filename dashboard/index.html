@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Prep-Phase Meeting Tracker — Buffalo Construction</title>
+<!-- Inline so there is no /favicon.ico request to 404. Buffalo orange on navy. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2300253D'/%3E%3Cpath d='M8 17l5 5 11-11' stroke='%23FF5F00' stroke-width='4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
@@ -268,11 +270,17 @@ function procoreProjectUrl(pid){
   return 'https://app.procore.com/'+encodeURIComponent(pid)+'/project/home';
 }
 /* Meetings tool deep link.
-   VERIFIED against a real Procore URL — the path needs the **/details/**
-   segment: .../tools/meetings/details/{meeting_id}. Deriving it from the create
-   URL the team uses (.../tools/meetings/create/383995) by swapping the id in
-   gives .../tools/meetings/{id}, which 404s. Same shape as the Safety
-   Dashboard's forms link (.../tools/forms/details/{id}). */
+   VERIFIED against a real Procore URL: the path needs a "details" segment —
+   .../tools/meetings/details/{meeting_id}. Deriving it from the create URL the
+   team uses (.../tools/meetings/create/383995) by swapping the id in gives
+   .../tools/meetings/{id}, which 404s. Same shape as the Safety Dashboard's
+   forms link (.../tools/forms/details/{id}).
+
+   Do NOT put markdown emphasis around a path in a block comment here. Writing
+   the segment as **_slash_details_slash_** puts a comment terminator inside the
+   comment, which ended it early, left a bare `details` as a live statement, and
+   took the whole dashboard down with "ReferenceError: details is not defined".
+   node --check passed the file, because a bare identifier is valid syntax. */
 function procoreMeetingUrl(pid, mid){
   return 'https://app.procore.com/webclients/host/companies/'+PROCORE_COMPANY_ID
     +'/projects/'+encodeURIComponent(pid)+'/tools/meetings/details/'+encodeURIComponent(mid);
@@ -1143,7 +1151,8 @@ function renderTopVendors(){
 
 async function loadMetrics(fresh){
   try{
-    var r=await api('/api/metrics?months='+MONTHS+(fresh?'&fresh=1':''));
+    // api() already prepends /api — passing it here made this /api/api/metrics.
+    var r=await api('/metrics?months='+MONTHS+(fresh?'&fresh=1':''));
     METRICS=r.data||null;
     renderMetrics();
   }catch(e){
