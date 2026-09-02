@@ -376,18 +376,123 @@ WHERE x.meeting_id IS NULL
 ORDER BY m.meeting_date DESC
 """).show(25, truncate=False)
 
-# The unmatched meetings name real subcontractors ("Escar Construction",
-# "K&B Electric", "Patriot Pipeline") that have no row in Procore's project
-# VENDOR directory — so the tracker's denominator can't see them and their prep
-# meeting can never be credited. But those companies DO show up on the project
-# PEOPLE list, because someone from them was given project access.
+# ------------------------------------------------------------------
+# WHY didn't each of those match?
 #
-# This is quantified, not acted on. Folding people-companies into the roster
-# would silently change every project's denominator, which is the safety team's
-# call, not a side effect of a notebook run. If the number below is large, the
-# options are: add the missing companies to Procore's project directory (best),
-# add them per-project in the tracker's admin UI, or ask for a vendorSource
-# option that includes them.
+# The unmatched titles plainly name subcontractors — "Escar Construction",
+# "K&B Electric", "Patriot Pipeline", "H&W LandWorks". "They're missing from the
+# roster" is the obvious explanation and it may well be right, but it is a
+# GUESS, and guessing from a table like the one above is precisely how the
+# commitments bug got written down as a fact about the business. There are three
+# very different causes and they need different fixes:
+#
+#   A. the roster carries the vendor and the title contains its whole name in
+#      order -> the match SHOULD have fired, and that is a bug in this file;
+#   B. the roster name is a superset/variant of what's in the title ("Patriot
+#      Pipeline Solutions" vs "...- Patriot Pipeline") -> the token-run test
+#      requires the vendor's tokens CONTIGUOUS AND COMPLETE, so it correctly
+#      refuses, and the question becomes whether to relax it;
+#   C. no vendor on that project shares a single word with the title -> the sub
+#      really is absent from the roster, and someone has to add it.
+#
+# So: strip the meeting boilerplate off the title, and show what the project's
+# roster actually offers against the residual. Cheap (tens of meetings, tens of
+# vendors each) and it turns "10 rows to eyeball" into a named cause per row.
+MEETING_BOILERPLATE = {
+    "preparatory", "preparation", "prep", "phase", "pre", "contract", "precon",
+    "meeting", "meetings", "agenda", "minutes", "kickoff", "kick", "off",
+    "for", "the", "and", "with", "of", "on", "at", "a", "to",
+    "site", "job", "project", "review", "notes", "call", "zoom", "teams",
+}
+
+
+def _residual_tokens(text):
+    """The words in a title that might be a company name."""
+    return [t for t in normalize_company(text).split()
+            if t and t not in MEETING_BOILERPLATE and not t.isdigit()]
+
+
+print("\n--- WHY those didn't match (title residual vs that project's roster) ---")
+try:
+    _unmatched = spark.sql("""
+    SELECT m.project_id, m.project_name, m.meeting_id, m.title, m.title_padded
+    FROM gold_vendor_prep_meetings m
+    LEFT JOIN (SELECT DISTINCT meeting_id FROM gold_vendor_prep_matches) x
+           ON x.meeting_id = m.meeting_id
+    WHERE x.meeting_id IS NULL
+    ORDER BY m.meeting_date DESC
+    """).collect()
+
+    _roster_by_project = {}
+    for _r in spark.sql(
+        "SELECT project_id, vendor_name, vendor_normalized FROM gold_vendor_roster"
+    ).collect():
+        _roster_by_project.setdefault(_r["project_id"], []).append(
+            (_r["vendor_name"], _r["vendor_normalized"]))
+
+    _causes = {"A_should_have_matched": 0, "B_roster_name_differs": 0,
+               "C_vendor_not_on_roster": 0, "D_no_vendor_in_title": 0}
+
+    for _m in _unmatched:
+        _res = _residual_tokens(_m["title"] or "")
+        _res_set = set(_res)
+        _cands = []
+        for _vname, _vnorm in _roster_by_project.get(_m["project_id"], []):
+            _vt = [t for t in (_vnorm or "").split() if t not in MEETING_BOILERPLATE]
+            if not _vt:
+                continue
+            _hit = len(set(_vt) & _res_set)
+            if _hit:
+                _contig = token_pad(_vnorm) in (_m["title_padded"] or "")
+                _cands.append((_hit / len(_vt), _hit, _contig, _vname, len(_vt)))
+        _cands.sort(reverse=True)
+
+        if not _res:
+            _cause, _detail = "D_no_vendor_in_title", "the title names no company at all"
+        elif not _cands:
+            _cause = "C_vendor_not_on_roster"
+            _detail = "NO vendor on this project shares a word with the title"
+        elif _cands[0][0] >= 1.0 and _cands[0][2]:
+            _cause = "A_should_have_matched"
+            _detail = f"⚠ BUG — '{_cands[0][3]}' is on the roster and fully in the title"
+        else:
+            _cause = "B_roster_name_differs"
+            _detail = ("closest roster name is longer/reordered: "
+                       + ", ".join(f"'{c[3]}' ({c[1]} of its {c[4]} words in the title)"
+                                   for c in _cands[:2]))
+        _causes[_cause] += 1
+        print(f"  [{_cause[0]}] {(_m['title'] or '')[:52]:<52} project {_m['project_id']}")
+        print(f"        title names : {' '.join(_res) or '(nothing)'}")
+        print(f"        {_detail}")
+
+    print("\n  cause tally:", ", ".join(f"{k}={v}" for k, v in _causes.items()))
+    if _causes["A_should_have_matched"]:
+        print("  ⚠️  Any 'A' is a matching bug in this file, not a data problem — the vendor")
+        print("      is on the roster and its full name is in the title. Send me the row.")
+    if _causes["B_roster_name_differs"]:
+        print("  'B' rows are the ONLY argument for relaxing the token-run rule. Don't relax it")
+        print("      on a hunch: a prefix match would also fuse 'ABC Construction' with 'ABC")
+        print("      Plumbing'. If B is large, the safe fix is an admin alias, not a looser test.")
+    if _causes["C_vendor_not_on_roster"]:
+        print("  'C' rows are real work in Procore: the sub isn't in the project's vendor")
+        print("      directory (nor under any contract), so the tracker cannot credit them.")
+        print("      Add them in Procore, or as a manual vendor in the tracker's admin UI.")
+except Exception as _e:                                     # never fail the build on a diagnostic
+    print(f"  (could not run the residual analysis: {_e})")
+
+# Are those subs at least present as PEOPLE on the job?
+#
+# ⚠️ An earlier version of this comment stated they were — "those companies DO
+# show up on the project PEOPLE list, because someone from them was given
+# project access". The query below returned ZERO on the first real run, so that
+# was another hypothesis written down as a finding. What it means is stronger
+# and worse: the missing subs are in neither Procore list, so nothing short of
+# adding them to Procore (or a manual vendor row) can make their prep meeting
+# countable.
+#
+# Kept because a non-zero here is a cheap, no-judgement fix. Folding
+# people-companies into the roster would silently change every project's
+# denominator, which is the safety team's call, not a side effect of a run.
 if table_exists("bronze_vendor_project_users"):
     print("\n--- companies with PEOPLE on a project but NO vendor-directory row ---")
     spark.sql("""
