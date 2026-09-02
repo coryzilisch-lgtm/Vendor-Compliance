@@ -55,6 +55,9 @@ const STUB = {
       { vendor_normalized: 'makk concrete', vendor_name: 'MAKK Concrete', status: 'held',
         match_method: 'title', meeting_id: 12406175, meeting_date: '2026-03-05',
         attendee_attended: null, trade_name: 'Concrete' },
+      { vendor_normalized: 'hive energy', vendor_name: 'Hive Energy Solutions LLC', status: 'held',
+        match_method: 'title_variant', meeting_id: 12719705, meeting_date: '2026-04-29',
+        attendee_attended: null, trade_name: null },
       { vendor_normalized: 'escar construction', vendor_name: 'Escar Construction',
         status: 'not_held', match_method: null, meeting_id: null, meeting_date: null,
         attendee_attended: null, trade_name: null },
@@ -71,29 +74,48 @@ const STUB = {
   '/api/unmatched-meetings': [
     { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', meeting_id: 12406175,
       title: 'Preparatory Meeting Agenda- H&W LandWorks', meeting_date: '2026-03-05',
-      vendor_attendee_count: 0 },
+      vendor_attendee_count: 0, attendee_count: 4,
+      suggested_vendor: 'H&W Landwork KY LLC', suggested_vendor_normalized: 'h and w landwork ky' },
+    { project_id: 3387062, project_name: 'AEP Eagle Pass Service Center', meeting_id: 12719705,
+      title: 'Pre-Contract Meeting Agenda - HIVE', meeting_date: '2026-04-29',
+      vendor_attendee_count: 0, attendee_count: 2,
+      suggested_vendor: null, suggested_vendor_normalized: null },
   ],
   '/api/settings': {
     settings: { vendorSource: 'either', allowTitleMatch: 1, requireVendorPresent: 0,
-                requireMeetingHeld: 0, adminMode: 'allowlist' },
+                requireMeetingHeld: 0, allowNameVariantMatch: 0, adminMode: 'allowlist' },
     coverage: { commitment_projects: 59, directory_projects: 91,
                 commitment_vendors: 1390, directory_vendors: 2362 },
   },
   '/api/overrides': [],
   '/api/admins': [{ email: 'cory.zilisch@buffaloconstruction.com', added_by: 'bootstrap' }],
   '/api/metrics': {
-    snapshot: { projects: 88, projects_with_meetings: 10, meetings: 63, vendors_credited: 59,
-                vendors_total: 2362, coverage_pct: 2.5, adoption_pct: 11.4 },
+    snapshot: { active_projects: 88, projects_with_meetings: 10, vendors_tracked: 2362,
+                vendors_held: 59, total_meetings: 63, unmatched_meetings: 10 },
     monthly: [
-      { month: '2026-03', meetings: 18, projects: 1, vendors_credited: 14,
-        by_attendee: 16, by_title: 2, unmatched: 2, attendance_ticked: 12 },
-      { month: '2026-04', meetings: 10, projects: 1, vendors_credited: 6,
-        by_attendee: 6, by_title: 0, unmatched: 4, attendance_ticked: 6 },
+      { month: '2026-03', meetings: 18, projects: 1, attendee_matched: 16, title_only: 2,
+        unmatched: 2, attendees: 40, attendees_with_status: 30, vendor_attendees: 22,
+        vendors_credited: 14 },
+      { month: '2026-04', meetings: 10, projects: 1, attendee_matched: 6, title_only: 0,
+        unmatched: 4, attendees: 12, attendees_with_status: 6, vendor_attendees: 8,
+        vendors_credited: 6 },
     ],
-    projects: [
-      { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', meetings: 18, pct: 75 },
+    // Field names must match what getMetrics() actually returns — an invented
+    // stub shape makes the smoke test assert against a page the real API would
+    // never produce. These came from the query's own SELECT list.
+    leaderboard: [
+      { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack',
+        superintendent_name: 'A Super', project_manager: 'A PM',
+        tracked: 12, held: 9, meetings: 18 },
+      { project_id: 3387062, project_name: 'AEP Eagle Pass Service Center',
+        superintendent_name: null, project_manager: null,
+        tracked: 20, held: 0, meetings: 10 },
     ],
-    vendors: [{ vendor_name: 'ZIP Electric LLC', meetings: 6, projects: 3 }],
+    topVendors: [
+      { vendor_name: 'ZIP Electric LLC', meetings: 6, projects: 3, ever_on_attendee_list: 1 },
+      { vendor_name: 'MAKK Concrete', meetings: 2, projects: 1, ever_on_attendee_list: 0 },
+    ],
+    months: 12,
   },
 };
 
@@ -170,6 +192,19 @@ const server = http.createServer((req, res) => {
     }, name);
     await page.waitForTimeout(400);
   }
+  // Spot-check that the tabs actually RENDERED, not merely failed to throw. A
+  // page that silently draws nothing passes an error-only check.
+  const expectations = [
+    ['#review-out', 'H&W Landwork KY LLC', 'Review Queue shows the name-variant suggestion'],
+    ['#review-out', 'Confirm as held', 'Review Queue offers the one-click confirm to admins'],
+    ['#mc-vend,#metrics-out', 'ZIP Electric', 'Metrics rendered its vendor table'],
+  ];
+  for (const [sel, needle, what] of expectations) {
+    const text = await page.$$eval(sel, (els) => els.map((e) => e.textContent).join(' '))
+      .catch(() => '');
+    if (!text.includes(needle)) problems.push(`${what} — "${needle}" not found in ${sel}`);
+  }
+
   // And the drilldown, which is where most of the rendering lives.
   for (const sel of ['[data-project-id]', 'tbody tr']) {
     const el = await page.$(sel);
