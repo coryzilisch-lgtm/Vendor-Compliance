@@ -116,6 +116,43 @@ On every activity: **Destination → Advanced → Table option → Auto create t
 (`Msg 22424`) and the pre-copy step silently no-ops — which is how the intranet's
 `silver_procore_project_users` quietly grew to five stacked snapshots.
 
+### ⚠️ `SqlColumnNameNotExist` — a gold table grew a column
+
+```
+ErrorCode=SqlColumnNameNotExist … Column 'title_padded' does not exist in the
+target table '[dbo].[vendor_prep_meetings]'.
+```
+
+**Auto create table is create-if-MISSING.** It builds the destination the first
+time and never touches it again — so once a gold table gains a column, the Copy
+keeps writing into last week's schema and fails on the new one. The pre-copy
+`DELETE` doesn't help: it empties rows, not columns.
+
+**Fix: drop the one destination table and re-run the pipeline.** Auto-create
+rebuilds it from the current gold schema on the next run.
+
+```sql
+-- Safe: these four are pure mirrors, rebuilt in full from the lakehouse on
+-- every run. They hold nothing the notebook can't regenerate.
+DROP TABLE IF EXISTS dbo.vendor_prep_meetings;
+```
+
+🛑 **Never drop `dbo.vendor_settings`, `dbo.vendor_prep_overrides` or
+`dbo.vendor_manual_roster`.** Those are API-managed, deliberately outside the
+pipeline, and hold every manual override and hand-added vendor — the one thing
+here that exists nowhere else. If in doubt, drop only tables named in the table
+above.
+
+If several activities fail this way at once, drop each named table and re-run —
+or, when you want a clean slate after a schema change:
+
+```sql
+DROP TABLE IF EXISTS dbo.vendor_roster;
+DROP TABLE IF EXISTS dbo.vendor_prep_meetings;
+DROP TABLE IF EXISTS dbo.vendor_prep_attendees;
+DROP TABLE IF EXISTS dbo.vendor_prep_matches;
+```
+
 Schedule it right after the existing nightly Procore run (the capacity is shared — keep it in the
 2–3 AM window, not during work hours).
 

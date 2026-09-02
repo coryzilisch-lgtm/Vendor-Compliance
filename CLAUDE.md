@@ -279,10 +279,64 @@ Note also that some contracts are titled `TEMPLATE` / `PO Template` with
 carries no vendor, so it falls out of the roster on its own, and filtering on
 status risks hiding a real sub whose contract hasn't been executed yet.
 
-**The one finding that matters operationally:** in that 20-project sample only
-**one** project (AEP Eagle Pass Service Center) had any prep meetings at all —
-all 10 of them. Adoption is the story the tracker will tell first; expect most
-projects to read 0% until the process spreads.
+**Confirmed fixed (2026-09, 88 active projects, 8.5 min, 577 calls):**
+1479 contracts fetched → **1407 vendors resolved → 1390 roster rows across 59
+projects.** The 72 with no vendor are exactly the TEMPLATE/draft contracts.
+
+**The shape, now that it's known:** the company is at
+**`vendor.company.name`** — `vendor` is present but carries no name of its own,
+which is why reading `contract["vendor"]["name"]` found nothing. The recursive
+search rescued all 1408 of them, but the path is now named explicitly: it keeps
+the common case cheap and it returns the **vendor id**, which the deep search
+can't. The per-contract detail fallback was measured at **72 calls, 0
+recoveries**, so it now stands itself down once the list view has proven it
+carries vendors (`detail_worth_trying()`) — kept as the rescue if Procore
+changes the shape, without spending ~12% of the nightly API budget confirming
+that templates have no vendor.
+
+### Which roster to point the tracker at — the numbers, and the trade
+
+`commitment_only: 0`. **Every commitment vendor is also in the project
+directory**, so the commitments roster is a strict *subset*, and `either` is
+currently identical to `directory`:
+
+| Source | Vendor rows | Projects covered |
+|---|---|---|
+| Directory (and therefore `either`) | 2362 | 91 |
+| Commitments | 1390 | 59 |
+
+So the choice is a real trade, not a coverage bug:
+
+- **`either` / `directory`** — nothing can be hidden, but the denominator carries
+  the 972 companies that are owners, architects, inspectors and suppliers. That
+  is what drags coverage to ~2% and why the Metrics tab points at *project
+  adoption* as the honest headline instead.
+- **`commitment`** — the companies actually under contract, which is much closer
+  to "who needs a prep meeting". But the 29 active projects with no commitments
+  written show an **empty checklist**, which reads as nothing to do rather than
+  as unknown.
+
+Left on **`either`** because an empty checklist is the more dangerous failure.
+It is a live setting, so it can be flipped from the Settings tab with no deploy
+if the safety team would rather have the tighter denominator; the
+`not_applicable` override is the other route, and works per vendor.
+
+**The one finding that matters operationally:** across all 88 active projects
+there are **63 prep meetings on 10 projects**. Chick-Fil-A Plainfield (23),
+Hunting Creek Snack Shack (18) and AEP Eagle Pass (10) are more than four fifths
+of them; **78 of 88 active jobs have never held one.** Adoption is the story
+this tracker tells first, and most projects will read 0% until the process
+spreads — that is the tracker working, not the data being wrong.
+
+Two smaller ones worth keeping:
+- **33 of the 63 prep meetings have no "prep" in the title** and were found only
+  by template id `383995`. The title heuristic alone would have missed more than
+  half of them. Nothing matched on title *only*, so the union is currently
+  costing nothing and catching a lot.
+- **19 attendees resolved by email domain rather than the directory join**, and
+  1 could not be resolved at all — those people are not in their project's
+  Procore directory. Adding them there is the fix; the tracker degrades to title
+  matching for them meanwhile.
 
 ### ⚠️ What is still NOT verified
 
@@ -291,9 +345,10 @@ Specifically:
 1. **The gold + API layers have not run against real rows yet.** Everything above was validated
    at the ingest stage; `build_vendor_gold.py`, the mirror pipeline and the dashboard have only
    been exercised against stubs and synthetic fixtures.
-2. **The `title_only` match count is unmeasured at scale.** In the sample every prep meeting was
-   found by template, and 3 also matched on title. A meeting matching on title *only* would be
-   one built from a different template — worth eyeballing when it appears.
+2. ~~The `title_only` match count is unmeasured at scale.~~ **Measured across all 88 active
+   projects: 30 both, 33 template-only, 0 title-only.** No meeting has yet matched on title
+   alone, so nothing is riding on the weaker signal — but leave `allowTitleMatch` on, since a
+   prep meeting built from a different template is exactly what it exists to catch.
 3. **`dbo.projects` column assumptions.** Confirmed against `build_gold.py`: it has
    `id, name, project_number, stage, is_active, project_manager, actual_start, projected_finish`
    and **no superintendent column** — the superintendent needs
@@ -363,6 +418,16 @@ docs/setup.md                        the deploy runbook — start here for anyth
   by `NOT_COURSE_OF_CONSTRUCTION`, kept verbatim in sync with Safety-Dash.
 - **Fabric SQL DB has no `TRUNCATE TABLE`** (`Msg 22424`) — pipeline pre-copy scripts must use
   `DELETE FROM` or they silently no-op and the destination stacks a fresh snapshot every night.
+- **"Auto create table" is create-if-MISSING, so a widened gold table breaks the Copy.**
+  `ErrorCode=SqlColumnNameNotExist … Column 'x' does not exist in the target table` means the
+  destination was built from an older gold schema and never altered since; the pre-copy `DELETE`
+  empties rows, not columns. Fix: `DROP TABLE IF EXISTS dbo.<the one named>;` and re-run — the
+  four mirrored tables are pure mirrors, rebuilt in full from the lakehouse. 🛑 Never drop
+  `vendor_settings` / `vendor_prep_overrides` / `vendor_manual_roster`: they are API-managed,
+  outside the pipeline by design, and hold the only data here that exists nowhere else.
+  (Making the pre-copy script a `DROP` would self-heal this, at the cost of rebuilding the table
+  nightly and a brief window where reads find nothing — not worth it for a once-per-schema-change
+  problem, so the convention stays `DELETE`.)
 - **SWA caps a deployment at ~15,000 files**, and the error is the opaque "Failure during content
   distribution". Count files, not bytes; `.funcignore` does *not* shrink what SWA zips. This API
   has 2 runtime deps to stay well clear — check any new dependency's file count first.
