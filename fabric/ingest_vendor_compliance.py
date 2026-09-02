@@ -164,8 +164,18 @@ PULL_COMMITMENTS = True        # work order + purchase order contracts
 # on it, fall back to GET /{path}/{id}, bounded so a tenant with thousands of
 # contracts can't turn one run into thousands of extra calls. The view probe
 # below usually makes this unnecessary after the first project.
+# MEASURED 2026-09: once the list shape is right, this yields nothing — 72
+# detail calls, 0 vendors recovered, because the contracts it fires on are the
+# TEMPLATE / Draft ones that genuinely have no vendor. So it now switches itself
+# off after the list view has proven itself (see `detail_worth_trying`), which
+# keeps it as the rescue if Procore changes the shape without costing ~12% of
+# the run's API budget every night for nothing.
 COMMITMENT_DETAIL_LOOKUP = True
 COMMITMENT_DETAIL_MAX    = 600
+# ...but only until this many contracts have been seen with this share of them
+# resolving straight from the list.
+COMMITMENT_DETAIL_STANDDOWN_AFTER = 25
+COMMITMENT_DETAIL_STANDDOWN_RATE  = 0.8
 PULL_DIRECTORY   = True        # project directory vendor list
 # The attendee -> company bridge. A meeting attendee carries only a person id
 # and an email, so the company has to come from the project directory people
@@ -777,6 +787,20 @@ def commitment_vendor(contract):
             vid = value.get("id") if isinstance(value, dict) else None
             _commitment_paths[key] = _commitment_paths.get(key, 0) + 1
             return name, vid, key
+        # MEASURED 2026-09: this tenant nests it one level further —
+        # vendor.company.name, with `vendor` itself carrying no name at all.
+        # 1408 of 1479 contracts resolve here. The recursive search below finds
+        # it too, but naming the real shape keeps the common case cheap, keeps
+        # the id (which the deep search can't return), and documents what
+        # Procore actually sends.
+        if isinstance(value, dict):
+            inner = value.get("company") or value.get("vendor")
+            iname = pick_name(inner)
+            if iname:
+                vid = (inner.get("id") if isinstance(inner, dict) else None) or value.get("id")
+                path = f"{key}.company"
+                _commitment_paths[path] = _commitment_paths.get(path, 0) + 1
+                return iname, vid, path
     direct = pick(contract, "vendor_name", "contract_company_name", "company_name")
     if direct:
         _commitment_paths["<direct>"] = _commitment_paths.get("<direct>", 0) + 1
@@ -831,6 +855,26 @@ def fetch_commitment_rows(pid, path, label):
         return extended
     _commitment_view[path] = None
     return rows
+
+
+def detail_worth_trying():
+    """Is a per-contract detail call still worth making?
+
+    Yes until the list response has demonstrably carried vendors. After that,
+    a contract still missing one is a template or a draft with no vendor on it
+    anywhere, and fetching the fat record just spends an API call to confirm
+    that. Measured: 72 calls, 0 recoveries.
+    """
+    if not COMMITMENT_DETAIL_LOOKUP:
+        return False
+    if _commitment_stats["detail_calls"] >= COMMITMENT_DETAIL_MAX:
+        return False
+    seen = _commitment_stats["rows"]
+    if seen >= COMMITMENT_DETAIL_STANDDOWN_AFTER:
+        rate = _commitment_stats["with_vendor"] / seen
+        if rate >= COMMITMENT_DETAIL_STANDDOWN_RATE:
+            return False
+    return True
 
 
 def attendee_name(att):
@@ -1105,8 +1149,7 @@ for pi, project in enumerate(scope, start=1):
                     # Last resort: the fat record. Only for contracts the list
                     # view left without a vendor, and hard-bounded — the whole
                     # point of the view probe above is that this stays rare.
-                    if (not vname and COMMITMENT_DETAIL_LOOKUP
-                            and _commitment_stats["detail_calls"] < COMMITMENT_DETAIL_MAX
+                    if (not vname and detail_worth_trying()
                             and isinstance(c, dict) and c.get("id") is not None):
                         _commitment_stats["detail_calls"] += 1
                         try:
@@ -1518,6 +1561,13 @@ if PULL_COMMITMENTS:
     print(f"  ...with a vendor resolved      : {_cs['with_vendor']}")
     print(f"  ...resolved via a detail call  : {_cs['via_detail']} "
           f"({_cs['detail_calls']} detail calls made, cap {COMMITMENT_DETAIL_MAX})")
+    if _cs["rows"] and not detail_worth_trying() and _cs["detail_calls"] < COMMITMENT_DETAIL_MAX:
+        print("     (detail lookups stood down — the list view is carrying vendors, so the")
+        print("      contracts still missing one are templates/drafts that have no vendor)")
+    unresolved = _cs["rows"] - _cs["with_vendor"]
+    if unresolved:
+        print(f"  ...with NO vendor anywhere     : {unresolved}  <-- expected: TEMPLATE / "
+              "PO Template / draft contracts carry none, and drop out of the roster on their own")
     if _commitment_view:
         for path, view in _commitment_view.items():
             print(f"  list view used for {path}: {view or 'default'}")
