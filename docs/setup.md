@@ -153,8 +153,40 @@ DROP TABLE IF EXISTS dbo.vendor_prep_attendees;
 DROP TABLE IF EXISTS dbo.vendor_prep_matches;
 ```
 
-Schedule it right after the existing nightly Procore run (the capacity is shared — keep it in the
-2–3 AM window, not during work hours).
+## 3b. When to run it
+
+Two schedules: the **notebook** (`Vendor Compliance - Prep Meetings` — both cells run in one
+execution, ingest then gold) and the **pipeline**. Recommended:
+
+| | When | Runtime |
+|---|---|---|
+| Notebook | **3:30 AM daily** | ~9 min (8.5 min measured over 88 projects, 577 API calls) |
+| `mirror-vendor-to-sql` | **4:00 AM daily** | seconds — the four tables total ~3.5k rows |
+
+Three things fix that window, and only one of them is about this app:
+
+1. **Procore's rate limit is company-wide, not per-app.** The ceiling is ~3,600 requests/hour and
+   this ingest spends 577 of them. Overlapping the Safety Dashboard's ingest means the two throttle
+   each other, and the reactive backoff turns a 9-minute run into an hour. Start after that run
+   has *finished*, not after it has started.
+2. **`dbo.projects` has to be fresh first.** The active-project filter and every project name come
+   from Safety-Dash's mirror of that table. Run before it and the tracker is scoped to yesterday's
+   project list — not broken, but a new job won't appear until the day after.
+3. **The F4 capacity already breaches its interactive-delay threshold on weekdays.** Anything
+   started in work hours competes with the dashboards people are actually reading.
+
+⚠️ **Adjust 3:30 to fit your own Procore run.** If the big `Procore Data - General, Teams, Safety`
+notebook starts at midnight and runs ~3h15m, it clears around 3:15 and 3:30 works. If you move it,
+move this. Everything here is a consequence of that job's finish time, not of a magic hour.
+
+**The 30-minute gap is deliberate even though the notebook takes nine.** `build_vendor_gold.py`
+uses `CREATE OR REPLACE TABLE`; a Copy activity reading a gold table mid-replace either fails or
+mirrors a half-built table, and a *wrong* dashboard is worse than one that is a day stale. If the
+ingest ever slows past the gap, widen it rather than trimming it.
+
+Daily is more than the data needs — 63 prep meetings exist across all history — but the run is
+cheap enough that a fixed daily slot beats reasoning about staleness. Weekdays-only is a fine
+variation; nobody logs a prep meeting on Sunday.
 
 ## 4. Create the Static Web App
 
