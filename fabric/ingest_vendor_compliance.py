@@ -79,31 +79,52 @@ from pyspark.sql.functions import current_timestamp, lit
 # Every one of them contains "prep", so that substring is the filter. It is
 # applied to the LIST response, so we only pay for a detail call on meetings that
 # already look like prep meetings.
-#
-# The title alone is NOT sufficient — see PREP_MATCH_MODE below. Confirmed
-# against live data: 7 of 10 real prep meetings had no "prep" in the title.
 PREP_TITLE_PATTERNS = [r"\bprep"]          # case-insensitive regex, ANY match wins
+
+# ⚠️ Titles that name a DIFFERENT kind of meeting, checked after the include
+# test above. This exists because template id 383995 turned out not to mean
+# "this is a preparatory meeting": the team creates pre-contract, kick-off and
+# coordination meetings from the same template and retitles them, so the
+# template swept all of those in. The safety team's rule is literal — only
+# preparatory meetings count — and the TITLE is what carries that.
+#
+# Applied to the whole title, so a vendor genuinely called "Coordination
+# Systems" on an otherwise-valid prep meeting would be excluded too. That has
+# not happened in this tenant, and the PREP TITLE EXCLUSIONS diagnostic prints
+# every title dropped here, so it would be visible rather than silent.
+PREP_TITLE_EXCLUDE = [
+    r"pre[\s-]*contract", r"kick[\s-]*off", r"coordination",
+    r"pre[\s-]*construction", r"precon\b", r"owner[\s-]*architect", r"\boac\b",
+    r"progress\s+meeting", r"toolbox", r"safety\s+meeting",
+]
 PREP_MEETING_TEMPLATE_ID = 383995          # from the create URL
 
 # ---- How a meeting is identified as a prep meeting --------------------------
-# CONFIRMED 2026-08 against live data: the API **does** expose the template id,
-# and it is strictly better than the title heuristic. In a 20-project sample the
-# title filter found 3 prep meetings while template 383995 was on 10 — seven
-# meetings were created from the prep template but titled something without the
-# word "prep" in it.
+#   "title"              (default) the title says "prep"/"preparatory" and does
+#                        not name a different meeting type. THE RULE.
+#   "template_or_title"  UNION with template id 383995. Most complete, and
+#                        wrong here — see below.
+#   "template"           template id only.
 #
-#   "template_or_title"  (default) UNION of both. Catches every meeting off the
-#                        prep template, PLUS any prep meeting created some other
-#                        way but titled like one. Most complete.
-#   "template"           template id only. Most precise; drops a correctly-named
-#                        meeting that was built from a different template.
-#   "title"              the old heuristic. Kept for a tenant that doesn't
-#                        expose the template id.
+# ⚠️ THE TEMPLATE ID DOES NOT MEAN "THIS IS A PREPARATORY MEETING", and reading
+# it that way is the mistake this setting has already made twice.
 #
-# ⚠️ An earlier version of this had a `PREP_REQUIRE_TEMPLATE_ID` flag that
-# AND-ed the two tests. That was backwards — it returned the intersection, so
-# switching it on made the result *worse* (3 instead of 10). It's a union.
-PREP_MATCH_MODE = "template_or_title"
+# The first version used the title. A 20-project sample then showed template
+# 383995 on 10 meetings where the title found only 3, and that was written up as
+# "the template is strictly better than the title heuristic" — so the default
+# became the union. What the sample actually showed is that the team creates
+# OTHER meetings from the same template and retitles them: the seven the title
+# "missed" were pre-contract, kick-off and coordination meetings. The number was
+# right and the conclusion inverted, exactly like the commitments count.
+#
+# The safety team's rule is literal: only preparatory meetings. The title is the
+# only thing in the data that carries that distinction, so the title is the
+# rule and the template id is now diagnostic only.
+#
+# (An even earlier version had a PREP_REQUIRE_TEMPLATE_ID flag that AND-ed the
+# two tests, which returned the intersection and made things worse. Union and
+# intersection were both wrong because the premise was.)
+PREP_MATCH_MODE = "title"
 
 # Candidate keys that might carry the template id on a meeting record. Procore's
 # meetings API is not consistent about this across tenants, so we probe several
@@ -561,11 +582,22 @@ def is_gc(name):
 
 
 PREP_TITLE_RE = [re.compile(p, re.I) for p in PREP_TITLE_PATTERNS]
+PREP_EXCLUDE_RE = [re.compile(p, re.I) for p in PREP_TITLE_EXCLUDE]
+
+
+_prep_excluded_titles = {}
 
 
 def looks_like_prep_meeting(title):
+    """Include on "prep", then drop anything naming a different meeting type."""
     t = str(title or "")
-    return any(rx.search(t) for rx in PREP_TITLE_RE)
+    if not any(rx.search(t) for rx in PREP_TITLE_RE):
+        return False
+    for rx in PREP_EXCLUDE_RE:
+        if rx.search(t):
+            _prep_excluded_titles[t] = _prep_excluded_titles.get(t, 0) + 1
+            return False
+    return True
 
 
 # Every key Procore might put the meeting's date under. The first live run came
@@ -1083,6 +1115,9 @@ if VENDOR_TEST_LIMIT is not None:
 
 print(f"  {len(all_projects)} projects total; {len(scope)} in scope.\n")
 
+from pyspark.sql.types import BooleanType as _BoolT
+spark.udf.register("is_prep_title", looks_like_prep_meeting, _BoolT())
+
 # ============================================================
 # 6. The pull
 # ============================================================
@@ -1444,6 +1479,13 @@ SELECT
     _fabric_loaded_at
 FROM bronze_vendor_meeting_details
 WHERE meeting_procore_id IS NOT NULL
+  -- The rule is re-applied HERE, not only at fetch time. Bronze is written as a
+  -- per-project merge, so tightening what counts as a prep meeting would
+  -- otherwise leave every already-ingested pre-contract and kick-off meeting
+  -- sitting in the table until that project happened to be re-fetched. A filter
+  -- enforced only where data is WRITTEN silently grandfathers whatever was
+  -- written under the old rule.
+  AND is_prep_title(title)
 """)
 
 spark.sql("""
@@ -1619,6 +1661,29 @@ else:
     print("  none of", TEMPLATE_ID_FIELDS, "appeared on any meeting record.")
     print("  => the API does not expose the originating template; the title match is")
     print("     the only available filter. Leave PREP_REQUIRE_TEMPLATE_ID = False.")
+
+# What the title rule threw away. This is the block to read after tightening it:
+# if a real preparatory meeting is in here, its title needs fixing in Procore or
+# the exclude pattern that caught it needs narrowing.
+print("\n--- PREP TITLE EXCLUSIONS (said 'prep' but named another meeting type) ---")
+if _prep_excluded_titles:
+    for t, n in sorted(_prep_excluded_titles.items(), key=lambda kv: -kv[1])[:25]:
+        print(f"  {n:>3}x  {t}")
+    print(f"  => {sum(_prep_excluded_titles.values())} meeting(s) dropped. Check none of these is")
+    print("     a genuine preparatory meeting before trusting the numbers above.")
+else:
+    print("  none — no title matched both an include and an exclude pattern.")
+
+# The template id is reported, not used. Kept because a big gap between the two
+# is exactly what revealed that the template does not mean "preparatory".
+print("\n--- template id vs the title rule (informational) ---")
+_tmpl_n = template_id_hits.get(str(PREP_MEETING_TEMPLATE_ID), 0)
+print(f"  meetings on template {PREP_MEETING_TEMPLATE_ID}: {_tmpl_n}")
+print(f"  meetings the TITLE rule accepted    : {len(meeting_details)}")
+if _tmpl_n > len(meeting_details):
+    print(f"  => {_tmpl_n - len(meeting_details)} meeting(s) were built from the prep template but are")
+    print("     NOT preparatory meetings by title — pre-contract, kick-off, coordination.")
+    print("     That gap is why PREP_MATCH_MODE is 'title'; do not 'improve' it back to a union.")
 
 print("\n--- how each prep meeting was identified ---")
 for k in ("both", "template_only", "title_only"):

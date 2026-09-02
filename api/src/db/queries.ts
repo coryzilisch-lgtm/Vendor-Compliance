@@ -149,14 +149,22 @@ export type Settings = {
    *  Gold emits these as `title_variant` candidates, only where exactly one
    *  vendor on the project fits.
    *
-   *  Default OFF, and it should stay off until someone has read the Review
-   *  Queue. Of the 8 real cases in the first build, one is
-   *  "KEN HOUSTON - Preparatory Meeting Agenda" against a vendor "Ken Houston
-   *  Electric LLC" — and titling a meeting with a PERSON's name is a known
-   *  habit here. Auto-crediting that marks a vendor compliant on a coincidence,
-   *  which is the one error this tracker must not make: a false "held" can put
-   *  a crew on site without the meeting that was supposed to precede them. A
-   *  false "outstanding" only costs someone a second look. */
+   *  Default ON, at the safety team's request: the vendor is often not in
+   *  Procore's attendee list at all, and "Preparatory Meeting - K&B Electric"
+   *  is how they record who the meeting was with. Without this, a roster entry
+   *  of "K&B Electrical Services, Inc" never meets its own meeting.
+   *
+   *  It is still the weakest of the three signals and is labelled "Name
+   *  variant" wherever it decides a row, because a false "held" is the one
+   *  error worth avoiding here — it can put a crew on site without the meeting
+   *  that was supposed to precede them, where a false "outstanding" only costs
+   *  someone a second look. The uniqueness gate in gold is the main protection:
+   *  a title fragment that fits two vendors on the project credits neither.
+   *
+   *  ⚠️ Worth one look on the Review Queue: "KEN HOUSTON - Preparatory Meeting
+   *  Agenda" fits a vendor "Ken Houston Electric LLC", and titling a meeting
+   *  with a person's name is a habit here. If that one is a coincidence,
+   *  override it to not_held rather than turning the whole signal off. */
   allowNameVariantMatch: 0 | 1;
   /** Require Procore's `held` flag. Default OFF: the flag is rarely flipped, so
    *  requiring it makes almost everything read "not held". */
@@ -169,7 +177,7 @@ export const DEFAULT_SETTINGS: Settings = {
   vendorSource: 'either',
   requireVendorPresent: 0,
   allowTitleMatch: 1,
-  allowNameVariantMatch: 0,
+  allowNameVariantMatch: 1,
   requireMeetingHeld: 0,
   adminMode: 'allowlist',
 };

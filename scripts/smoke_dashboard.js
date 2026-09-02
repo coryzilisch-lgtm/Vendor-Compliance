@@ -83,7 +83,7 @@ const STUB = {
   ],
   '/api/settings': {
     settings: { vendorSource: 'either', allowTitleMatch: 1, requireVendorPresent: 0,
-                requireMeetingHeld: 0, allowNameVariantMatch: 0, adminMode: 'allowlist' },
+                requireMeetingHeld: 0, allowNameVariantMatch: 1, adminMode: 'allowlist' },
     coverage: { commitment_projects: 59, directory_projects: 91,
                 commitment_vendors: 1390, directory_vendors: 2362 },
   },

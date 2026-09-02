@@ -248,7 +248,7 @@ Four of the five unknowns are now settled against real data:
 
 | Question | Answer |
 |---|---|
-| **Is the meeting template id exposed?** | **Yes** — `383995` appeared on 10 meetings. And it is *necessary*: the title heuristic found only **3 of those 10**, because 7 prep meetings have no "prep" in the title. `PREP_MATCH_MODE` now defaults to the union of template + title. (The old `PREP_REQUIRE_TEMPLATE_ID` flag AND-ed them, so enabling it would have returned 3 — the intersection — and made things worse.) |
+| **Is the meeting template id exposed?** | **Yes — and it does NOT mean "preparatory meeting".** `383995` appeared on 63 meetings while the title rule accepted 30. That gap was first read as "the template is strictly better than the title heuristic", and the default became their union. Wrong: the team creates **pre-contract, kick-off and coordination** meetings from the same template and retitles them, so the union swept all of those into the tracker. The safety team's rule is literal — only preparatory meetings — and the TITLE is the only thing in the data carrying that distinction. `PREP_MATCH_MODE = "title"`, plus `PREP_TITLE_EXCLUDE`; the template id is now diagnostic only. Same shape of error as the commitments count: the number was right, the conclusion inverted. |
 | **Which vendor roster does BCI maintain?** | **Both.** The directory covers ~every project (~22 companies each, but that includes owner/architect/inspectors). Commitments are real too — see *The commitments bug* below. Keep `vendorSource = either`. |
 | **Where is the attendee's company?** | **Nowhere on the attendee.** The record is only `{id, status, login_information:{id, login, name}}`. Procore's UI resolves that column by joining the person to the project directory, so the ingest pulls `/projects/{id}/users` and does the same. Resolution went from **0/60 to 60/60**. An email-domain fallback (`…@jjfloresroofing.co` → "JJ Flores Roofing") covers people missing from the directory, bounded to vendors already on that project. |
 | **Does the attendance field parse?** | **Yes** — Procore returns `'Present'`, `'For Distribution Only'`, `'Absent'`, all understood. The 11 "unknown" rows carry **no status field at all** (nobody ticked a box), which is different from an unrecognized value. |
@@ -342,10 +342,10 @@ this tracker tells first, and most projects will read 0% until the process
 spreads — that is the tracker working, not the data being wrong.
 
 Two smaller ones worth keeping:
-- **33 of the 63 prep meetings have no "prep" in the title** and were found only
-  by template id `383995`. The title heuristic alone would have missed more than
-  half of them. Nothing matched on title *only*, so the union is currently
-  costing nothing and catching a lot.
+- **33 of the 63 "prep meetings" had no "prep" in the title** — and the safety
+  team confirmed those are pre-contract, kick-off and coordination meetings, not
+  preparatory ones. They came in purely on template id. The tracker now takes
+  the ~30 the title accepts. ⚠️ Do not read the drop as lost data.
 - **19 attendees resolved by email domain rather than the directory join**, and
   1 could not be resolved at all — those people are not in their project's
   Procore directory. Adding them there is the fix; the tracker degrades to title
