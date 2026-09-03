@@ -144,6 +144,28 @@ export type Settings = {
    *  added to the attendee list. Default ON — that is how BCI labels these
    *  meetings, and turning it off drops most historical matches. */
   allowTitleMatch: 0 | 1;
+  /** Count a meeting whose title names the vendor under a SHORTER trading name
+   *  than the roster's legal one ("… - HIVE" vs "Hive Energy Solutions LLC").
+   *  Gold emits these as `title_variant` candidates, only where exactly one
+   *  vendor on the project fits.
+   *
+   *  Default ON, at the safety team's request: the vendor is often not in
+   *  Procore's attendee list at all, and "Preparatory Meeting - K&B Electric"
+   *  is how they record who the meeting was with. Without this, a roster entry
+   *  of "K&B Electrical Services, Inc" never meets its own meeting.
+   *
+   *  It is still the weakest of the three signals and is labelled "Name
+   *  variant" wherever it decides a row, because a false "held" is the one
+   *  error worth avoiding here — it can put a crew on site without the meeting
+   *  that was supposed to precede them, where a false "outstanding" only costs
+   *  someone a second look. The uniqueness gate in gold is the main protection:
+   *  a title fragment that fits two vendors on the project credits neither.
+   *
+   *  ⚠️ Worth one look on the Review Queue: "KEN HOUSTON - Preparatory Meeting
+   *  Agenda" fits a vendor "Ken Houston Electric LLC", and titling a meeting
+   *  with a person's name is a habit here. If that one is a coincidence,
+   *  override it to not_held rather than turning the whole signal off. */
+  allowNameVariantMatch: 0 | 1;
   /** Require Procore's `held` flag. Default OFF: the flag is rarely flipped, so
    *  requiring it makes almost everything read "not held". */
   requireMeetingHeld: 0 | 1;
@@ -155,6 +177,7 @@ export const DEFAULT_SETTINGS: Settings = {
   vendorSource: 'either',
   requireVendorPresent: 0,
   allowTitleMatch: 1,
+  allowNameVariantMatch: 1,
   requireMeetingHeld: 0,
   adminMode: 'allowlist',
 };
@@ -193,6 +216,7 @@ function coerceSettings(raw: Record<string, string | null>): Settings {
     vendorSource,
     requireVendorPresent: bit('requireVendorPresent'),
     allowTitleMatch: bit('allowTitleMatch'),
+    allowNameVariantMatch: bit('allowNameVariantMatch'),
     requireMeetingHeld: bit('requireMeetingHeld'),
     adminMode,
   };
@@ -273,6 +297,7 @@ export async function saveSettings(
       v === 'commitment' || v === 'directory' || v === 'either' ? String(v) : null,
     requireVendorPresent: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
     allowTitleMatch: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
+    allowNameVariantMatch: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
     requireMeetingHeld: (v) => (String(v) === '1' ? '1' : String(v) === '0' ? '0' : null),
     adminMode: (v) => (v === 'open' || v === 'allowlist' ? String(v) : null),
   };
@@ -531,6 +556,11 @@ function manualTitleMatchBranch(): string {
 function matchPredicate(s: Settings, alias = 'm'): string {
   const parts: string[] = [];
   if (!s.allowTitleMatch) parts.push(`${alias}.match_method = 'attendee'`);
+  // Name-variant candidates are always emitted by gold and never count unless
+  // this is explicitly turned on. Redundant when allowTitleMatch is off, and
+  // stated anyway — a reader should not have to derive "variants are excluded"
+  // from a different setting's clause.
+  if (!s.allowNameVariantMatch) parts.push(`${alias}.match_method <> 'title_variant'`);
   if (s.requireVendorPresent) {
     // Attendance is only knowable for attendee matches; a title match has no
     // attendee row to inspect, so it passes this gate on its own merits.
@@ -543,6 +573,22 @@ function matchPredicate(s: Settings, alias = 'm'): string {
     parts.push(`CAST(${alias}.held AS NVARCHAR(10)) IN ('1','true','True')`);
   }
   return parts.length ? parts.join('\n        AND ') : '1 = 1';
+}
+
+/**
+ * The meetings that ARE credited to some vendor under the current settings.
+ *
+ * ⚠️ Use this, never `SELECT DISTINCT meeting_id FROM dbo.vendor_prep_matches`.
+ * That table holds CANDIDATES, including `title_variant` rows that are off by
+ * default — so the raw form would drop a meeting out of the Review Queue while
+ * crediting nobody for it. The meeting would then be invisible: not counted as
+ * held, and not shown as needing attention. "Unmatched" has to mean "no match
+ * that COUNTS", or the tracker's blind spot grows silently.
+ */
+function countedMeetingIds(s: Settings): string {
+  return `SELECT DISTINCT mm.meeting_id
+            FROM dbo.vendor_prep_matches mm
+           WHERE ${matchPredicate(s, 'mm')}`;
 }
 
 /**
@@ -664,7 +710,13 @@ function vendorStatusCTEs(s: Settings, projectFilter: string): string {
              e.meeting_date, e.match_method, e.matched_attendee_name, e.attendance_status,
              ROW_NUMBER() OVER (
                PARTITION BY e.project_id, e.vendor_normalized
-               ORDER BY CASE WHEN e.match_method = 'attendee' THEN 0 ELSE 1 END,
+               -- Strongest evidence wins the row the UI shows: a direct
+               -- attendee record, then an exact title, then a name variant.
+               ORDER BY CASE e.match_method
+                          WHEN 'attendee'      THEN 0
+                          WHEN 'title'         THEN 1
+                          WHEN 'title_variant' THEN 2
+                          ELSE 3 END,
                         e.meeting_date ASC, e.meeting_id ASC) AS rn
       FROM eligible e
   ),
@@ -672,7 +724,8 @@ function vendorStatusCTEs(s: Settings, projectFilter: string): string {
       SELECT project_id, vendor_normalized,
              COUNT(DISTINCT meeting_id) AS meeting_count,
              MAX(CASE WHEN match_method = 'attendee' THEN 1 ELSE 0 END) AS has_attendee_match,
-             MAX(CASE WHEN match_method = 'title'    THEN 1 ELSE 0 END) AS has_title_match
+             MAX(CASE WHEN match_method = 'title'    THEN 1 ELSE 0 END) AS has_title_match,
+             MAX(CASE WHEN match_method = 'title_variant' THEN 1 ELSE 0 END) AS has_variant_match
       FROM eligible
       GROUP BY project_id, vendor_normalized
   ),
@@ -694,6 +747,7 @@ function vendorStatusCTEs(s: Settings, projectFilter: string): string {
           COALESCE(ev.meeting_count, 0)      AS meeting_count,
           COALESCE(ev.has_attendee_match, 0) AS has_attendee_match,
           COALESCE(ev.has_title_match, 0)    AS has_title_match,
+          COALESCE(ev.has_variant_match, 0)  AS has_variant_match,
           o.status                           AS override_status,
           o.note                             AS override_note,
           o.meeting_date                     AS override_meeting_date,
@@ -759,7 +813,7 @@ export async function getProjectSummaries(scope: 'active' | 'all'): Promise<Proj
                COUNT(*) AS prep_meeting_count,
                SUM(CASE WHEN x.meeting_id IS NULL THEN 1 ELSE 0 END) AS unmatched_meeting_count
         FROM dbo.vendor_prep_meetings m
-        LEFT JOIN (SELECT DISTINCT meeting_id FROM dbo.vendor_prep_matches) x
+        LEFT JOIN (${countedMeetingIds(s)}) x
                ON x.meeting_id = m.meeting_id
         GROUP BY m.project_id
     )
@@ -805,6 +859,7 @@ export type VendorRow = {
   meeting_count: number;
   has_attendee_match: number;
   has_title_match: number;
+  has_variant_match: number;
   override_status: string | null;
   override_note: string | null;
   override_by: string | null;
@@ -830,7 +885,7 @@ export async function getProjectDetail(projectId: number): Promise<{
         status, meeting_id, meeting_title,
         CONVERT(VARCHAR(10), COALESCE(override_meeting_date, meeting_date), 23) AS meeting_date,
         match_method, matched_attendee_name, attendance_status,
-        meeting_count, has_attendee_match, has_title_match,
+        meeting_count, has_attendee_match, has_title_match, has_variant_match,
         override_status, override_note, override_by
     FROM resolved
     ORDER BY CASE status WHEN 'not_held' THEN 0 WHEN 'held' THEN 1 ELSE 2 END, vendor_name;
@@ -851,7 +906,12 @@ export async function getProjectDetail(projectId: number): Promise<{
             m.held, m.attendee_count, m.vendor_attendee_count, m.vendor_attendees_present,
             m.series_name, m.location,
             (SELECT COUNT(DISTINCT x.vendor_normalized) FROM dbo.vendor_prep_matches x
-              WHERE x.meeting_id = m.meeting_id) AS matched_vendor_count
+              WHERE x.meeting_id = m.meeting_id
+                AND ${matchPredicate(s, 'x')}) AS matched_vendor_count,
+            (SELECT TOP 1 x.vendor_name FROM dbo.vendor_prep_matches x
+              WHERE x.meeting_id = m.meeting_id
+                AND x.match_method = 'title_variant'
+              ORDER BY x.vendor_name) AS suggested_vendor
      FROM dbo.vendor_prep_meetings m
      WHERE m.project_id = @pid
      ORDER BY m.meeting_date DESC`,
@@ -874,15 +934,30 @@ export async function getProjectDetail(projectId: number): Promise<{
  */
 export async function getUnmatchedMeetings(scope: 'active' | 'all'): Promise<Record<string, unknown>[]> {
   await ensureProjectColumnMeta();
+  const s = await getSettings();
   const projectFilter = scope === 'all' ? '1 = 1' : activeStageFilter('p');
+  // `suggested_vendor` is a name-variant candidate gold found but the settings
+  // do not credit — the title names a company that IS on this project's roster
+  // under a longer legal name, and exactly one vendor fits. Showing it turns a
+  // row that says "we can't credit this" into one an admin can act on in a
+  // click, without the tracker having decided anything on its own.
   const { rows } = await db.query(`
     SELECT m.project_id, p.name AS project_name, m.meeting_id, m.title,
            CONVERT(VARCHAR(10), m.meeting_date, 23) AS meeting_date,
-           m.attendee_count, m.vendor_attendee_count
+           m.attendee_count, m.vendor_attendee_count,
+           sug.vendor_name       AS suggested_vendor,
+           sug.vendor_normalized AS suggested_vendor_normalized
     FROM dbo.vendor_prep_meetings m
     JOIN dbo.projects p ON p.id = m.project_id
-    LEFT JOIN (SELECT DISTINCT meeting_id FROM dbo.vendor_prep_matches) x
+    LEFT JOIN (${countedMeetingIds(s)}) x
            ON x.meeting_id = m.meeting_id
+    OUTER APPLY (
+        SELECT TOP 1 v.vendor_name, v.vendor_normalized
+        FROM dbo.vendor_prep_matches v
+        WHERE v.meeting_id = m.meeting_id
+          AND v.match_method = 'title_variant'
+        ORDER BY v.vendor_name
+    ) sug
     WHERE x.meeting_id IS NULL
       AND ${projectFilter}
     ORDER BY m.meeting_date DESC;
@@ -1022,7 +1097,7 @@ export async function getMetrics(months: number): Promise<Record<string, unknown
           JOIN proj ON proj.project_id = m.project_id)                 AS total_meetings,
         (SELECT COUNT(*) FROM dbo.vendor_prep_meetings m
           JOIN proj ON proj.project_id = m.project_id
-          LEFT JOIN (SELECT DISTINCT meeting_id FROM dbo.vendor_prep_matches) x
+          LEFT JOIN (${countedMeetingIds(s)}) x
                  ON x.meeting_id = m.meeting_id
          WHERE x.meeting_id IS NULL)                                   AS unmatched_meetings
     FROM per_project pp;`);
@@ -1039,9 +1114,14 @@ export async function getMetrics(months: number): Promise<Record<string, unknown
                m.project_id,
                CONVERT(CHAR(7), m.meeting_date, 23) AS ym,
                MAX(CASE WHEN x.match_method = 'attendee' THEN 1 ELSE 0 END) AS has_attendee,
-               MAX(CASE WHEN x.match_method = 'title'    THEN 1 ELSE 0 END) AS has_title
+               MAX(CASE WHEN x.match_method IN ('title','title_variant')
+                        THEN 1 ELSE 0 END)                             AS has_title
         FROM dbo.vendor_prep_meetings m
-        LEFT JOIN dbo.vendor_prep_matches x ON x.meeting_id = m.meeting_id
+        -- Only matches that COUNT feed the chart; otherwise a meeting credited
+        -- to nobody would still be drawn in the "matched by title" band.
+        LEFT JOIN dbo.vendor_prep_matches x
+               ON x.meeting_id = m.meeting_id
+              AND ${matchPredicate(s, 'x')}
         WHERE m.meeting_date IS NOT NULL
           AND m.meeting_date >= DATEADD(MONTH, -@win, CAST(GETUTCDATE() AS DATE))
         GROUP BY m.meeting_id, m.project_id, CONVERT(CHAR(7), m.meeting_date, 23)
@@ -1066,6 +1146,7 @@ export async function getMetrics(months: number): Promise<Record<string, unknown
         FROM dbo.vendor_prep_matches x
         WHERE x.meeting_date IS NOT NULL
           AND x.meeting_date >= DATEADD(MONTH, -@win, CAST(GETUTCDATE() AS DATE))
+          AND ${matchPredicate(s, 'x')}
         GROUP BY CONVERT(CHAR(7), x.meeting_date, 23)
     )
     SELECT
@@ -1110,6 +1191,7 @@ export async function getMetrics(months: number): Promise<Record<string, unknown
            MAX(CASE WHEN x.match_method = 'attendee' THEN 1 ELSE 0 END) AS ever_on_attendee_list
     FROM dbo.vendor_prep_matches x
     WHERE COALESCE(x.vendor_name,'') <> ''
+      AND ${matchPredicate(s, 'x')}
     GROUP BY x.vendor_name
     ORDER BY COUNT(DISTINCT x.meeting_id) DESC, x.vendor_name;`);
 

@@ -537,8 +537,15 @@ function vendorRow(v){
   if(v.is_manual) tags+=' <span class="pill manual">Added manually</span>';
   else if(v.from_commitment && !v.from_directory) tags+=' <span class="pill info">Commitment</span>';
   else if(v.from_directory && !v.from_commitment) tags+=' <span class="pill info">Directory</span>';
-  if(v.status==='held' && v.match_method==='title' && !v.override_status){
-    tags+=' <span class="pill warn">Title match</span>';
+  if(v.status==='held' && !v.override_status){
+    if(v.match_method==='title'){
+      tags+=' <span class="pill warn">Title match</span>';
+    }else if(v.match_method==='title_variant'){
+      // Weaker than a title match and labelled as such: the title named a
+      // SHORTER form of this vendor's name, and nobody put them on the
+      // attendee list. Worth a look before it is trusted.
+      tags+=' <span class="pill warn">Name variant</span>';
+    }
   }
 
   var acts='';
@@ -714,13 +721,29 @@ async function loadReview(){
         +'Nothing to review.</div>';
       return;
     }
-    var h='<table><thead><tr><th>Project</th><th>Meeting title</th><th class="num">Date</th>'
+    var h='<table><thead><tr><th>Project</th><th>Meeting title</th>'
+      +'<th>Looks like</th><th class="num">Date</th>'
       +'<th class="num">Attendees</th><th class="num">Vendor-side attendees</th>'
       +'<th class="num">Procore</th></tr></thead><tbody>';
     REVIEW.forEach(function(m){
+      /* `suggested_vendor` is a vendor that IS on this project's roster under a
+         longer legal name, where exactly one candidate fits. It is a suggestion,
+         never an automatic credit — the tracker will not decide on its own that
+         a meeting happened. An admin confirms it, which writes an ordinary
+         "held" override with a note recording that it came from the title. */
+      var sug='<span class="muted">—</span>';
+      if(m.suggested_vendor){
+        sug='<div>'+esc(m.suggested_vendor)+'</div>';
+        if(ADMIN){
+          sug+='<button class="mini" data-confirm="'+esc(m.project_id)+'"'
+            +' data-vendor="'+esc(m.suggested_vendor_normalized||'')+'"'
+            +' data-mdate="'+esc(m.meeting_date||'')+'">Confirm as held</button>';
+        }
+      }
       h+='<tr class="click" data-pid="'+esc(m.project_id)+'">'
         +'<td class="pname">'+esc(m.project_name||m.project_id)+'</td>'
         +'<td>'+esc(m.title||'—')+'</td>'
+        +'<td>'+sug+'</td>'
         +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'
         +'<td class="num">'+esc(m.attendee_count==null?'—':m.attendee_count)+'</td>'
         +'<td class="num">'+(Number(m.vendor_attendee_count||0)===0
@@ -731,10 +754,33 @@ async function loadReview(){
     $('review-out').innerHTML=h;
     Array.prototype.forEach.call($('review-out').querySelectorAll('tr.click'),function(tr){
       tr.onclick=function(ev){
-        if(ev.target.closest && ev.target.closest('a')) return;
+        if(ev.target.closest && (ev.target.closest('a')||ev.target.closest('button'))) return;
         openProject(Number(tr.getAttribute('data-pid')));
       };
     });
+    Array.prototype.forEach.call($('review-out').querySelectorAll('button[data-confirm]'),
+      function(b){
+        b.onclick=async function(ev){
+          ev.stopPropagation();
+          var pid=Number(b.getAttribute('data-confirm'));
+          var vendor=b.getAttribute('data-vendor');
+          if(!vendor) return;
+          b.disabled=true; b.textContent='Saving…';
+          try{
+            await api('/overrides',{
+              method:'POST', headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({project_id:pid, vendor_normalized:vendor, status:'held',
+                note:'Confirmed from the Review Queue: the meeting title names this vendor '
+                     +'under a shorter name ('+(b.getAttribute('data-mdate')||'no date')+').'})
+            });
+            await loadReview();
+            loadProjects(true);
+          }catch(e){
+            alert('Could not confirm: '+e.message);
+            b.disabled=false; b.textContent='Confirm as held';
+          }
+        };
+      });
   }catch(e){
     $('review-out').innerHTML=errNote(e.message);
   }
@@ -820,6 +866,15 @@ async function loadSettings(){
         +'<div class="hint">Counts “Preparatory Meeting - ZIP” for the vendor ZIP even when nobody '
         +'from ZIP was added to the attendee list. This is how your teams actually name these '
         +'meetings — turning it off will drop most historical matches.</div></label></div>'
+      +'<div class="opt"><input type="checkbox" id="allowNameVariantMatch"'
+        +(Number(SETTINGS.allowNameVariantMatch)?' checked':'')+(ADMIN?'':' disabled')+'>'
+        +'<label for="allowNameVariantMatch">Also accept a shorter trading name'
+        +'<div class="hint">Counts “Preparatory Meeting - K&amp;B Electric” for the vendor '
+        +'“K&amp;B Electrical Services, Inc” — the case where the vendor was never added to the '
+        +'attendee list and the title is the only record of who the meeting was with. Only fires '
+        +'where exactly ONE vendor on that project fits, so “Patriot Pipeline” is never credited '
+        +'to “Patriot Plumbing”. Rows decided this way are labelled '
+        +'<span class="pill warn">Name variant</span> so they stay checkable.</div></label></div>'
       +'<div class="opt"><input type="checkbox" id="requireVendorPresent"'
         +(Number(SETTINGS.requireVendorPresent)?' checked':'')+(ADMIN?'':' disabled')+'>'
         +'<label for="requireVendorPresent">Require the vendor to be marked Present'
@@ -878,6 +933,7 @@ async function loadSettings(){
           body:JSON.stringify({
             vendorSource: sel?sel.value:SETTINGS.vendorSource,
             allowTitleMatch: $('allowTitleMatch').checked?1:0,
+            allowNameVariantMatch: $('allowNameVariantMatch').checked?1:0,
             requireVendorPresent: $('requireVendorPresent').checked?1:0,
             requireMeetingHeld: $('requireMeetingHeld').checked?1:0,
             adminMode: (document.querySelector('input[name="adminMode"]:checked')||{}).value

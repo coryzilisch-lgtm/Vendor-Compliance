@@ -57,6 +57,109 @@ TITLE_STOPWORDS = {
     "the", "and", "of", "for", "fdg", "project", "job", "site",
 }
 
+# ── Signal 3: name-variant title matching ────────────────────────────────────
+# MEASURED on the first full build: 10 prep meetings matched nothing, and the
+# residual analysis classified 8 of them as "the vendor IS on the roster, under a
+# longer legal name". The titles use the trading name, the roster uses what's on
+# the contract:
+#
+#     title "… - HIVE"              roster "Hive Energy Solutions LLC"
+#     title "… - Patriot Pipeline"  roster "Patriot Pipeline Albuquerque"
+#     title "… - L&G Construction"  roster "L&G Concrete Construction, Inc"   (infix!)
+#     title "…- H&W LandWorks"      roster "H&W Landwork KY LLC"              (plural)
+#     title "… - K&B Electric"      roster "K&B Electrical Services, Inc"     (stem)
+#
+# The strict token-run test refuses all of these, correctly — it demands the
+# vendor's tokens contiguous AND complete. So this is a THIRD, weaker signal
+# rather than a loosening of the second one: every word the title says about the
+# company must appear somewhere in the vendor's name, and the match must be
+# UNIQUE on that project. Uniqueness is what makes it safe — it is precisely
+# what stops "ABC" crediting both "ABC Construction" and "ABC Plumbing", and it
+# already earns its keep on real data ("Patriot Pipeline" must not also match
+# "Patriot Plumbing Solutions", which sits on the same job).
+#
+# ⚠️ These are emitted as CANDIDATES and are OFF by default in the API
+# (`allowNameVariantMatch`). One of the eight is "KEN HOUSTON - Preparatory
+# Meeting Agenda" against a vendor "Ken Houston Electric LLC" — and a meeting
+# titled with a PERSON's name is a known pattern here. Auto-crediting that would
+# mark a vendor compliant on the strength of a coincidence, which is the one
+# error this tracker must not make. They surface as suggestions in the Review
+# Queue instead.
+
+# Corporate filler. Deliberately EXCLUDES trade words (electric, plumbing,
+# concrete, roofing, pipeline) — those are exactly what tells "Patriot Pipeline"
+# apart from "Patriot Plumbing", and treating them as noise would undo the
+# uniqueness guarantee.
+GENERIC_NAME_WORDS = {
+    "construction", "contracting", "contractors", "contractor",
+    "services", "service", "solutions", "group", "enterprises", "industries",
+    "systems", "associates", "builders", "supply", "supplies", "products",
+    "international", "national", "development", "developers", "holdings",
+    "partners", "management", "usa", "inc", "llc",
+}
+
+# Words to strip off a MEETING TITLE before asking what company it names.
+MEETING_BOILERPLATE = {
+    "preparatory", "preparation", "prep", "phase", "pre", "contract", "precon",
+    "meeting", "meetings", "agenda", "minutes", "kickoff", "kick", "off",
+    "for", "the", "and", "with", "of", "on", "at", "a", "to",
+    "site", "job", "project", "review", "notes", "call", "zoom", "teams",
+}
+
+# A token is "the same word" as another when one is an INFLECTION of the other:
+# same stem plus a known word ending. Nothing else.
+#
+# ⚠️ The first version said "a prefix of it at 5+ characters", which is not the
+# same claim at all — it made `Excel` match `Excelsior`, destroying the exact
+# negative control the strict token-run rule was built around. A unit test on
+# the real vendor names caught it. Any future loosening here must keep the
+# Excel/Excelsior and ZIP/Zipper controls green.
+VARIANT_MIN_STEM = 5
+VARIANT_ENDINGS = ("s", "es", "al", "als", "al services", "ing", "ings",
+                   "ed", "er", "ers", "or", "ors", "ion", "ions", "ics", "ial")
+
+
+def _same_word(a, b):
+    if a == b:
+        return True
+    lo, hi = (a, b) if len(a) <= len(b) else (b, a)
+    if not hi.startswith(lo):
+        return False
+    # A plural is fine at any length ("h&w landwork" -> "landworks"); anything
+    # else has to be a real stem, so a 3-letter abbreviation can't grow a word.
+    extra = hi[len(lo):]
+    if extra == "s":
+        return True
+    return len(lo) >= VARIANT_MIN_STEM and extra in VARIANT_ENDINGS
+
+
+def title_names_tokens(title):
+    """The words in a meeting title that might be a company name."""
+    return [t for t in normalize_company(title or "").split()
+            if t and t not in MEETING_BOILERPLATE and not t.isdigit()]
+
+
+def variant_match(title, vendor_name):
+    """True when the company named in the title is plausibly this vendor under a
+    longer or inflected name. Conjunctive on purpose: EVERY word the title says
+    must be in the vendor's name, so a shared generic word can never carry a
+    match on its own ("Escar Construction" must not match "Espana Construction").
+    """
+    t_all = title_names_tokens(title)
+    v_all = normalize_company(vendor_name or "").split()
+    if not t_all or not v_all:
+        return False
+    for tok in t_all:
+        if not any(_same_word(tok, v) for v in v_all):
+            return False
+    # ...and the agreement can't be only on filler words.
+    t_dist = [t for t in t_all if t not in GENERIC_NAME_WORDS]
+    v_dist = [v for v in v_all if v not in GENERIC_NAME_WORDS]
+    if not t_dist or not v_dist:
+        return False
+    return any(_same_word(a, b) for a in t_dist for b in v_dist)
+
+
 print("Building vendor compliance gold tables...")
 
 # ============================================================
@@ -131,6 +234,7 @@ spark.udf.register("norm_company", normalize_company, StringType())
 spark.udf.register("token_pad", token_pad, StringType())
 spark.udf.register("title_matchable", title_matchable, BooleanType())
 spark.udf.register("vendor_excluded", vendor_excluded, BooleanType())
+spark.udf.register("variant_match", variant_match, BooleanType())
 
 
 def table_exists(name):
@@ -280,6 +384,22 @@ attendee_match AS (
     WHERE NOT COALESCE(a.is_gc, false)
       AND COALESCE(a.company_normalized, '') <> ''
     GROUP BY a.meeting_id, a.company_normalized
+),
+-- Meetings already credited by a stronger signal. Signal 3 is deliberately
+-- restricted to what is left over.
+matched_meetings AS (
+    SELECT DISTINCT m.meeting_id
+    FROM meetings m
+    JOIN roster r ON r.project_id = m.project_id
+    JOIN attendee_match am ON am.meeting_id = m.meeting_id
+                          AND am.vendor_normalized = r.vendor_normalized
+    UNION
+    SELECT DISTINCT m.meeting_id
+    FROM meetings m
+    JOIN roster r ON r.project_id = m.project_id
+    WHERE r.title_matchable
+      AND m.title_padded <> ''
+      AND INSTR(m.title_padded, token_pad(r.vendor_name)) > 0
 )
 SELECT
     m.project_id,
@@ -319,6 +439,39 @@ JOIN roster r ON r.project_id = m.project_id
 WHERE r.title_matchable
   AND m.title_padded <> ''
   AND INSTR(m.title_padded, token_pad(r.vendor_name)) > 0
+
+UNION ALL
+
+-- Signal 3: the same company under a longer legal name. Applied ONLY to
+-- meetings that matched nothing at all, so it can never disturb a match the two
+-- stronger signals already made, and only where exactly ONE vendor on the
+-- project fits — the uniqueness gate is what makes it safe.
+SELECT
+    v.project_id,
+    v.vendor_normalized,
+    v.vendor_name,
+    v.meeting_id,
+    v.title            AS meeting_title,
+    v.meeting_date,
+    v.held,
+    'title_variant'    AS match_method,
+    CAST(NULL AS BOOLEAN) AS attendee_attended,
+    CAST(NULL AS STRING)  AS matched_attendee_name,
+    CAST(NULL AS STRING)  AS attendance_status,
+    current_timestamp() AS _fabric_loaded_at
+FROM (
+    SELECT c.*, COUNT(*) OVER (PARTITION BY c.meeting_id) AS fits
+    FROM (
+        SELECT m.project_id, m.meeting_id, m.title, m.meeting_date, m.held,
+               r.vendor_normalized, r.vendor_name
+        FROM meetings m
+        JOIN roster r ON r.project_id = m.project_id
+        WHERE r.title_matchable
+          AND m.meeting_id NOT IN (SELECT meeting_id FROM matched_meetings)
+          AND variant_match(m.title, r.vendor_name)
+    ) c
+) v
+WHERE v.fits = 1
 """)
 
 # ============================================================
@@ -395,22 +548,16 @@ ORDER BY m.meeting_date DESC
 #   C. no vendor on that project shares a single word with the title -> the sub
 #      really is absent from the roster, and someone has to add it.
 #
-# So: strip the meeting boilerplate off the title, and show what the project's
-# roster actually offers against the residual. Cheap (tens of meetings, tens of
-# vendors each) and it turns "10 rows to eyeball" into a named cause per row.
-MEETING_BOILERPLATE = {
-    "preparatory", "preparation", "prep", "phase", "pre", "contract", "precon",
-    "meeting", "meetings", "agenda", "minutes", "kickoff", "kick", "off",
-    "for", "the", "and", "with", "of", "on", "at", "a", "to",
-    "site", "job", "project", "review", "notes", "call", "zoom", "teams",
-}
-
-
-def _residual_tokens(text):
-    """The words in a title that might be a company name."""
-    return [t for t in normalize_company(text).split()
-            if t and t not in MEETING_BOILERPLATE and not t.isdigit()]
-
+# So: strip the meeting boilerplate off the title (title_names_tokens, shared
+# with the variant matcher above so the diagnostic and the rule can't disagree)
+# and show what the project's roster actually offers against the residual.
+#
+# ⚠️ Score on DISTINCTIVE words only. The first version counted any shared token
+# and so reported "Escar Construction" as a near miss of "Espana Construction" —
+# the only word they share is "construction". That is a genuinely-absent vendor
+# (cause C) dressed up as a near miss (cause B), i.e. the diagnostic quietly
+# talking the reader out of the one row that needed action.
+_residual_tokens = title_names_tokens
 
 print("\n--- WHY those didn't match (title residual vs that project's roster) ---")
 try:
@@ -430,18 +577,25 @@ try:
         _roster_by_project.setdefault(_r["project_id"], []).append(
             (_r["vendor_name"], _r["vendor_normalized"]))
 
-    _causes = {"A_should_have_matched": 0, "B_roster_name_differs": 0,
-               "C_vendor_not_on_roster": 0, "D_no_vendor_in_title": 0}
+    _causes = {"A_should_have_matched": 0, "B_name_variant_suggested": 0,
+               "B_ambiguous": 0, "C_vendor_not_on_roster": 0, "D_no_vendor_in_title": 0}
 
     for _m in _unmatched:
         _res = _residual_tokens(_m["title"] or "")
-        _res_set = set(_res)
-        _cands = []
+        # Distinctive words only. Scoring on ANY shared token reported "Escar
+        # Construction" as a near miss of "Espana Construction" on the strength
+        # of the word "construction" alone.
+        _res_dist = set(t for t in _res if t not in GENERIC_NAME_WORDS)
+        _cands, _variants = [], []
         for _vname, _vnorm in _roster_by_project.get(_m["project_id"], []):
             _vt = [t for t in (_vnorm or "").split() if t not in MEETING_BOILERPLATE]
             if not _vt:
                 continue
-            _hit = len(set(_vt) & _res_set)
+            if variant_match(_m["title"], _vname):
+                _variants.append(_vname)
+            _hit = sum(1 for t in _vt
+                       if t not in GENERIC_NAME_WORDS
+                       and any(_same_word(t, r) for r in _res_dist))
             if _hit:
                 _contig = token_pad(_vnorm) in (_m["title_padded"] or "")
                 _cands.append((_hit / len(_vt), _hit, _contig, _vname, len(_vt)))
@@ -449,17 +603,25 @@ try:
 
         if not _res:
             _cause, _detail = "D_no_vendor_in_title", "the title names no company at all"
-        elif not _cands:
-            _cause = "C_vendor_not_on_roster"
-            _detail = "NO vendor on this project shares a word with the title"
-        elif _cands[0][0] >= 1.0 and _cands[0][2]:
+        elif _cands and _cands[0][0] >= 1.0 and _cands[0][2]:
             _cause = "A_should_have_matched"
             _detail = f"⚠ BUG — '{_cands[0][3]}' is on the roster and fully in the title"
+        elif len(_variants) == 1:
+            _cause = "B_name_variant_suggested"
+            _detail = (f"same company under a longer name: '{_variants[0]}' "
+                       "-> suggested in the Review Queue")
+        elif len(_variants) > 1:
+            _cause = "B_ambiguous"
+            _detail = ("AMBIGUOUS - the title fits " + str(len(_variants)) + " vendors ("
+                       + ", ".join(f"'{v}'" for v in _variants[:3])
+                       + "); refusing to guess between them")
+        elif not _cands:
+            _cause = "C_vendor_not_on_roster"
+            _detail = "NO vendor on this project shares a distinctive word with the title"
         else:
-            _cause = "B_roster_name_differs"
-            _detail = ("closest roster name is longer/reordered: "
-                       + ", ".join(f"'{c[3]}' ({c[1]} of its {c[4]} words in the title)"
-                                   for c in _cands[:2]))
+            _cause = "C_vendor_not_on_roster"
+            _detail = ("no roster name contains everything the title says; closest is "
+                       + ", ".join(f"'{c[3]}' ({c[1]} of its {c[4]} words)" for c in _cands[:2]))
         _causes[_cause] += 1
         print(f"  [{_cause[0]}] {(_m['title'] or '')[:52]:<52} project {_m['project_id']}")
         print(f"        title names : {' '.join(_res) or '(nothing)'}")
@@ -469,10 +631,15 @@ try:
     if _causes["A_should_have_matched"]:
         print("  ⚠️  Any 'A' is a matching bug in this file, not a data problem — the vendor")
         print("      is on the roster and its full name is in the title. Send me the row.")
-    if _causes["B_roster_name_differs"]:
-        print("  'B' rows are the ONLY argument for relaxing the token-run rule. Don't relax it")
-        print("      on a hunch: a prefix match would also fuse 'ABC Construction' with 'ABC")
-        print("      Plumbing'. If B is large, the safe fix is an admin alias, not a looser test.")
+    if _causes["B_name_variant_suggested"]:
+        print(f"  {_causes['B_name_variant_suggested']} row(s) are the same company under a longer")
+        print("      legal name. gold emits these as `title_variant` CANDIDATES; they do NOT count")
+        print("      until an admin turns on 'Name-variant title match' in Settings, because one of")
+        print("      them can be a meeting titled with a PERSON's name that happens to match a")
+        print("      vendor. Confirm them from the Review Queue instead.")
+    if _causes["B_ambiguous"]:
+        print(f"  {_causes['B_ambiguous']} row(s) fit more than one vendor and are deliberately")
+        print("      left unmatched — this is the uniqueness gate doing its job.")
     if _causes["C_vendor_not_on_roster"]:
         print("  'C' rows are real work in Procore: the sub isn't in the project's vendor")
         print("      directory (nor under any contract), so the tracker cannot credit them.")
