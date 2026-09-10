@@ -234,6 +234,18 @@ PROJECTS_SINCE       = "2024-01-01"
 # exactly like SKIP_COMPLETED_PROJECTS.
 ACTIVE_PROJECTS_ONLY = True
 
+# ---- One-time historical backfill -------------------------------------------
+# Set True for a single run to pull every project back to PROJECTS_SINCE
+# (2024-01-01), then set it back to False. It simply forces
+# ACTIVE_PROJECTS_ONLY off for that run and says so loudly, so the intent is
+# recorded rather than left as a flipped flag someone finds later and "fixes".
+#
+# Safe to run once and forget: the nightly active-only run narrows scope, and
+# narrowing sets merge_ids, so the finished 2024-25 projects keep their rows
+# instead of being deleted. That is what makes "pull the history once" work at
+# all — verify write_delta's merge branch before changing it.
+BACKFILL_ALL_HISTORY = False
+
 # Stage strings that mean this job will never need a prep meeting again —
 # it is finished, dead, or paused.
 #
@@ -253,6 +265,39 @@ FINISHED_STAGE_HINTS = [
 
 SKIP_COMPLETED_PROJECTS = False
 COMPLETED_GRACE_DAYS    = 120
+
+# ---- Don't re-fetch what can't have changed ---------------------------------
+# THE NIGHTLY COST IS THE DETAIL CALL. The meetings LIST is one call per project
+# and unavoidable; a prep meeting's DETAIL is one call each, and a meeting that
+# already happened is not going to change. Without this, every nightly run
+# re-downloads the entire back catalogue to rebuild rows identical to the ones
+# already in bronze — and after a 2024 backfill that is hundreds of calls a
+# night to learn nothing.
+#
+# So: keep the detail + attendee rows already in bronze and re-fetch only what
+# is new or genuinely changed. Two independent tests, either one is enough:
+#
+#   1. `updated_at` on the LIST record matches what we stored. Exact, and the
+#      preferred path — Procore bumps it on any edit.
+#   2. The meeting happened more than REUSE_SETTLED_AFTER_DAYS ago. The
+#      fallback for a tenant whose list response omits updated_at, and the
+#      thing that makes a 2024 backfill cheap to carry. It IS a trade: someone
+#      editing the attendee list of a year-old meeting won't be picked up until
+#      a full sweep. Set REUSE_MEETING_DETAILS = False occasionally (monthly,
+#      say) to re-read everything — same pattern as ingest_safety's full sweep.
+REUSE_MEETING_DETAILS   = True
+REUSE_SETTLED_AFTER_DAYS = 45
+
+# ⚠️ BUMP THIS whenever attendee company resolution changes — the directory
+# join, the email-domain fallback, normalize_company, attendance parsing, any of
+# it. Cached rows carry the version they were built with, and a mismatch
+# re-fetches them. Without it, an improvement to resolution would silently apply
+# only to meetings held since the improvement, and the older ones would keep
+# whatever the old code decided — the kind of split-brain that is very hard to
+# see and very easy to mistake for bad data.
+#   1: original      2: directory join + email-domain fallback
+#   3: title-only prep rule (2026-09)
+ATTENDEE_RESOLUTION_VERSION = 3
 
 # ---- Targeted re-ingest -----------------------------------------------------
 # Non-empty => pull ONLY these projects and merge them back over the existing
@@ -1085,6 +1130,13 @@ merge_ids = None
 # The runtime lever. Narrowing to live jobs only affects what gets FETCHED —
 # out-of-scope projects keep their existing rows through the project-level merge
 # below, so this is safe to flip in either direction.
+if BACKFILL_ALL_HISTORY:
+    print(f"  BACKFILL_ALL_HISTORY: pulling every project since {PROJECTS_SINCE}.")
+    print("  Expect roughly 5 API calls per project plus one per prep meeting, so a")
+    print("  ~250-project tenant is ~20-30 min. Set it back to False afterwards; the")
+    print("  nightly active-only run preserves these rows through the project merge.")
+    ACTIVE_PROJECTS_ONLY = False
+
 if ACTIVE_PROJECTS_ONLY and not ONLY_PROJECT_IDS:
     before = len(scope)
     scope = [p for p in scope if is_live_project(p)]
@@ -1113,10 +1165,129 @@ if VENDOR_TEST_LIMIT is not None:
     print(f"  VENDOR_TEST_LIMIT={VENDOR_TEST_LIMIT} — merge mode on so this test "
           f"run can't wipe the other projects.")
 
-print(f"  {len(all_projects)} projects total; {len(scope)} in scope.\n")
+print(f"  {len(all_projects)} projects total; {len(scope)} in scope.")
 
 from pyspark.sql.types import BooleanType as _BoolT
 spark.udf.register("is_prep_title", looks_like_prep_meeting, _BoolT())
+
+
+# ============================================================
+# 5b. The meeting-detail carry-forward cache
+#
+# Reads back what bronze already knows so the run can skip the detail call for
+# meetings that cannot have changed. See REUSE_MEETING_DETAILS above for the
+# two tests; this is the machinery.
+# ============================================================
+
+# write_delta stamps these on every row. They must be stripped before a cached
+# row goes back through it, or the second pass would try to add a column that is
+# already present.
+_BOOKKEEPING_COLS = {"_fabric_loaded_at", "_notebook_run_started_at",
+                     "_source_system", "_company_id"}
+
+_detail_cache = {}        # str(meeting_id) -> {"detail": {...}, "attendees": [...]}
+_reuse_stats = {"eligible": 0, "reused": 0, "refetched": 0, "no_updated_at": 0,
+                "changed": 0, "stale_version": 0, "settled": 0}
+
+
+def _row_to_dict(row):
+    return {k: v for k, v in row.asDict().items() if k not in _BOOKKEEPING_COLS}
+
+
+def load_meeting_detail_cache(scope_ids):
+    """Populate _detail_cache from bronze for the projects we're about to pull.
+
+    Scoped to those projects on purpose: a full-history table is pointless to
+    load when the nightly run only touches the live jobs, and the rows for every
+    other project are preserved by the merge regardless.
+    """
+    if not REUSE_MEETING_DETAILS:
+        print("  REUSE_MEETING_DETAILS is off — every prep meeting will be re-fetched.")
+        return
+    if not (spark.catalog.tableExists("bronze_vendor_meeting_details")
+            and spark.catalog.tableExists("bronze_vendor_meeting_attendees")):
+        print("  No bronze meeting tables yet — first run, nothing to reuse.")
+        return
+
+    want = {str(i) for i in scope_ids}
+    try:
+        details = spark.table("bronze_vendor_meeting_details").collect()
+        atts = spark.table("bronze_vendor_meeting_attendees").collect()
+    except Exception as e:
+        print(f"  could not read the bronze meeting tables ({e}); re-fetching everything.")
+        return
+
+    by_meeting = {}
+    for a in atts:
+        d = _row_to_dict(a)
+        mid = str(d.get("meeting_procore_id"))
+        by_meeting.setdefault(mid, []).append(d)
+
+    for r in details:
+        d = _row_to_dict(r)
+        if str(d.get("project_procore_id")) not in want:
+            continue
+        mid = str(d.get("meeting_procore_id"))
+        _detail_cache[mid] = {"detail": d, "attendees": by_meeting.get(mid, [])}
+
+    print(f"  cache: {len(_detail_cache)} prep meeting(s) already in bronze for this scope.")
+
+
+def _settled(detail_row):
+    """True when the meeting is old enough that its record is done changing."""
+    if not REUSE_SETTLED_AFTER_DAYS:
+        return False
+    raw = detail_row.get("meeting_date") or detail_row.get("held_at")
+    if not raw:
+        return False
+    try:
+        when = datetime.fromisoformat(str(raw)[:19].replace("Z", ""))
+    except Exception:
+        return False
+    if when.tzinfo is not None:
+        when = when.replace(tzinfo=None)
+    return (datetime.utcnow() - when).days > REUSE_SETTLED_AFTER_DAYS
+
+
+def cached_meeting(mid, list_record, pid, pname):
+    """The stored (detail_row, attendee_rows) when this meeting is provably
+    unchanged, else None — in which case the caller pays for the detail call.
+
+    Returns rows with project_name refreshed (a project can be renamed without
+    any of its meetings changing) and the resolution version restamped.
+    """
+    hit = _detail_cache.get(str(mid))
+    if not hit:
+        return None
+    _reuse_stats["eligible"] += 1
+    detail = hit["detail"]
+
+    # A resolution change invalidates every cached row — see the ⚠️ on
+    # ATTENDEE_RESOLUTION_VERSION.
+    if str(detail.get("_resolution_version")) != str(ATTENDEE_RESOLUTION_VERSION):
+        _reuse_stats["stale_version"] += 1
+        _reuse_stats["refetched"] += 1
+        return None
+
+    stored = detail.get("source_updated_at")
+    live = pick(list_record, "updated_at", "updated_on")
+    if live and stored:
+        if str(live) != str(stored):
+            _reuse_stats["changed"] += 1
+            _reuse_stats["refetched"] += 1
+            return None
+    elif _settled(detail):
+        _reuse_stats["settled"] += 1          # no updated_at, but long since held
+    else:
+        _reuse_stats["no_updated_at"] += 1
+        _reuse_stats["refetched"] += 1
+        return None
+
+    _reuse_stats["reused"] += 1
+    d = dict(detail)
+    d["project_name"] = pname
+    d["project_procore_id"] = pid
+    return d, [dict(a) for a in hit["attendees"]]
 
 # ============================================================
 # 6. The pull
@@ -1124,6 +1295,9 @@ spark.udf.register("is_prep_title", looks_like_prep_meeting, _BoolT())
 meeting_summaries, meeting_details, meeting_attendees, project_users = [], [], [], []
 commitments, directory_vendors, sync_errors = [], [], []
 template_id_hits, attendance_shapes, raw_status_values = {}, {}, {}
+
+load_meeting_detail_cache([p.get("id") for p in scope])
+print()
 
 _t0, _n = time.time(), len(scope)
 
@@ -1310,10 +1484,21 @@ for pi, project in enumerate(scope, start=1):
                 if not is_prep:
                     continue
 
-                # Only prep candidates get the (expensive) detail call.
+                # Only prep candidates get the (expensive) detail call...
                 mid = m.get("id")
                 if mid is None:
                     continue
+
+                # ...and not even those, when bronze already holds a row this
+                # meeting cannot have changed since. This is the whole nightly
+                # saving: after a backfill the back catalogue costs 0 calls.
+                hit = cached_meeting(mid, m, pid, pname)
+                if hit:
+                    _cached_detail, _cached_atts = hit
+                    meeting_details.append(_cached_detail)
+                    meeting_attendees.extend(_cached_atts)
+                    continue
+
                 detail, status = request_json(
                     f"{PROCORE_API_BASE_URL}/rest/v1.1/projects/{pid}/meetings/{mid}",
                     {"company_id": company_id})
@@ -1342,6 +1527,13 @@ for pi, project in enumerate(scope, start=1):
                     "updated_at": detail.get("updated_at"),
                     "attendee_count": len(atts),
                     "detail_http_status": status,
+                    # What the NEXT run compares against. `updated_at` above is
+                    # the detail record's; this is the LIST record's, which is
+                    # what a later run sees before deciding whether to pay for
+                    # the detail call. They are not always the same field value,
+                    # so keep both.
+                    "source_updated_at": pick(m, "updated_at", "updated_on"),
+                    "_resolution_version": ATTENDEE_RESOLUTION_VERSION,
                     "raw_json": safe_json_dumps(detail),
                 })
 
@@ -1665,6 +1857,33 @@ else:
 # What the title rule threw away. This is the block to read after tightening it:
 # if a real preparatory meeting is in here, its title needs fixing in Procore or
 # the exclude pattern that caught it needs narrowing.
+# Did the cache actually save anything? A reuse rate of zero means every night
+# is still re-downloading the whole back catalogue — the failure this exists to
+# prevent, and one that is invisible without being counted.
+print("\n--- DETAIL-CALL REUSE (what this run did NOT have to fetch) ---")
+_rs = _reuse_stats
+if not REUSE_MEETING_DETAILS:
+    print("  disabled (REUSE_MEETING_DETAILS = False) — full sweep, everything re-fetched.")
+else:
+    print(f"  prep meetings already in bronze : {_rs['eligible']}")
+    print(f"  reused, no API call             : {_rs['reused']}"
+          + (f"  ({_rs['settled']} on the age rule, no updated_at)" if _rs["settled"] else ""))
+    print(f"  re-fetched                      : {_rs['refetched']}")
+    if _rs["changed"]:
+        print(f"    - {_rs['changed']} genuinely changed since last run")
+    if _rs["stale_version"]:
+        print(f"    - {_rs['stale_version']} built by an older resolution version "
+              f"(now {ATTENDEE_RESOLUTION_VERSION}) — expected once after a logic change")
+    if _rs["no_updated_at"]:
+        print(f"    - {_rs['no_updated_at']} could not be proven unchanged: the list record")
+        print("      carries no updated_at and the meeting is too recent to call settled.")
+    if _rs["eligible"] and not _rs["reused"]:
+        print("  ⚠️  NOTHING was reused despite bronze having rows. Every night is paying")
+        print("      for the whole back catalogue. Check that the list record carries")
+        print("      updated_at, or lower REUSE_SETTLED_AFTER_DAYS.")
+    elif _rs["reused"]:
+        print(f"  => {_rs['reused']} detail call(s) saved on this run.")
+
 print("\n--- PREP TITLE EXCLUSIONS (said 'prep' but named another meeting type) ---")
 if _prep_excluded_titles:
     for t, n in sorted(_prep_excluded_titles.items(), key=lambda kv: -kv[1])[:25]:

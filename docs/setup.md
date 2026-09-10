@@ -59,8 +59,9 @@ live — typically ~70 of the ~250 projects since 2024 — because a prep meetin
 finished last year is never scored. Pre-construction and awarded jobs are **kept**: a preparatory
 meeting happens *before* the vendor starts work, so those are exactly where they're being held now.
 
-Set `ACTIVE_PROJECTS_ONLY = False` only for a one-off historical backfill. Narrowing the scope is
-safe either way — out-of-scope projects keep their existing rows via the project-level merge.
+For the one-off reach back to 2024, use **`BACKFILL_ALL_HISTORY = True`** — see §3a. Narrowing the
+scope afterwards is safe: out-of-scope projects keep their existing rows via the project-level
+merge, which is exactly what lets the history be pulled once and then left alone.
 
 **If it spends most of its time in rate-limit pauses**, the run prints a warning telling you so.
 The usual cause is another notebook pulling from Procore at the same time — **Procore Nightly
@@ -76,7 +77,9 @@ what keeps this to minutes rather than the hours the Safety Dashboard's all-meet
 |---|---|
 | **COVERAGE DIAGNOSTIC** | Tells you whether BCI actually maintains commitments, the project directory, or both. Whichever covers more **projects** is the one your teams keep current — set the tracker's *vendor source* setting to match (step 5). ⚠️ Never read a `0` here on its own: it means "no roster rows", which is what both an empty tenant *and* a broken extraction look like. Read the next block first. |
 | **COMMITMENT VENDOR RESOLUTION** | Contracts fetched → vendors resolved → roster rows out. If contracts came back but the vendor count is 0, Procore is returning a contract shape this code doesn't recognize — print a `raw_json` from `bronze_vendor_commitments` (the block tells you how) and send it over. This block exists because exactly that happened: 1500 contracts were ingested, all lost their vendor name, and the resulting zero was mistaken for "BCI has no commitments". |
-| **meeting template id exposure** | If template id `383995` shows up, the API exposes it and you can set `PREP_REQUIRE_TEMPLATE_ID = True` for an exact filter instead of the `"prep"` title heuristic. If nothing appears, leave it `False`. |
+| **template id vs the title rule** | Informational only. The template id is NOT a reliable "this is a preparatory meeting" signal — the team builds pre-contract, kick-off and coordination meetings from template `383995` too, and an earlier version that took the union of template and title swept all of those into the tracker. A gap between the two counts is expected. Don't "improve" `PREP_MATCH_MODE` back to a union. |
+| **PREP TITLE EXCLUSIONS** | Every title dropped for naming a different kind of meeting. Check none of them is a genuine preparatory meeting; if one is, its title needs fixing in Procore or the exclude pattern needs narrowing. |
+| **DETAIL-CALL REUSE** | How many prep meetings this run did NOT have to re-fetch, and why the rest were re-fetched. Zero reuse while bronze holds rows = every night is re-downloading the back catalogue. See §3b. |
 | **attendee company coverage** | If `missing_company` is high, `attendee_company()` is looking in the wrong key for your tenant. Inspect a `raw_json` row in `bronze_vendor_meeting_attendees` and extend the candidate list. Title matching still works meanwhile, at lower confidence. |
 | **attendance status shapes** | If most rows are `unknown`, the Present/Absent/Distribution field is in a shape `attendance_status()` doesn't recognize. Leave *Require the vendor to be marked Present* **off** until this is clean. |
 
@@ -153,7 +156,65 @@ DROP TABLE IF EXISTS dbo.vendor_prep_attendees;
 DROP TABLE IF EXISTS dbo.vendor_prep_matches;
 ```
 
-## 3b. When to run it
+## 3a. The one-time 2024 backfill
+
+The nightly run only fetches **live** projects — that is what keeps it to ~9
+minutes. To see prep-meeting adoption back to the start of 2024 you need one
+wider run, once.
+
+1. In the notebook's ingest cell set **`BACKFILL_ALL_HISTORY = True`**.
+   (`PROJECTS_SINCE` is already `2024-01-01`.)
+2. Run the notebook. Expect **~20-30 minutes** — roughly 5 API calls per project
+   across ~250 projects, plus one per prep meeting found.
+3. Set it **back to `False`**.
+4. Run `build_vendor_gold.py` and the pipeline as usual.
+
+**The history survives every later nightly run**, and that is not a hopeful
+assumption — it is why `write_delta` takes `merge_project_ids`. Narrowing the
+scope sets `merge_ids`, and the write then keeps every row whose project is
+*not* in that list, replacing only the projects actually re-fetched. Without
+that branch a narrowed nightly run would delete the entire backfill on its first
+execution. Check it before changing anything in `write_delta`.
+
+To view the history once it lands: **Metrics tab → "Since 2024" → "Include
+finished"**. Both are needed. The scope chip matters more than the range chip —
+most 2024-25 projects have since closed out, so the default active-only view
+would show their meetings only for the handful of old jobs still running, making
+a genuine upward trend look like it never happened.
+
+## 3b. What the nightly run does NOT re-fetch
+
+A prep meeting that already happened cannot change, so re-downloading it every
+night buys nothing. After the backfill that would be hundreds of wasted calls a
+night.
+
+The meetings **list** is one call per project and unavoidable — it is how new
+meetings are discovered. The **detail** call (one per prep meeting) is the cost,
+and it is skipped when bronze already holds a row that is provably current:
+
+| Test | When it applies |
+|---|---|
+| `updated_at` on the list record matches what was stored | Preferred — exact. Procore bumps it on any edit. |
+| The meeting was held more than `REUSE_SETTLED_AFTER_DAYS` (45) ago | Fallback for a tenant whose list response omits `updated_at`; what makes carrying the 2024 history cheap. |
+
+Read the **DETAIL-CALL REUSE** diagnostic after each run. It prints how many
+meetings were reused and how many were re-fetched *and why*. A reuse count of
+zero while bronze holds rows means every night is still paying for the whole
+back catalogue — it says so explicitly rather than leaving you to infer it from
+the runtime.
+
+⚠️ **`ATTENDEE_RESOLUTION_VERSION` must be bumped whenever attendee company
+resolution changes** — the directory join, the email-domain fallback,
+`normalize_company`, attendance parsing. Cached rows carry the version that
+built them and a mismatch re-fetches them. Skip the bump and an improvement to
+resolution applies only to meetings held *after* it, while older ones keep
+whatever the old code decided: a split-brain that looks exactly like bad data.
+
+The age rule is a real trade — someone editing a year-old meeting's attendee
+list won't be noticed. Run a **full sweep occasionally** (monthly is plenty) by
+setting `REUSE_MEETING_DETAILS = False` for one run.
+
+## 3c. When to run it
 
 Two schedules: the **notebook** (`Vendor Compliance - Prep Meetings` — both cells run in one
 execution, ingest then gold) and the **pipeline**. Recommended:

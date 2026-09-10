@@ -1072,15 +1072,30 @@ export async function removeManualVendor(
  * recorded. The dashboard says as much next to the charts.
  * ==========================================================================*/
 
-export async function getMetrics(months: number): Promise<Record<string, unknown>> {
+/**
+ * Company-wide adoption metrics.
+ *
+ * `scope` matters more here than anywhere else. The default 'active' answers
+ * "how are we doing right now", which is what the safety team opens this for.
+ * But adoption over the last two years is a question about projects that have
+ * since FINISHED — filtering to active projects would show the 2024 backfill's
+ * meetings only for the handful of 2024 jobs still running, making a real
+ * upward trend look like it never happened. 'all' drops the stage filter so the
+ * history is measured against the projects that actually held the meetings.
+ */
+export async function getMetrics(
+  months: number,
+  scope: 'active' | 'all' = 'active',
+): Promise<Record<string, unknown>> {
   await ensureProjectColumnMeta();
   await ensureAdminTables();
   const s = await getSettings();
   const win = Math.max(1, Math.min(60, Math.floor(months)));
+  const metricsProjectFilter = scope === 'all' ? '1 = 1' : activeStageFilter('p');
 
   // ── Current adoption + coverage snapshot ────────────────────────────────
   const { rows: snap } = await db.query(`
-    WITH ${vendorStatusCTEs(s, activeStageFilter('p'))},
+    WITH ${vendorStatusCTEs(s, metricsProjectFilter)},
     per_project AS (
         SELECT project_id,
                SUM(CASE WHEN status <> 'not_applicable' THEN 1 ELSE 0 END) AS tracked,
@@ -1170,7 +1185,7 @@ export async function getMetrics(months: number): Promise<Record<string, unknown
 
   // ── Per-project leaderboard (current coverage) ──────────────────────────
   const { rows: leaderboard } = await db.query(`
-    WITH ${vendorStatusCTEs(s, activeStageFilter('p'))}
+    WITH ${vendorStatusCTEs(s, metricsProjectFilter)}
     SELECT
         proj.project_id, proj.project_name, proj.superintendent_name, proj.project_manager,
         SUM(CASE WHEN r.status <> 'not_applicable' THEN 1 ELSE 0 END) AS tracked,
