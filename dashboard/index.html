@@ -220,6 +220,11 @@ button.sec-t.closed .cnt{background:var(--muted)}
       <button class="chip" data-months="6">6 months</button>
       <button class="chip on" data-months="12">12 months</button>
       <button class="chip" data-months="24">24 months</button>
+      <button class="chip" data-months="36">Since 2024</button>
+      <span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>
+      <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)">Projects</span>
+      <button class="chip on" data-mscope="active">Active only</button>
+      <button class="chip" data-mscope="all">Include finished</button>
     </div>
     <div id="metrics-out"><div class="empty">Loading…</div></div>
   </section>
@@ -1042,7 +1047,7 @@ function drawChart(id, series, labels, opts){
 }
 
 /* ── Metrics ───────────────────────────────────────────── */
-var METRICS=null, MONTHS=12;
+var METRICS=null, MONTHS=12, MSCOPE='active';
 
 /* SQL only returns months that had meetings. Charting those consecutively
    would compress a six-month gap into one flat step and misrepresent the
@@ -1208,7 +1213,7 @@ function renderTopVendors(){
 async function loadMetrics(fresh){
   try{
     // api() already prepends /api — passing it here made this /api/api/metrics.
-    var r=await api('/metrics?months='+MONTHS+(fresh?'&fresh=1':''));
+    var r=await api('/metrics?months='+MONTHS+'&scope='+MSCOPE+(fresh?'&fresh=1':''));
     METRICS=r.data||null;
     renderMetrics();
   }catch(e){
@@ -1339,6 +1344,17 @@ document.addEventListener('click',function(e){
   if(t.matches && t.matches('.chip[data-months]')){
     MONTHS=Number(t.getAttribute('data-months'));
     Array.prototype.forEach.call(document.querySelectorAll('.chip[data-months]'),function(c){
+      c.classList.toggle('on', c===t);
+    });
+    loadMetrics(true);
+  }
+  /* Scope chip: "Include finished" drops the active-project filter so adoption
+     over the last two years is measured against the projects that actually held
+     the meetings. Most of those jobs have since closed out, so the active-only
+     view makes a real trend look like it never happened. */
+  if(t.matches && t.matches('.chip[data-mscope]')){
+    MSCOPE=t.getAttribute('data-mscope');
+    Array.prototype.forEach.call(document.querySelectorAll('.chip[data-mscope]'),function(c){
       c.classList.toggle('on', c===t);
     });
     loadMetrics(true);

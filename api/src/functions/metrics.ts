@@ -17,13 +17,18 @@ app.http('metrics', {
   handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
       const months = Number(request.query.get('months')) || 12;
+      // 'all' drops the active-project filter so historical adoption is measured
+      // against the projects that held the meetings, not just the jobs still
+      // running today. The cache key includes it — without that, whichever
+      // scope was requested first would be served to the other for 15 minutes.
+      const scope = request.query.get('scope') === 'all' ? 'all' : 'active';
       const fresh = isFresh(request);
-      const key = `metrics:${months}`;
+      const key = `metrics:${months}:${scope}`;
       if (!fresh) {
         const hit = cacheGet<HttpResponseInit>(key);
         if (hit) return hit;
       }
-      const data = await getMetrics(months);
+      const data = await getMetrics(months, scope);
       const response = meta(data, undefined, fresh ? 0 : 3600);
       if (!fresh) cacheSet(key, 900, response);
       return response;
