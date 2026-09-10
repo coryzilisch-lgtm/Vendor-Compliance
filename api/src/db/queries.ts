@@ -17,6 +17,15 @@ let projectMetaProbed = false;
 let projectsHasIsActive = false;
 let hasSuperTables = false;
 let meetingsHaveTitlePadded = false;
+/**
+ * Does dbo.vendor_project_scope exist? It records which projects the ingest
+ * actually pulled, which is the only way to tell "this job has no vendors" from
+ * "this job was never fetched" — the tracker showed both as "No Vendors", i.e.
+ * a gap in our coverage rendered as a fact about the job. Probed rather than
+ * assumed: it is a 5th mirror activity someone has to add, and naming a table
+ * that isn't there is a parse error that blanks the dashboard.
+ */
+let hasProjectScope = false;
 
 /**
  * The mirror pipeline AUTO-CREATES dbo.projects, so its column set follows
@@ -35,18 +44,22 @@ export async function ensureProjectColumnMeta(): Promise<void> {
   try {
     const { rows } = await db.query<{
       has_active: number | null; has_super: number | null; has_padded: number | null;
+      has_scope: number | null;
     }>(
       `SELECT COL_LENGTH('dbo.projects','is_active')                    AS has_active,
               OBJECT_ID('dbo.project_superintendents','U')              AS has_super,
-              COL_LENGTH('dbo.vendor_prep_meetings','title_padded')     AS has_padded`,
+              COL_LENGTH('dbo.vendor_prep_meetings','title_padded')     AS has_padded,
+              OBJECT_ID('dbo.vendor_project_scope','U')                 AS has_scope`,
     );
     projectsHasIsActive = rows[0]?.has_active != null;
     hasSuperTables = rows[0]?.has_super != null;
     meetingsHaveTitlePadded = rows[0]?.has_padded != null;
+    hasProjectScope = rows[0]?.has_scope != null;
   } catch {
     projectsHasIsActive = false;
     hasSuperTables = false;
     meetingsHaveTitlePadded = false;
+    hasProjectScope = false;
   }
   if (hasSuperTables) {
     try {
@@ -98,6 +111,47 @@ const NOT_COURSE_OF_CONSTRUCTION = [
 ];
 
 /** Active course-of-construction projects only. Requires ensureProjectColumnMeta(). */
+/**
+ * Project numbers the tracker never shows, matched as a PREFIX.
+ *
+ * `BB-26-050` and friends are budget/bid-board records, not jobs anyone holds a
+ * preparatory meeting on. Left in, they pad the denominator with projects that
+ * can only ever read 0%.
+ *
+ * ⚠️ This list is duplicated in `fabric/ingest_vendor_compliance.py`
+ * (EXCLUDED_PROJECT_NUMBER_PREFIXES) and the two must agree. The ingest copy
+ * stops them being FETCHED (saving the API calls); this copy stops them being
+ * DISPLAYED, which is what makes the exclusion take effect on data already in
+ * the database without waiting for a re-ingest. Neither is redundant.
+ *
+ * The match is prefix-plus-separator (`BB-…`, `BB …`) rather than a bare
+ * `LIKE 'BB%'`, so a real job numbered `BBQ-14` is not swept up with them.
+ */
+export const EXCLUDED_PROJECT_NUMBER_PREFIXES = ['BB'];
+
+/** True for a project that must never appear anywhere in the tracker. */
+export function notExcludedProject(alias = 'p'): string {
+  const n = `LTRIM(RTRIM(COALESCE(${alias}.project_number, '')))`;
+  const clauses = EXCLUDED_PROJECT_NUMBER_PREFIXES.flatMap((pre) => [
+    `UPPER(${n}) NOT LIKE '${pre.toUpperCase()}-%'`,
+    `UPPER(${n}) NOT LIKE '${pre.toUpperCase()} %'`,
+  ]);
+  return clauses.join('\n      AND ');
+}
+
+/**
+ * The project filter for a given scope, WITH the exclusions applied.
+ *
+ * Use this rather than writing `scope === 'all' ? '1 = 1' : activeStageFilter()`
+ * inline: that idiom was in five places, and '1 = 1' means the exclusions get
+ * dropped exactly when the widest set of projects is on screen — the one view
+ * where an unwanted project is most likely to show up.
+ */
+export function scopedProjectFilter(scope: 'active' | 'all', alias = 'p'): string {
+  const base = scope === 'all' ? '1 = 1' : activeStageFilter(alias);
+  return `${base}\n      AND ${notExcludedProject(alias)}`;
+}
+
 export function activeStageFilter(alias = 'p'): string {
   const s = `LOWER(COALESCE(${alias}.stage, ''))`;
   const base = `${s} LIKE '%construction%'
@@ -787,6 +841,9 @@ export type ProjectSummary = {
   last_meeting_date: string | null;
   prep_meeting_count: number;
   unmatched_meeting_count: number;
+  /** 1 = the ingest pulled this project; 0 = it never did; null = we can't tell
+   *  (dbo.vendor_project_scope not mirrored yet). Never render 0 as "no vendors". */
+  ingested: number | null;
 };
 
 /** One row per active project — the tracker's landing view. */
@@ -794,7 +851,7 @@ export async function getProjectSummaries(scope: 'active' | 'all'): Promise<Proj
   await ensureProjectColumnMeta();
   await ensureAdminTables();
   const s = await getSettings();
-  const projectFilter = scope === 'all' ? '1 = 1' : activeStageFilter('p');
+  const projectFilter = scopedProjectFilter(scope, 'p');
 
   const { rows } = await db.query<ProjectSummary>(`
     WITH ${vendorStatusCTEs(s, projectFilter)},
@@ -828,6 +885,12 @@ export async function getProjectSummaries(scope: 'active' | 'all'): Promise<Proj
         COALESCE(agg.vendor_held, 0)           AS vendor_held,
         COALESCE(agg.vendor_outstanding, 0)    AS vendor_outstanding,
         COALESCE(agg.vendor_not_applicable, 0) AS vendor_not_applicable,
+        ${hasProjectScope
+          ? `CASE WHEN scp.project_id IS NULL THEN 0 ELSE 1 END AS ingested,
+        scp.status_project_vendors, scp.status_work_order,`
+          : `CAST(NULL AS INT) AS ingested,
+        CAST(NULL AS NVARCHAR(8)) AS status_project_vendors,
+        CAST(NULL AS NVARCHAR(8)) AS status_work_order,`}
         CASE WHEN COALESCE(agg.vendor_total, 0) = 0 THEN NULL
              ELSE ROUND(100.0 * agg.vendor_held / agg.vendor_total, 0) END AS pct_complete,
         CONVERT(VARCHAR(10), agg.last_meeting_date, 23) AS last_meeting_date,
@@ -836,6 +899,9 @@ export async function getProjectSummaries(scope: 'active' | 'all'): Promise<Proj
     FROM proj
     LEFT JOIN agg ON agg.project_id = proj.project_id
     LEFT JOIN mtg ON mtg.project_id = proj.project_id
+    ${hasProjectScope
+      ? 'LEFT JOIN dbo.vendor_project_scope scp ON scp.project_id = proj.project_id'
+      : ''}
     ORDER BY proj.project_name;
   `);
   return rows;
@@ -935,7 +1001,7 @@ export async function getProjectDetail(projectId: number): Promise<{
 export async function getUnmatchedMeetings(scope: 'active' | 'all'): Promise<Record<string, unknown>[]> {
   await ensureProjectColumnMeta();
   const s = await getSettings();
-  const projectFilter = scope === 'all' ? '1 = 1' : activeStageFilter('p');
+  const projectFilter = scopedProjectFilter(scope, 'p');
   // `suggested_vendor` is a name-variant candidate gold found but the settings
   // do not credit — the title names a company that IS on this project's roster
   // under a longer legal name, and exactly one vendor fits. Showing it turns a
@@ -1091,7 +1157,7 @@ export async function getMetrics(
   await ensureAdminTables();
   const s = await getSettings();
   const win = Math.max(1, Math.min(60, Math.floor(months)));
-  const metricsProjectFilter = scope === 'all' ? '1 = 1' : activeStageFilter('p');
+  const metricsProjectFilter = scopedProjectFilter(scope, 'p');
 
   // ── Current adoption + coverage snapshot ────────────────────────────────
   const { rows: snap } = await db.query(`
@@ -1244,6 +1310,6 @@ export async function getRosterCoverage(): Promise<Record<string, unknown>> {
       COUNT(*)                     AS vendor_rows_any
     FROM dbo.vendor_roster r
     JOIN dbo.projects p ON p.id = r.project_id
-    WHERE ${activeStageFilter('p')};`);
+    WHERE ${scopedProjectFilter('active', 'p')};`);
   return rows[0] ?? {};
 }

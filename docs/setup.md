@@ -112,6 +112,14 @@ database, schema `dbo`:
 | `gold_vendor_prep_meetings` | `vendor_prep_meetings` | `IF OBJECT_ID('dbo.vendor_prep_meetings','U') IS NOT NULL DELETE FROM dbo.vendor_prep_meetings;` |
 | `gold_vendor_prep_attendees` | `vendor_prep_attendees` | `IF OBJECT_ID('dbo.vendor_prep_attendees','U') IS NOT NULL DELETE FROM dbo.vendor_prep_attendees;` |
 | `gold_vendor_prep_matches` | `vendor_prep_matches` | `IF OBJECT_ID('dbo.vendor_prep_matches','U') IS NOT NULL DELETE FROM dbo.vendor_prep_matches;` |
+| `gold_vendor_project_scope` | `vendor_project_scope` | `IF OBJECT_ID('dbo.vendor_project_scope','U') IS NOT NULL DELETE FROM dbo.vendor_project_scope;` |
+
+**The 5th activity is worth adding even though nothing breaks without it.** It
+records which projects the ingest actually pulled, which is the only way the
+tracker can tell *"this job has no vendors"* from *"this job was never
+fetched"* — it used to render both as **No vendors**, i.e. a gap in our coverage
+displayed as a fact about the job. Without the table the API probes for it,
+finds it absent, and shows neither claim.
 
 On every activity: **Destination → Advanced → Table option → Auto create table** ✅.
 
@@ -155,6 +163,37 @@ DROP TABLE IF EXISTS dbo.vendor_prep_meetings;
 DROP TABLE IF EXISTS dbo.vendor_prep_attendees;
 DROP TABLE IF EXISTS dbo.vendor_prep_matches;
 ```
+
+## 2b. "No vendors" on a project you know has vendors
+
+Three different situations produce that, and they need different fixes. The
+ingest's **PROJECTS WITH NO VENDORS** diagnostic names which one you have, per
+project, with the HTTP status that produced it:
+
+| What you see | What it means | Fix |
+|---|---|---|
+| Tracker chip says **Not ingested** | The project is in `dbo.projects` (mirrored by the safety pipeline) but the vendor notebook has never pulled it. Its vendors are *unknown*, not absent. | Run once with `BACKFILL_ALL_HISTORY = True` (§3a) |
+| Diagnostic shows **403 / 404** on its roster endpoints | The API service account has no access to that project's tool. You can see its vendors in Procore because *you* have access — it can't. Same failure that hid private Observations from the safety dashboard. | Grant the service account access in Procore, then re-run |
+| Diagnostic shows **200 with zero rows** | Procore is genuinely reporting no directory companies and no commitments. | If you can see vendors on that job in Procore, send the project number — that would mean the account sees a different view than you do |
+
+The *vendor source* setting can also hide vendors that were ingested — check
+Settings before concluding anything from an empty checklist.
+
+## 2c. Projects the tracker never shows
+
+Project numbers beginning **`BB-`** (budget / bid-board records like
+`BB-26-050`) are excluded. They are not jobs anyone holds a preparatory meeting
+on, and left in they pad the denominator with rows that can only read 0%.
+
+The rule lives in **two places on purpose**: `EXCLUDED_PROJECT_NUMBER_PREFIXES`
+in `fabric/ingest_vendor_compliance.py` stops them being *fetched* (saving ~5
+API calls each), and the copy in `api/src/db/queries.ts` stops them being
+*displayed* — which is what makes the exclusion apply to rows already in the
+database without waiting for a re-ingest. **Keep the two lists the same.**
+
+Matching is prefix-plus-separator (`BB-…`, `BB …`), not a bare `LIKE 'BB%'`, so
+a real job numbered `BBQ-14` isn't swept up with them. To exclude another
+prefix, add it to both lists.
 
 ## 3a. The one-time 2024 backfill
 

@@ -44,7 +44,11 @@ const STUB = {
       pct: 75, last_meeting_date: '2026-03-17', unmatched_count: 2 },
     { project_id: 3387062, project_name: 'AEP Eagle Pass Service Center', project_number: '25-004',
       superintendent: null, vendor_count: 20, held_count: 0, outstanding_count: 20,
-      pct: 0, last_meeting_date: null, unmatched_count: 4 },
+      pct: 0, last_meeting_date: null, unmatched_count: 4, ingested: 1 },
+    { project_id: 3119932, project_name: 'An Old 2024 Job', project_number: '24-007',
+      superintendent: null, vendor_count: 0, held_count: 0, outstanding_count: 0,
+      vendor_total: 0, pct: null, last_meeting_date: null, unmatched_count: 0,
+      ingested: 0 },
   ],
   '/api/projects/3176472': {
     project: { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', pct: 75 },

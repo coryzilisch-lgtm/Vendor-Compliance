@@ -280,6 +280,46 @@ WHERE r.vendor_normalized IS NOT NULL
 """)
 
 # ============================================================
+# 3b. gold_vendor_project_scope — which projects were actually pulled
+#
+# The tracker cannot otherwise tell "we fetched this job and it has no vendors"
+# apart from "we never fetched this job", and it renders both as "No Vendors".
+# One is a fact about the job; the other is a fact about our ingest, and showing
+# the second as the first is how a gap in coverage gets read as a business
+# result. Falls open to an empty stub when the silver table isn't there yet, so
+# an older ingest cell doesn't break the build.
+# ============================================================
+if table_exists("silver_vendor_project_scope"):
+    spark.sql("""
+    CREATE OR REPLACE TABLE gold_vendor_project_scope AS
+    SELECT project_procore_id AS project_id, project_name, project_number,
+           directory_vendors, commitment_vendors, commitment_rows,
+           project_users, prep_meetings,
+           status_project_vendors, status_work_order, status_purchase_order,
+           status_meetings, ingested_at,
+           current_timestamp() AS _fabric_loaded_at
+    FROM silver_vendor_project_scope
+    """)
+else:
+    print("  silver_vendor_project_scope missing — re-paste the ingest cell; "
+          "emitting an empty gold_vendor_project_scope so the build completes.")
+    spark.sql("""
+    CREATE OR REPLACE TABLE gold_vendor_project_scope AS
+    SELECT CAST(NULL AS BIGINT) AS project_id, CAST(NULL AS STRING) AS project_name,
+           CAST(NULL AS STRING) AS project_number,
+           CAST(NULL AS INT) AS directory_vendors, CAST(NULL AS INT) AS commitment_vendors,
+           CAST(NULL AS INT) AS commitment_rows, CAST(NULL AS INT) AS project_users,
+           CAST(NULL AS INT) AS prep_meetings,
+           CAST(NULL AS STRING) AS status_project_vendors,
+           CAST(NULL AS STRING) AS status_work_order,
+           CAST(NULL AS STRING) AS status_purchase_order,
+           CAST(NULL AS STRING) AS status_meetings,
+           CAST(NULL AS STRING) AS ingested_at,
+           current_timestamp() AS _fabric_loaded_at
+    WHERE 1 = 0
+    """)
+
+# ============================================================
 # 4. gold_vendor_prep_meetings / gold_vendor_prep_attendees
 # ============================================================
 spark.sql("""
@@ -480,7 +520,7 @@ WHERE v.fits = 1
 print("\n" + "=" * 64)
 print("ROW COUNTS")
 print("=" * 64)
-for t in ("gold_vendor_roster", "gold_vendor_prep_meetings",
+for t in ("gold_vendor_roster", "gold_vendor_project_scope", "gold_vendor_prep_meetings",
           "gold_vendor_prep_attendees", "gold_vendor_prep_matches"):
     print(f"  {t}: {spark.table(t).count()}")
 

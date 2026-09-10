@@ -433,7 +433,17 @@ function renderProjects(){
       +'<td class="num">'+esc(p.vendor_held)+'</td>'
       +'<td class="num">'+(p.vendor_outstanding>0
           ? '<span class="pill notheld">'+esc(p.vendor_outstanding)+'</span>' : '0')+'</td>'
-      +'<td>'+(p.vendor_total===0
+      /* `ingested === 0` means the vendor ingest has never pulled this project —
+         it is in dbo.projects (mirrored by the safety pipeline) but outside the
+         scope this notebook ran with. That is a gap in OUR coverage, not a fact
+         about the job, and rendering it as "No vendors" is how the two got
+         confused. `null` = the scope table isn't mirrored yet, so we can't tell
+         and don't claim either way. */
+      +'<td>'+(Number(p.ingested)===0
+          ? '<span class="pill info" title="This project has never been pulled by the '
+            +'vendor ingest — run the notebook with BACKFILL_ALL_HISTORY = True. '
+            +'Its vendors are unknown, not absent.">Not ingested</span>'
+        : p.vendor_total===0
           ? '<span class="pill warn">No vendors</span>'
           : '<span class="bar"><i class="'+(pct===100?'done':'')+'" style="width:'+barW+'%"></i></span>'
             +'<span class="pct">'+barW+'%</span>')+'</td>'
@@ -592,9 +602,16 @@ async function openProject(pid){
 
     var body='';
     if(!vendors.length){
-      body+='<div class="note warn">No vendors are on this project\'s checklist. Either Procore '
-        +'has no commitments or directory companies for the job, or the current <b>vendor source</b> '
-        +'setting is filtering them all out. Check Settings, or add a vendor manually.</div>';
+      body+='<div class="note warn">No vendors are on this project\'s checklist. Three '
+        +'different things look like this, and they need different fixes:<br>'
+        +'<b>1.</b> The vendor ingest has never pulled this project — likely if it is an older '
+        +'job. Run the notebook once with <code>BACKFILL_ALL_HISTORY = True</code>.<br>'
+        +'<b>2.</b> Procore returned 403/404 for its roster, meaning the API service account '
+        +'has no access to that project. You can see its vendors because you have access; it '
+        +'cannot. The ingest\'s <b>PROJECTS WITH NO VENDORS</b> diagnostic names these.<br>'
+        +'<b>3.</b> The job genuinely has no directory companies and no commitments.<br>'
+        +'The <b>vendor source</b> setting can also hide them — check Settings, or add a '
+        +'vendor manually.</div>';
     }
     if(unmatched.length){
       body+='<div class="note warn"><b>'+esc(unmatched.length)+' prep meeting'
