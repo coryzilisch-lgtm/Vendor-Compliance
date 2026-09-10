@@ -159,6 +159,7 @@ _attendee_keys = {}   # top-level keys seen on attendee objects
 _endpoint_status = {} # (endpoint, http status) -> count, to tell 403 from empty
 _withheld = {}        # endpoint -> projects where Total exceeded the rows returned
 _last_total = {"value": None}  # Procore's Total header from the most recent response
+_last_status = {}     # endpoint label -> the status code its last call returned
 _date_key_samples = {}  # date-ish keys actually present on meeting records
 _commitment_paths = {}  # which JSON path yielded each commitment's vendor
 _commitment_view  = {}  # endpoint -> the `view` param that actually carries vendors
@@ -299,6 +300,19 @@ REUSE_SETTLED_AFTER_DAYS = 45
 #   3: title-only prep rule (2026-09)
 ATTENDEE_RESOLUTION_VERSION = 3
 
+# ---- Project numbers that are never real jobs -------------------------------
+# `BB-26-050` and friends are budget / bid-board records, not jobs anyone holds
+# a preparatory meeting on. Excluded from the scope so the run doesn't spend ~5
+# API calls each on them, and excluded again in the API so the rule applies to
+# rows already in the database without waiting for a re-ingest.
+#
+# ⚠️ Duplicated in `api/src/db/queries.ts` (EXCLUDED_PROJECT_NUMBER_PREFIXES).
+# Keep the two lists the same.
+#
+# Matched as prefix-plus-separator (`BB-…`, `BB …`), NOT a bare startswith, so a
+# real job numbered `BBQ-14` isn't swept up with them.
+EXCLUDED_PROJECT_NUMBER_PREFIXES = ["BB"]
+
 # ---- Targeted re-ingest -----------------------------------------------------
 # Non-empty => pull ONLY these projects and merge them back over the existing
 # bronze rows (every other project is preserved). Set back to [] when done.
@@ -435,6 +449,11 @@ def request_json(url, params=None, allow_404=True):
 
 
 def _note_status(label, status, total=None, returned=None):
+    # Remember the most recent status per endpoint so the per-project coverage
+    # row below can say WHY a project came back with no vendors. A 403 on an old
+    # job (the service account was removed from its directory) and a genuine
+    # empty roster are indistinguishable without this.
+    _last_status[label] = status
     key = (label, status)
     _endpoint_status[key] = _endpoint_status.get(key, 0) + 1
     # Procore's `Total` header is the full server-side count. When it exceeds
@@ -1080,6 +1099,26 @@ def in_since_window(p):
     return (not ds) or max(ds) >= PROJECTS_SINCE
 
 
+_excluded_numbers = {}
+
+
+def project_number_of(p):
+    return str(pick(p, "project_number", "number", "job_number") or "").strip()
+
+
+def is_excluded_project(p):
+    """True for a project number the tracker never shows."""
+    num = project_number_of(p).upper()
+    for pre in EXCLUDED_PROJECT_NUMBER_PREFIXES:
+        pre = pre.upper()
+        # prefix followed by a separator — "BB-26-050" and "BB 26-050" match,
+        # "BBQ-14" does not.
+        if num.startswith(pre) and len(num) > len(pre) and not num[len(pre)].isalnum():
+            _excluded_numbers[project_number_of(p)] = p.get("name")
+            return True
+    return False
+
+
 def looks_completed(p):
     """Projected finish more than COMPLETED_GRACE_DAYS in the past."""
     ends = [str(p.get(k))[:10] for k in ("projected_finish_date", "completion_date") if p.get(k)]
@@ -1124,6 +1163,16 @@ else:
         p for p in all_projects
         if p.get("active") is not False
         and str(p.get("status") or "").lower() not in ("inactive", "closed", "archived")]
+
+# Drop the never-real project numbers first, so no later filter has to know
+# about them and no API call is ever spent on one.
+_before_excl = len(scope)
+scope = [p for p in scope if not is_excluded_project(p)]
+if _before_excl != len(scope):
+    print(f"  excluded {_before_excl - len(scope)} project(s) by number prefix "
+          f"{EXCLUDED_PROJECT_NUMBER_PREFIXES}: "
+          + ", ".join(sorted(_excluded_numbers)[:8])
+          + (" ..." if len(_excluded_numbers) > 8 else ""))
 
 merge_ids = None
 
@@ -1294,6 +1343,7 @@ def cached_meeting(mid, list_record, pid, pname):
 # ============================================================
 meeting_summaries, meeting_details, meeting_attendees, project_users = [], [], [], []
 commitments, directory_vendors, sync_errors = [], [], []
+project_scope = []
 template_id_hits, attendance_shapes, raw_status_values = {}, {}, {}
 
 load_meeting_detail_cache([p.get("id") for p in scope])
@@ -1591,6 +1641,29 @@ for pi, project in enumerate(scope, start=1):
             print(f"  meetings failed: project={pid}: {e}")
             sync_errors.append({"project_procore_id": pid, "stage": "meetings",
                                 "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
+    # ---- 6e. What did this project actually yield? -------------------------
+    # One row per project the run LOOKED AT, whether or not it found anything.
+    # This is what lets the dashboard tell "no vendors on this job" apart from
+    # "this job was never ingested" — which currently render identically as
+    # "No Vendors", i.e. an absence of data displayed as a fact about the job.
+    project_scope.append({
+        "project_procore_id": pid,
+        "project_name": pname,
+        "project_number": project_number_of(project),
+        "directory_vendors": sum(1 for v in directory_vendors
+                                 if v["project_procore_id"] == pid),
+        "commitment_vendors": sum(1 for c in commitments
+                                  if c["project_procore_id"] == pid and c.get("vendor_name")),
+        "commitment_rows": sum(1 for c in commitments if c["project_procore_id"] == pid),
+        "project_users": sum(1 for u in project_users if u["project_procore_id"] == pid),
+        "prep_meetings": sum(1 for m in meeting_details if m["project_procore_id"] == pid),
+        "status_project_vendors": _last_status.get("project_vendors"),
+        "status_work_order": _last_status.get("work_order_contracts"),
+        "status_purchase_order": _last_status.get("purchase_order_contracts"),
+        "status_meetings": _last_status.get("meetings"),
+        "ingested_at": datetime.now(timezone.utc).isoformat(),
+    })
+
     if pi % 10 == 0 or pi == _n:
         el = time.time() - _t0
         eta = (el / pi) * (_n - pi)
@@ -1643,7 +1716,10 @@ write_delta(directory_vendors, "bronze_vendor_directory",
                         "vendor_normalized"],
             merge_project_ids=merge_ids)
 if sync_errors:
-    write_delta(sync_errors, "bronze_vendor_sync_errors")
+    write_delta(project_scope, "bronze_vendor_project_scope",
+            empty_cols=["project_procore_id", "project_name", "project_number"],
+            merge_project_ids=merge_ids)
+write_delta(sync_errors, "bronze_vendor_sync_errors")
 
 # ============================================================
 # 8. Silver
@@ -1700,6 +1776,30 @@ SELECT
     _fabric_loaded_at
 FROM bronze_vendor_meeting_attendees
 WHERE meeting_procore_id IS NOT NULL
+""")
+
+# One row per project the ingest actually looked at. Small, and the only thing
+# in the whole pipeline that can distinguish "this job has no vendors" from
+# "this job was never pulled".
+spark.sql("""
+CREATE OR REPLACE TABLE silver_vendor_project_scope AS
+SELECT
+    CAST(project_procore_id AS BIGINT) AS project_procore_id,
+    project_name,
+    project_number,
+    CAST(directory_vendors  AS INT)    AS directory_vendors,
+    CAST(commitment_vendors AS INT)    AS commitment_vendors,
+    CAST(commitment_rows    AS INT)    AS commitment_rows,
+    CAST(project_users      AS INT)    AS project_users,
+    CAST(prep_meetings      AS INT)    AS prep_meetings,
+    status_project_vendors,
+    status_work_order,
+    status_purchase_order,
+    status_meetings,
+    ingested_at,
+    _fabric_loaded_at
+FROM bronze_vendor_project_scope
+WHERE project_procore_id IS NOT NULL
 """)
 
 # One row per (project, vendor), carrying BOTH provenance flags so the dashboard
@@ -1860,6 +1960,39 @@ else:
 # Did the cache actually save anything? A reuse rate of zero means every night
 # is still re-downloading the whole back catalogue — the failure this exists to
 # prevent, and one that is invisible without being counted.
+# ---- Projects the run looked at and found nothing on ------------------------
+# The question this answers: a project shows "No Vendors" in the tracker — did
+# we fetch it and it really has none, or did the fetch come back empty for a
+# reason? A 403 here means the API service account is not on that project's
+# directory, which is common on old jobs and is a PERMISSION story, not a data
+# one. You can see those vendors in Procore because you have access; it doesn't.
+print("\n--- PROJECTS WITH NO VENDORS (and the HTTP status that produced it) ---")
+_empty = [r for r in project_scope
+          if not r["directory_vendors"] and not r["commitment_vendors"]]
+if not _empty:
+    print(f"  none — all {len(project_scope)} project(s) in scope yielded at least one vendor.")
+else:
+    print(f"  {len(_empty)} of {len(project_scope)} project(s) in scope came back with no vendors.")
+    _by_status = {}
+    for r in _empty:
+        k = (r["status_project_vendors"], r["status_work_order"], r["status_purchase_order"])
+        _by_status.setdefault(k, []).append(r)
+    for (sv, wo, po), rows in sorted(_by_status.items(), key=lambda kv: -len(kv[1])):
+        print(f"  vendors HTTP {sv} / work_order {wo} / purchase_order {po}: {len(rows)} project(s)")
+        for r in rows[:5]:
+            print(f"      {r['project_number'] or '(no number)':<14} {str(r['project_name'])[:44]}")
+        if len(rows) > 5:
+            print(f"      ... and {len(rows) - 5} more")
+        if 403 in (sv, wo, po) or 404 in (sv, wo, po):
+            print("      ^ 403/404 = the API service account has no access to that project's")
+            print("        tool. NOT an empty roster. Grant it access in Procore (the same")
+            print("        fix as the safety dashboard's private Observations) and re-run.")
+        elif (sv, wo, po) == (200, 200, 200):
+            print("      ^ all 200 with zero rows: Procore says these jobs genuinely have no")
+            print("        vendors on the directory AND no commitments written. If you can see")
+            print("        vendors on one of these in Procore, send me its project number —")
+            print("        that would mean the account sees a different view than you do.")
+
 print("\n--- DETAIL-CALL REUSE (what this run did NOT have to fetch) ---")
 _rs = _reuse_stats
 if not REUSE_MEETING_DETAILS:
