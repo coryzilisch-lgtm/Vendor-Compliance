@@ -416,6 +416,15 @@ docs/setup.md                        the deploy runbook — start here for anyth
 
 - **`mssql`/`tedious` cannot connect to `*.datawarehouse.fabric.microsoft.com`.** Fabric **SQL
   Database** (`*.database.fabric.microsoft.com`) only. Not fixable by any driver option.
+- **`Number(null)` is `0`, and that turns "unknown" into a definite claim.** The "Not ingested"
+  chip was written as `Number(p.ingested)===0`. The API returns `ingested: null` until
+  `dbo.vendor_project_scope` is mirrored — so every project on the board was labelled never-fetched,
+  including ones showing 38 vendors and a prep meeting. Check `=== null || === undefined` first, and
+  where the UI makes a claim about our own coverage, also refuse to make it about a row that is
+  visibly displaying fetched data: a self-contradicting row is worse than no chip.
+  ⚠️ **A stub that OMITS a field cannot reproduce this** — `Number(undefined)` is `NaN`, which fails
+  the comparison and passes the test. The smoke-test fixture carries an explicit `null` for exactly
+  this reason; keep it that way.
 - **A count of zero is never evidence on its own.** It is what an empty tenant, a
   permission-filtered endpoint, and a row-dropping filter all look like from the outside. Procore
   list endpoints are permission-filtered (this is how private Observations hid from the safety
