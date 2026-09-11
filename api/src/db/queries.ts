@@ -866,6 +866,9 @@ export type ProjectSummary = {
   last_meeting_date: string | null;
   prep_meeting_count: number;
   unmatched_meeting_count: number;
+  /** Prep meetings on this project still in agenda state; null when the mirror
+   *  hasn't carried `meeting_state` yet. */
+  awaiting_minutes_count: number | null;
   /** 1 = the ingest pulled this project; 0 = it never did; null = we can't tell
    *  (dbo.vendor_project_scope not mirrored yet). Never render 0 as "no vendors". */
   ingested: number | null;
@@ -893,7 +896,13 @@ export async function getProjectSummaries(scope: 'active' | 'all'): Promise<Proj
     mtg AS (
         SELECT m.project_id,
                COUNT(*) AS prep_meeting_count,
-               SUM(CASE WHEN x.meeting_id IS NULL THEN 1 ELSE 0 END) AS unmatched_meeting_count
+               SUM(CASE WHEN x.meeting_id IS NULL THEN 1 ELSE 0 END) AS unmatched_meeting_count,
+               -- Prep meetings still sitting as an agenda. They DID happen and
+               -- they count; attendance simply can't be recorded until someone
+               -- converts them, so this is an action list, not a failure count.
+               ${hasMeetingState
+                 ? `SUM(CASE WHEN m.meeting_state = 'agenda' THEN 1 ELSE 0 END)`
+                 : `CAST(NULL AS INT)`} AS awaiting_minutes_count
         FROM dbo.vendor_prep_meetings m
         LEFT JOIN (${countedMeetingIds(s)}) x
                ON x.meeting_id = m.meeting_id
@@ -920,7 +929,8 @@ export async function getProjectSummaries(scope: 'active' | 'all'): Promise<Proj
              ELSE ROUND(100.0 * agg.vendor_held / agg.vendor_total, 0) END AS pct_complete,
         CONVERT(VARCHAR(10), agg.last_meeting_date, 23) AS last_meeting_date,
         COALESCE(mtg.prep_meeting_count, 0)      AS prep_meeting_count,
-        COALESCE(mtg.unmatched_meeting_count, 0) AS unmatched_meeting_count
+        COALESCE(mtg.unmatched_meeting_count, 0) AS unmatched_meeting_count,
+        mtg.awaiting_minutes_count
     FROM proj
     LEFT JOIN agg ON agg.project_id = proj.project_id
     LEFT JOIN mtg ON mtg.project_id = proj.project_id
@@ -951,6 +961,8 @@ export type VendorRow = {
   has_attendee_match: number;
   has_title_match: number;
   has_variant_match: number;
+  /** Agenda/minutes state of the meeting that credited this vendor. */
+  meeting_state: string | null;
   override_status: string | null;
   override_note: string | null;
   override_by: string | null;
@@ -977,7 +989,16 @@ export async function getProjectDetail(projectId: number): Promise<{
         CONVERT(VARCHAR(10), COALESCE(override_meeting_date, meeting_date), 23) AS meeting_date,
         match_method, matched_attendee_name, attendance_status,
         meeting_count, has_attendee_match, has_title_match, has_variant_match,
-        override_status, override_note, override_by
+        override_status, override_note, override_by,
+        -- Joined here rather than threaded through eligible_raw's four UNION
+        -- branches: one join, one place to be wrong. A vendor credited off a
+        -- meeting still in agenda state is a weaker claim than one credited off
+        -- recorded attendance, and the row says so.
+        ${hasMeetingState
+          ? `(SELECT TOP 1 COALESCE(mm.meeting_state, 'unknown')
+                FROM dbo.vendor_prep_meetings mm
+               WHERE mm.meeting_id = resolved.meeting_id)`
+          : `CAST(NULL AS NVARCHAR(16))`} AS meeting_state
     FROM resolved
     ORDER BY CASE status WHEN 'not_held' THEN 0 WHEN 'held' THEN 1 ELSE 2 END, vendor_name;
   `,
@@ -996,6 +1017,8 @@ export async function getProjectDetail(projectId: number): Promise<{
     `SELECT m.meeting_id, m.title, CONVERT(VARCHAR(10), m.meeting_date, 23) AS meeting_date,
             m.held, m.attendee_count, m.vendor_attendee_count, m.vendor_attendees_present,
             m.series_name, m.location,
+            ${hasMeetingState ? `COALESCE(m.meeting_state, 'unknown')` : `CAST(NULL AS NVARCHAR(16))`}
+              AS meeting_state,
             (SELECT COUNT(DISTINCT x.vendor_normalized) FROM dbo.vendor_prep_matches x
               WHERE x.meeting_id = m.meeting_id
                 AND ${matchPredicate(s, 'x')}) AS matched_vendor_count,
@@ -1017,7 +1040,22 @@ export async function getProjectDetail(projectId: number): Promise<{
 }
 
 /**
- * Prep meetings the matcher could not credit to any vendor. This is the
+ * The Review Queue: prep meetings that need something done to them.
+ *
+ * TWO reasons, deliberately in one list, because they are one person's worklist:
+ *
+ *  - `no_vendor`  — credited to no vendor at all. Either the sub is missing
+ *                   from both Procore rosters or the title names nobody.
+ *  - `needs_minutes` — still an AGENDA. Attendance cannot be recorded until it
+ *                   is converted, so this meeting can never be credited by the
+ *                   attendee signal no matter how long it sits there.
+ *
+ * ⚠️ An agenda-state meeting belongs here EVEN IF it already title-matched a
+ * vendor. Restricting the queue to unmatched meetings (its first form) hid
+ * exactly the meetings that need converting: once title and name-variant
+ * matching started crediting them, they dropped off the list while still
+ * missing their attendance record. The queue went from 26 rows to 1 — not
+ * because the work was done, but because the work became invisible. This is the
  * tracker's honest blind spot — a meeting was held and logged, but nothing ties
  * it to a company on the roster (usually a meeting titled with a person's name,
  * or a sub who never made it onto either Procore roster). Surfacing them beats
@@ -1039,6 +1077,8 @@ export async function getUnmatchedMeetings(scope: 'active' | 'all'): Promise<Rec
            ${hasMeetingState
              ? `COALESCE(m.meeting_state, 'unknown')`
              : `CAST(NULL AS NVARCHAR(16))`}   AS meeting_state,
+           CASE WHEN x.meeting_id IS NULL THEN 'no_vendor' ELSE 'needs_minutes' END
+             AS review_reason,
            sug.vendor_name       AS suggested_vendor,
            sug.vendor_normalized AS suggested_vendor_normalized
     FROM dbo.vendor_prep_meetings m
@@ -1052,9 +1092,10 @@ export async function getUnmatchedMeetings(scope: 'active' | 'all'): Promise<Rec
           AND v.match_method = 'title_variant'
         ORDER BY v.vendor_name
     ) sug
-    WHERE x.meeting_id IS NULL
+    WHERE (x.meeting_id IS NULL${hasMeetingState ? ` OR m.meeting_state = 'agenda'` : ''})
       AND ${projectFilter}
-    ORDER BY m.meeting_date DESC;
+    ORDER BY CASE WHEN x.meeting_id IS NULL THEN 0 ELSE 1 END,
+             m.meeting_date DESC;
   `);
   return rows;
 }

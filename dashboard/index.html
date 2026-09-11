@@ -205,6 +205,7 @@ button.sec-t.closed .cnt{background:var(--muted)}
       <button class="chip" data-filter="outstanding">Has outstanding</button>
       <button class="chip" data-filter="complete">Complete</button>
       <button class="chip" data-filter="novendors">No vendors found</button>
+      <button class="chip" data-filter="awaiting">Awaiting minutes</button>
       <select id="scope">
         <option value="active">Active projects (Course of Construction)</option>
         <option value="all">All projects</option>
@@ -339,12 +340,39 @@ function matchesFilter(p){
   if(FILTER==='outstanding') return p.vendor_outstanding>0;
   if(FILTER==='complete')    return p.vendor_total>0 && p.vendor_outstanding===0;
   if(FILTER==='novendors')   return p.vendor_total===0;
+  /* Projects holding prep meetings that nobody has converted yet. These are the
+     jobs where a bit of Procore housekeeping turns un-creditable meetings into
+     credited ones. */
+  if(FILTER==='awaiting')    return Number(p.awaiting_minutes_count||0)>0;
   return true;
 }
 function matchesQuery(p,q){
   if(!q) return true;
   return [p.project_name,p.project_number,p.superintendent_name,p.project_manager,p.project_id]
     .some(function(v){ return String(v==null?'':v).toLowerCase().indexOf(q)>-1; });
+}
+
+/* "Not converted to minutes" — the flag, in one place.
+
+   A Procore meeting starts as an agenda and attendance can only be recorded
+   after it is converted to minutes. These meetings DID happen and they count;
+   what they're missing is the conversion. So the tracker shows them everywhere
+   a meeting shows, with this chip, rather than discounting or hiding them —
+   the meeting is real, the attendance record is the part that isn't there yet. */
+function minutesChip(state, opts){
+  if(state!=='agenda') return '';
+  return ' <span class="pill info" title="This meeting is still an agenda in Procore. '
+    +'Attendance can\'t be recorded until it\'s converted to minutes — the meeting itself '
+    +'counts.">'+((opts&&opts.short)?'Agenda':'Not converted to minutes')+'</span>';
+}
+
+function neverPulled(p){
+  if(p.ingested===null || p.ingested===undefined) return false;
+  if(Number(p.ingested)!==0) return false;
+  if(Number(p.vendor_total||0)>0) return false;
+  if(Number(p.prep_meeting_count||0)>0) return false;
+  if(p.last_meeting_date) return false;
+  return true;
 }
 
 function renderKpis(){
@@ -356,6 +384,18 @@ function renderKpis(){
     ['n err',    t.outstanding||0,             'Still outstanding'],
     ['n',        (t.pct_complete==null?'—':t.pct_complete+'%'), 'Complete']
   ];
+  /* Meetings that happened but are still agendas. Summed from the loaded rows
+     rather than from an API total, so it always matches the scope on screen.
+     Only shown once the mirror carries meeting_state — before that every row is
+     null and a "0" here would read as "nothing to convert", which is a claim we
+     can't make yet. */
+  var awaiting = PROJECTS.reduce(function(n,p){
+    return n + (p.awaiting_minutes_count==null ? 0 : Number(p.awaiting_minutes_count));
+  }, 0);
+  var knowAwaiting = PROJECTS.some(function(p){ return p.awaiting_minutes_count!=null; });
+  if(knowAwaiting && awaiting>0){
+    cells.push(['n orange', awaiting, 'Awaiting minutes']);
+  }
   $('kpis').innerHTML = cells.map(function(c){
     return '<div class="kpi"><div class="'+c[0]+'">'+esc(c[1])+'</div><div class="l">'+esc(c[2])+'</div></div>';
   }).join('');
@@ -436,15 +476,6 @@ function renderProjects(){
       ingested data. If it has vendors or prep meetings on screen, we plainly
       did fetch it, whatever the scope table says — a self-contradicting row is
       worse than no chip at all. */
-function neverPulled(p){
-  if(p.ingested===null || p.ingested===undefined) return false;
-  if(Number(p.ingested)!==0) return false;
-  if(Number(p.vendor_total||0)>0) return false;
-  if(Number(p.prep_meeting_count||0)>0) return false;
-  if(p.last_meeting_date) return false;
-  return true;
-}
-
   rows.forEach(function(p){
     var pct = p.pct_complete==null ? null : Number(p.pct_complete);
     var barW = pct==null?0:pct;
@@ -570,6 +601,7 @@ function vendorRow(v){
   else if(v.from_commitment && !v.from_directory) tags+=' <span class="pill info">Commitment</span>';
   else if(v.from_directory && !v.from_commitment) tags+=' <span class="pill info">Directory</span>';
   if(v.status==='held' && !v.override_status){
+    tags+=minutesChip(v.meeting_state, {short:true});
     if(v.match_method==='title'){
       tags+=' <span class="pill warn">Title match</span>';
     }else if(v.match_method==='title_variant'){
@@ -665,7 +697,7 @@ async function openProject(pid){
         +'<th class="num">Attendees</th><th class="num">Vendor side</th>'
         +'<th class="num">Vendors matched</th><th class="num">Procore</th></tr></thead><tbody>';
       meetings.forEach(function(m){
-        mtgHtml+='<tr><td>'+esc(m.title||'—')+'</td>'
+        mtgHtml+='<tr><td>'+esc(m.title||'—')+minutesChip(m.meeting_state)+'</td>'
           +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'
           +'<td class="num">'+esc(m.attendee_count==null?'—':m.attendee_count)+'</td>'
           +'<td class="num">'+esc(m.vendor_attendee_count==null?'—':m.vendor_attendee_count)+'</td>'
@@ -769,30 +801,37 @@ async function loadReview(){
        read as a process failure. Only "converted, still no attendance" is a
        missed step. `null` state = the mirror hasn't carried the column yet, so
        we don't sort into either bucket. */
-    var awaiting = REVIEW.filter(function(m){ return m.meeting_state==='agenda'; });
-    var missed   = REVIEW.filter(function(m){ return m.meeting_state==='minutes'; });
-    var unknownState = REVIEW.filter(function(m){
+    /* Group by WHAT THE ROW NEEDS, not by meeting state alone. An agenda-state
+       meeting that already title-matched a vendor still needs converting, so it
+       belongs here — restricting the queue to unmatched meetings hid exactly
+       those and took it from 26 rows to 1. */
+    var noVendor = REVIEW.filter(function(m){ return m.review_reason!=='needs_minutes'; });
+    var awaiting = REVIEW.filter(function(m){ return m.review_reason==='needs_minutes'; });
+    var missed   = noVendor.filter(function(m){ return m.meeting_state==='minutes'; });
+    var unknownState = noVendor.filter(function(m){
       return m.meeting_state!=='agenda' && m.meeting_state!=='minutes'; });
+    var noVendorAgenda = noVendor.filter(function(m){ return m.meeting_state==='agenda'; });
 
     var h='';
-    if(awaiting.length){
-      h+='<div class="note">'+esc(awaiting.length)+' of these meeting'
-        +(awaiting.length===1?' is':'s are')+' still an <b>agenda</b>. Attendance can\'t be '
-        +'recorded in Procore until the meeting is converted to minutes, so these are waiting '
-        +'on that — not meetings that were run without the vendor. Converting them is what '
-        +'lets the tracker credit the vendor automatically.</div>';
-    }
     if(missed.length){
       h+='<div class="note warn">'+esc(missed.length)+' meeting'
         +(missed.length===1?' was':'s were')+' converted to <b>minutes</b> but still '
-        +'name no vendor-side attendee. Those are the ones worth chasing.</div>';
+        +'name no vendor-side attendee — the vendor is missing from both Procore rosters, or '
+        +'the title names nobody the tracker recognises. Those need a person.</div>';
+    }
+    if(awaiting.length+noVendorAgenda.length){
+      h+='<div class="note">'+esc(awaiting.length+noVendorAgenda.length)+' meeting'
+        +((awaiting.length+noVendorAgenda.length)===1?' is':'s are')+' still an <b>agenda</b>. '
+        +'The meeting happened and it counts — what\'s missing is the conversion to minutes, '
+        +'which is the only way Procore lets anyone record attendance. Converting them is what '
+        +'lets the tracker credit the vendor on its own.</div>';
     }
     h+='<table><thead><tr><th>Project</th><th>Meeting title</th>'
-      +'<th>State</th>'
+      +'<th>Needs</th><th>State</th>'
       +'<th>Looks like</th><th class="num">Date</th>'
       +'<th class="num">Attendees</th><th class="num">Vendor-side attendees</th>'
       +'<th class="num">Procore</th></tr></thead><tbody>';
-    missed.concat(unknownState, awaiting).forEach(function(m){
+    missed.concat(unknownState, noVendorAgenda, awaiting).forEach(function(m){
       /* `suggested_vendor` is a vendor that IS on this project's roster under a
          longer legal name, where exactly one candidate fits. It is a suggestion,
          never an automatic credit — the tracker will not decide on its own that
@@ -808,8 +847,7 @@ async function loadReview(){
         }
       }
       var st = m.meeting_state==='agenda'
-            ? '<span class="pill info" title="Attendance can\'t be taken until this is '
-              +'converted to minutes in Procore.">Agenda</span>'
+            ? minutesChip('agenda')
           : m.meeting_state==='minutes'
             ? '<span class="pill warn" title="Converted to minutes, but no vendor-side '
               +'attendee was recorded.">Minutes</span>'
@@ -817,6 +855,9 @@ async function loadReview(){
       h+='<tr class="click" data-pid="'+esc(m.project_id)+'">'
         +'<td class="pname">'+esc(m.project_name||m.project_id)+'</td>'
         +'<td>'+esc(m.title||'—')+'</td>'
+        +'<td>'+(m.review_reason==='needs_minutes'
+            ? '<span class="pill info">Converting</span>'
+            : '<span class="pill warn">A vendor</span>')+'</td>'
         +'<td>'+st+'</td>'
         +'<td>'+sug+'</td>'
         +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'

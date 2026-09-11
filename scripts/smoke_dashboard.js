@@ -42,7 +42,7 @@ const STUB = {
     { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', project_number: '24-101',
       superintendent: 'Ken Houston', vendor_total: 12, vendor_held: 9, vendor_outstanding: 3,
       prep_meeting_count: 4, pct_complete: 75, last_meeting_date: '2026-03-17',
-      unmatched_meeting_count: 2,
+      unmatched_meeting_count: 2, awaiting_minutes_count: 3,
       // EXPLICIT null, not a missing key. This is what the API returns before
       // dbo.vendor_project_scope is mirrored, and the difference is the whole
       // bug: Number(null) is 0 while Number(undefined) is NaN, so a stub that
@@ -52,21 +52,21 @@ const STUB = {
     { project_id: 3387062, project_name: 'AEP Eagle Pass Service Center', project_number: '25-004',
       superintendent: null, vendor_total: 20, vendor_held: 0, vendor_outstanding: 20,
       prep_meeting_count: 5, pct_complete: 0, last_meeting_date: null,
-      unmatched_meeting_count: 4, ingested: 1 },
+      unmatched_meeting_count: 4, ingested: 1, awaiting_minutes_count: 0 },
     { project_id: 3119932, project_name: 'An Old 2024 Job', project_number: '24-007',
       superintendent: null, vendor_total: 0, vendor_held: 0, vendor_outstanding: 0,
       prep_meeting_count: 0, pct_complete: null, last_meeting_date: null,
-      unmatched_meeting_count: 0, ingested: 0 },
+      unmatched_meeting_count: 0, ingested: 0, awaiting_minutes_count: null },
   ],
   '/api/projects/3176472': {
     project: { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', pct: 75 },
     vendors: [
       { vendor_normalized: 'zip electric', vendor_name: 'ZIP Electric LLC', status: 'held',
         match_method: 'attendee', meeting_id: 12457210, meeting_date: '2026-03-17',
-        attendee_attended: true, trade_name: 'Electrical' },
+        attendee_attended: true, trade_name: 'Electrical', meeting_state: 'minutes' },
       { vendor_normalized: 'makk concrete', vendor_name: 'MAKK Concrete', status: 'held',
         match_method: 'title', meeting_id: 12406175, meeting_date: '2026-03-05',
-        attendee_attended: null, trade_name: 'Concrete' },
+        attendee_attended: null, trade_name: 'Concrete', meeting_state: 'agenda' },
       { vendor_normalized: 'hive energy', vendor_name: 'Hive Energy Solutions LLC', status: 'held',
         match_method: 'title_variant', meeting_id: 12719705, meeting_date: '2026-04-29',
         attendee_attended: null, trade_name: null },
@@ -76,7 +76,7 @@ const STUB = {
     ],
     meetings: [
       { meeting_id: 12457210, title: 'Preparatory Meeting Agenda - ZIP', meeting_date: '2026-03-17',
-        vendor_attendee_count: 3, matched_vendors: 1 },
+        vendor_attendee_count: 3, matched_vendors: 1, meeting_state: 'agenda' },
     ],
     unmatched: [
       { meeting_id: 12406175, title: 'Preparatory Meeting Agenda- H&W LandWorks',
@@ -87,10 +87,12 @@ const STUB = {
     { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', meeting_id: 12406175,
       title: 'Preparatory Meeting Agenda- H&W LandWorks', meeting_date: '2026-03-05',
       vendor_attendee_count: 0, attendee_count: 4, meeting_state: 'minutes',
+      review_reason: 'no_vendor',
       suggested_vendor: 'H&W Landwork KY LLC', suggested_vendor_normalized: 'h and w landwork ky' },
     { project_id: 3387062, project_name: 'AEP Eagle Pass Service Center', meeting_id: 12719705,
       title: 'Pre-Contract Meeting Agenda - HIVE', meeting_date: '2026-04-29',
-      vendor_attendee_count: 0, attendee_count: 2, meeting_state: 'agenda',
+      vendor_attendee_count: 3, attendee_count: 5, meeting_state: 'agenda',
+      review_reason: 'needs_minutes',
       suggested_vendor: null, suggested_vendor_normalized: null },
   ],
   '/api/settings': {
@@ -211,6 +213,8 @@ const server = http.createServer((req, res) => {
     ['#review-out', 'Confirm as held', 'Review Queue offers the one-click confirm to admins'],
     ['#mc-vend,#metrics-out', 'ZIP Electric', 'Metrics rendered its vendor table'],
     ['#review-out', 'still an', 'Review Queue explains the agenda-state rows'],
+    ['#review-out', 'Converting', 'Review Queue says an agenda row needs converting'],
+    ['#kpis', 'Awaiting minutes', 'KPI strip surfaces the un-converted meeting count'],
     ['#review-out', 'converted to', 'Review Queue flags the minutes-state rows'],
   ];
   // The "Not ingested" chip must appear exactly once: on the project that has
