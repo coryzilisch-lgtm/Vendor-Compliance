@@ -196,6 +196,38 @@ gives `.../tools/meetings/{id}`, which 404s — that was the first attempt.
 Verified against a real Procore URL. Same shape as the Safety Dashboard's forms
 link. Both URLs are built by one function each in `dashboard/index.html`.
 
+### Agenda vs Minutes — why most Review Queue rows exist
+
+**A Procore meeting starts as an AGENDA and attendance cannot be recorded until
+it is converted to MINUTES.** That single fact reframes the Review Queue: a prep
+meeting with no vendor-side attendee is usually waiting on the super to convert
+it, *not* evidence the meeting ran without the vendor. Only a meeting already
+converted to minutes and still missing attendance is a missed step.
+
+Treating the two the same reported a workflow state as a compliance failure —
+the same shape of error as reading a discarded-row count as "BCI has no
+commitments". The queue now splits them, leads with the actionable group, and
+says plainly that converting a meeting is what lets the tracker credit the
+vendor automatically.
+
+⚠️ **`requireVendorPresent` can never be satisfied by an agenda-state meeting.**
+Switching it on before the Agenda bucket is empty marks every un-converted prep
+meeting as missed. The setting's help text says so.
+
+It also explains two earlier measurements that looked like sloppiness and
+weren't: the 101 attendees carrying **no status field at all** are agenda-state
+meetings where nobody could tick a box yet, and title matching doing most of the
+work is the correct behaviour for un-converted meetings rather than a weak
+fallback.
+
+**The field carrying this is being DISCOVERED, not assumed.** `meeting_state()`
+probes `MEETING_STATE_FIELDS` plus minutes-marker keys, and the **MEETING STATE**
+diagnostic prints every raw value it saw on every candidate key. If most
+meetings come back `unknown`, that block says where to look instead. Cached
+detail rows predate the field, so `ATTENDEE_RESOLUTION_VERSION` was bumped to
+**4** — every prep meeting is re-read once, which is exactly what that guard is
+for.
+
 ### The Review Queue is not decoration
 
 Prep meetings that were logged but **can't be credited to any vendor** get their own tab rather

@@ -86,11 +86,11 @@ const STUB = {
   '/api/unmatched-meetings': [
     { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', meeting_id: 12406175,
       title: 'Preparatory Meeting Agenda- H&W LandWorks', meeting_date: '2026-03-05',
-      vendor_attendee_count: 0, attendee_count: 4,
+      vendor_attendee_count: 0, attendee_count: 4, meeting_state: 'minutes',
       suggested_vendor: 'H&W Landwork KY LLC', suggested_vendor_normalized: 'h and w landwork ky' },
     { project_id: 3387062, project_name: 'AEP Eagle Pass Service Center', meeting_id: 12719705,
       title: 'Pre-Contract Meeting Agenda - HIVE', meeting_date: '2026-04-29',
-      vendor_attendee_count: 0, attendee_count: 2,
+      vendor_attendee_count: 0, attendee_count: 2, meeting_state: 'agenda',
       suggested_vendor: null, suggested_vendor_normalized: null },
   ],
   '/api/settings': {
@@ -210,6 +210,8 @@ const server = http.createServer((req, res) => {
     ['#review-out', 'H&W Landwork KY LLC', 'Review Queue shows the name-variant suggestion'],
     ['#review-out', 'Confirm as held', 'Review Queue offers the one-click confirm to admins'],
     ['#mc-vend,#metrics-out', 'ZIP Electric', 'Metrics rendered its vendor table'],
+    ['#review-out', 'still an', 'Review Queue explains the agenda-state rows'],
+    ['#review-out', 'converted to', 'Review Queue flags the minutes-state rows'],
   ];
   // The "Not ingested" chip must appear exactly once: on the project that has
   // no data AND ingested:0. Hunting Creek carries no `ingested` field at all

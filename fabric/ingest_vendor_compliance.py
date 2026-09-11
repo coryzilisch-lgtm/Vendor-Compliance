@@ -298,7 +298,10 @@ REUSE_SETTLED_AFTER_DAYS = 45
 # see and very easy to mistake for bad data.
 #   1: original      2: directory join + email-domain fallback
 #   3: title-only prep rule (2026-09)
-ATTENDEE_RESOLUTION_VERSION = 3
+#   4: agenda-vs-minutes state on each meeting (2026-09) — cached rows predate
+#      the field, so they must be re-read once for the Review Queue to be able
+#      to separate "no attendance taken" from "no attendance possible yet"
+ATTENDEE_RESOLUTION_VERSION = 4
 
 # ---- Project numbers that are never real jobs -------------------------------
 # `BB-26-050` and friends are budget / bid-board records, not jobs anyone holds
@@ -715,6 +718,65 @@ def date_like_keys(meeting):
            re.match(r"^\d{4}-\d{2}-\d{2}", sv):
             out[str(k)] = sv[:32]
     return out
+
+
+# ── Agenda vs Minutes: the reason most Review Queue rows exist ───────────────
+# A Procore meeting starts as an AGENDA and is later "converted to minutes".
+# **Attendance cannot be recorded until that conversion happens.** So a prep
+# meeting still sitting in agenda state has no vendor-side attendee for a
+# structural reason, not because anyone forgot — and treating those two the same
+# is how a workflow state gets reported as a compliance failure.
+#
+# Which field carries this is a question about the tenant, not something to
+# guess: the same class of unknown as "where is the attendee's company", which
+# was solved by probing and reporting rather than by a second guess. The
+# candidates are probed in order, every value actually seen is printed by the
+# MEETING STATE diagnostic, and anything unrecognised stays "unknown" rather
+# than being forced into one bucket.
+MEETING_STATE_FIELDS = [
+    "status", "meeting_status", "stage", "state", "meeting_stage", "phase",
+]
+# Keys whose mere presence means the conversion has happened.
+MEETING_MINUTES_MARKERS = [
+    "minutes_created_at", "converted_to_minutes_at", "minutes_at",
+    "minutes_issued_at", "has_minutes", "is_minutes",
+]
+
+_meeting_state_paths  = {}   # how each meeting's state was decided
+_meeting_state_values = {}   # every raw value seen, per key — the discovery output
+
+
+def meeting_state(detail):
+    """('minutes' | 'agenda' | 'unknown', how_we_decided)."""
+    if not isinstance(detail, dict):
+        return "unknown", None
+
+    for key in MEETING_MINUTES_MARKERS:
+        v = detail.get(key)
+        if v in (None, "", False, "false", "False"):
+            continue
+        _meeting_state_paths[f"marker:{key}"] = _meeting_state_paths.get(f"marker:{key}", 0) + 1
+        return "minutes", key
+
+    for key in MEETING_STATE_FIELDS:
+        v = detail.get(key)
+        if isinstance(v, dict):
+            v = pick_name(v)
+        if v in (None, ""):
+            continue
+        sv = str(v)
+        _meeting_state_values.setdefault(key, {})
+        _meeting_state_values[key][sv] = _meeting_state_values[key].get(sv, 0) + 1
+        low = sv.lower()
+        if "minute" in low:
+            _meeting_state_paths[f"{key}=minutes"] = _meeting_state_paths.get(f"{key}=minutes", 0) + 1
+            return "minutes", key
+        if "agenda" in low:
+            _meeting_state_paths[f"{key}=agenda"] = _meeting_state_paths.get(f"{key}=agenda", 0) + 1
+            return "agenda", key
+
+    _meeting_state_paths["unknown"] = _meeting_state_paths.get("unknown", 0) + 1
+    return "unknown", None
 
 
 def template_id_of(meeting):
@@ -1559,6 +1621,7 @@ for pi, project in enumerate(scope, start=1):
                     _date_key_samples.setdefault(_k, _v)
                 d_title = pick(detail, "title", "name") or title
                 atts = extract_attendee_list(detail)
+                _m_state, _m_state_src = meeting_state(detail)
 
                 meeting_details.append({
                     "project_procore_id": pid,
@@ -1572,6 +1635,12 @@ for pi, project in enumerate(scope, start=1):
                     "held_at": pick(detail, "held_at", "actual_date", "actual_start_time"),
                     "held": detail.get("held"),
                     "status": pick(detail, "status", "meeting_status"),
+                    # Agenda vs minutes — see meeting_state(). Attendance is not
+                    # recordable until the meeting is converted to minutes, so
+                    # this is what separates "nobody took attendance" from
+                    # "nobody could have yet".
+                    "meeting_state": _m_state,
+                    "meeting_state_source": _m_state_src,
                     "location": pick(detail, "location"),
                     "created_at": detail.get("created_at"),
                     "updated_at": detail.get("updated_at"),
@@ -1741,6 +1810,11 @@ SELECT
     TO_DATE(held_at)                    AS held_at,
     CAST(held AS BOOLEAN)               AS held,
     status,
+    -- 'agenda' | 'minutes' | 'unknown'. Attendance is only recordable once a
+    -- meeting is converted to minutes, so this is what tells a missed step
+    -- apart from a step that isn't due yet.
+    COALESCE(meeting_state, 'unknown')  AS meeting_state,
+    meeting_state_source,
     location,
     CAST(attendee_count AS INT)         AS attendee_count,
     raw_json,
@@ -1966,6 +2040,49 @@ else:
 # reason? A 403 here means the API service account is not on that project's
 # directory, which is common on old jobs and is a PERMISSION story, not a data
 # one. You can see those vendors in Procore because you have access; it doesn't.
+# ---- Agenda vs minutes ------------------------------------------------------
+# THE FIELD NAME IS BEING DISCOVERED HERE, not assumed. If this prints
+# "unknown" for most meetings, MEETING_STATE_FIELDS is looking in the wrong
+# place — the raw values below say where to look instead.
+print("\n--- MEETING STATE (agenda vs minutes) ---")
+_ms_counts = {}
+for _d in meeting_details:
+    _k = _d.get("meeting_state") or "unknown"
+    _ms_counts[_k] = _ms_counts.get(_k, 0) + 1
+for _k, _n in sorted(_ms_counts.items(), key=lambda kv: -kv[1]):
+    print(f"  {_k}: {_n}")
+if _meeting_state_paths:
+    print("  decided by:")
+    for _k, _n in sorted(_meeting_state_paths.items(), key=lambda kv: -kv[1]):
+        print(f"    {_k}: {_n}")
+if _meeting_state_values:
+    print("  raw values seen on each candidate key:")
+    for _key, _vals in _meeting_state_values.items():
+        for _v, _n in sorted(_vals.items(), key=lambda kv: -kv[1])[:8]:
+            print(f"    {_key} = {_v!r}: {_n}")
+if _ms_counts.get("unknown"):
+    print(f"  ⚠️  {_ms_counts['unknown']} meeting(s) could not be classified. Procore marks a")
+    print("      meeting agenda-vs-minutes somewhere this code isn't looking. The raw values")
+    print("      above are every candidate key that WAS present — if the distinction is in")
+    print("      one of them under a different word, add it to MEETING_STATE_FIELDS. If none")
+    print("      of them carry it, print a raw_json from bronze_vendor_meeting_details:")
+    print("        spark.sql('SELECT raw_json FROM bronze_vendor_meeting_details LIMIT 1')"
+          ".collect()[0][0]")
+
+# How many Review Queue rows are a workflow state rather than a missed step?
+_agenda_no_vendor = sum(
+    1 for _d in meeting_details
+    if _d.get("meeting_state") == "agenda"
+    and not any(a["meeting_procore_id"] == _d["meeting_procore_id"]
+                and str(a.get("is_gc")).lower() != "true"
+                for a in meeting_attendees))
+if _agenda_no_vendor:
+    print(f"  => {_agenda_no_vendor} prep meeting(s) are still AGENDAS with no vendor attendee.")
+    print("     Attendance can't be taken until they're converted to minutes, so those are")
+    print("     waiting on the super, not evidence the meeting was run badly. The tracker")
+    print("     shows them separately from meetings that WERE converted and still have no")
+    print("     attendance — only the second group is a missed step.")
+
 print("\n--- PROJECTS WITH NO VENDORS (and the HTTP status that produced it) ---")
 _empty = [r for r in project_scope
           if not r["directory_vendors"] and not r["commitment_vendors"]]

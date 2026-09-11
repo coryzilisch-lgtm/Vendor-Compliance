@@ -760,11 +760,39 @@ async function loadReview(){
         +'Nothing to review.</div>';
       return;
     }
-    var h='<table><thead><tr><th>Project</th><th>Meeting title</th>'
+    /* Split the queue by what the row actually needs.
+
+       A Procore meeting starts as an AGENDA and attendance can only be recorded
+       once it is converted to MINUTES. So a prep meeting with no vendor-side
+       attendee is usually waiting on that conversion, not evidence the vendor
+       was absent — two different asks, and listing them together made every row
+       read as a process failure. Only "converted, still no attendance" is a
+       missed step. `null` state = the mirror hasn't carried the column yet, so
+       we don't sort into either bucket. */
+    var awaiting = REVIEW.filter(function(m){ return m.meeting_state==='agenda'; });
+    var missed   = REVIEW.filter(function(m){ return m.meeting_state==='minutes'; });
+    var unknownState = REVIEW.filter(function(m){
+      return m.meeting_state!=='agenda' && m.meeting_state!=='minutes'; });
+
+    var h='';
+    if(awaiting.length){
+      h+='<div class="note">'+esc(awaiting.length)+' of these meeting'
+        +(awaiting.length===1?' is':'s are')+' still an <b>agenda</b>. Attendance can\'t be '
+        +'recorded in Procore until the meeting is converted to minutes, so these are waiting '
+        +'on that — not meetings that were run without the vendor. Converting them is what '
+        +'lets the tracker credit the vendor automatically.</div>';
+    }
+    if(missed.length){
+      h+='<div class="note warn">'+esc(missed.length)+' meeting'
+        +(missed.length===1?' was':'s were')+' converted to <b>minutes</b> but still '
+        +'name no vendor-side attendee. Those are the ones worth chasing.</div>';
+    }
+    h+='<table><thead><tr><th>Project</th><th>Meeting title</th>'
+      +'<th>State</th>'
       +'<th>Looks like</th><th class="num">Date</th>'
       +'<th class="num">Attendees</th><th class="num">Vendor-side attendees</th>'
       +'<th class="num">Procore</th></tr></thead><tbody>';
-    REVIEW.forEach(function(m){
+    missed.concat(unknownState, awaiting).forEach(function(m){
       /* `suggested_vendor` is a vendor that IS on this project's roster under a
          longer legal name, where exactly one candidate fits. It is a suggestion,
          never an automatic credit — the tracker will not decide on its own that
@@ -779,9 +807,17 @@ async function loadReview(){
             +' data-mdate="'+esc(m.meeting_date||'')+'">Confirm as held</button>';
         }
       }
+      var st = m.meeting_state==='agenda'
+            ? '<span class="pill info" title="Attendance can\'t be taken until this is '
+              +'converted to minutes in Procore.">Agenda</span>'
+          : m.meeting_state==='minutes'
+            ? '<span class="pill warn" title="Converted to minutes, but no vendor-side '
+              +'attendee was recorded.">Minutes</span>'
+            : '<span class="muted">—</span>';
       h+='<tr class="click" data-pid="'+esc(m.project_id)+'">'
         +'<td class="pname">'+esc(m.project_name||m.project_id)+'</td>'
         +'<td>'+esc(m.title||'—')+'</td>'
+        +'<td>'+st+'</td>'
         +'<td>'+sug+'</td>'
         +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'
         +'<td class="num">'+esc(m.attendee_count==null?'—':m.attendee_count)+'</td>'
@@ -920,7 +956,10 @@ async function loadSettings(){
         +'<div class="hint">Ignores an attendee set to “For Distribution Only”. Stricter and more '
         +'truthful — but only switch this on once you\'ve confirmed the Present / Absent / '
         +'Distribution buttons are being filled in reliably, or real meetings will start reading '
-        +'as missed. Does not affect title matches.</div></label></div>'
+        +'as missed. Does not affect title matches.<br><b>A meeting still in Agenda state can '
+        +'never satisfy this</b> — Procore only allows attendance once the meeting is converted '
+        +'to minutes. Check the Review Queue\'s Agenda count before switching it on.</div>'
+        +'</label></div>'
       +'<div class="opt"><input type="checkbox" id="requireMeetingHeld"'
         +(Number(SETTINGS.requireMeetingHeld)?' checked':'')+(ADMIN?'':' disabled')+'>'
         +'<label for="requireMeetingHeld">Require Procore\'s “held” flag'
