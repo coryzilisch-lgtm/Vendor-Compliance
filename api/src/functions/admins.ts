@@ -1,21 +1,29 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
-import { addAdmin, getSettings, listAdmins, removeAdmin } from '../db/queries.js';
+import { addAdmin, getSettings, listAdmins, removeAdmin, searchPeople } from '../db/queries.js';
 import { cacheBust } from '../cache.js';
 import { BOOTSTRAP_ADMIN_LIST, actorEmail, errorResponse, meta, requireAdmin } from './_shared.js';
 
 /**
- * GET    /api/admins            the admin list + the current admin mode
- * POST   /api/admins            { email }        add
- * DELETE /api/admins/{email}                     remove
+ * GET    /api/admin-users            the admin list + the current admin mode
+ * POST   /api/admin-users            { email }        add
+ * DELETE /api/admin-users/{email}                     remove
+ * GET    /api/people?q=              typeahead for the add-admin picker
+ *
+ * ⚠️ The route and function name were `admins` and 404'd in production even
+ * though the handler was registered and `dist/functions/admins.js` was in the
+ * build. Static Web Apps can wedge a function name across deploys — the sibling
+ * intranet hit exactly this going from `admin-users` to `permissions`, and the
+ * only fix that worked was renaming the function name AND route together to
+ * force a fresh registration. Don't rename these back to `admins`.
  *
  * While `adminMode` is 'open' every signed-in user can edit, so this list has no
  * effect yet — it is being maintained now so that flipping to 'allowlist' later
  * is a single setting change rather than a scramble.
  */
-app.http('admins', {
+app.http('adminUsers', {
   methods: ['GET', 'POST'],
   authLevel: 'anonymous',
-  route: 'admins',
+  route: 'admin-users',
   handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
       if (request.method === 'GET') {
@@ -48,10 +56,10 @@ app.http('admins', {
   },
 });
 
-app.http('adminDelete', {
+app.http('adminUserDelete', {
   methods: ['DELETE'],
   authLevel: 'anonymous',
-  route: 'admins/{email}',
+  route: 'admin-users/{email}',
   handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
       const denied = await requireAdmin(request);
@@ -68,6 +76,21 @@ app.http('adminDelete', {
 
       cacheBust('tracker:');
       return meta(await listAdmins(BOOTSTRAP_ADMIN_LIST()), { removed: email }, 0);
+    } catch (err) {
+      return errorResponse(err);
+    }
+  },
+});
+
+
+/** Typeahead behind the add-admin picker. Read-only and name/email only. */
+app.http('people', {
+  methods: ['GET'],
+  authLevel: 'anonymous',
+  route: 'people',
+  handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
+    try {
+      return meta(await searchPeople(request.query.get('q') || ''), undefined, 0);
     } catch (err) {
       return errorResponse(err);
     }

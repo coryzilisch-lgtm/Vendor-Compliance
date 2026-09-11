@@ -228,6 +228,34 @@ detail rows predate the field, so `ATTENDEE_RESOLUTION_VERSION` was bumped to
 **4** — every prep meeting is re-read once, which is exactly what that guard is
 for.
 
+### The Review Queue is a worklist, not a list of failures
+
+It holds prep meetings that need **something done to them**, and there are two
+different somethings:
+
+| Needs | Why it's there | Who fixes it |
+|---|---|---|
+| **A vendor** | Credited to no vendor at all — the sub is on neither Procore roster, or the title names nobody recognised. | Add the vendor in Procore, or add a manual vendor / override in the tracker |
+| **Converting** | Still an **agenda**. Attendance is not recordable until it's converted to minutes, so this meeting can never be credited by the attendee signal however long it sits. | Convert it in Procore; the tracker then credits the vendor on its own |
+
+⚠️ **An agenda-state meeting belongs in the queue even when it already
+title-matched a vendor.** The first version restricted the queue to *unmatched*
+meetings, which hid precisely the meetings that need converting: once title and
+name-variant matching started crediting them, they dropped off the list while
+still missing their attendance record. **The queue went from 26 rows to 1 — not
+because the work was done, but because the work became invisible.** A queue that
+empties as matching improves is measuring the matcher, not the process.
+
+The un-converted meetings are surfaced in three more places so they can't be
+missed: a **"Not converted to minutes"** chip wherever a meeting renders
+(`minutesChip()` — one definition, so the wording can't drift), the same chip on
+a vendor row whose credit came from an un-converted meeting (a weaker claim than
+recorded attendance, and it says so), and an **Awaiting minutes** KPI + filter
+chip on the projects page. The KPI is summed from the loaded rows so it always
+matches the scope on screen, and is hidden entirely until the mirror carries
+`meeting_state` — a "0" there would read as "nothing to convert", which is a
+claim we can't make yet.
+
 ### The Review Queue is not decoration
 
 Prep meetings that were logged but **can't be credited to any vendor** get their own tab rather
@@ -437,7 +465,8 @@ docs/setup.md                        the deploy runbook — start here for anyth
 | `GET /api/settings` · `POST` (admin) | the four settings + live roster-coverage comparison |
 | `GET /api/overrides` · `POST` (admin) · `DELETE /{pid}/{vendor}` | the manual overrides |
 | `POST /api/manual-vendors` (admin) · `DELETE /{pid}/{vendor}` | vendors not in either Procore roster |
-| `GET /api/admins` · `POST` (admin) · `DELETE /{email}` | the in-app admin list |
+| `GET /api/admin-users` · `POST` (admin) · `DELETE /{email}` | the in-app admin list (renamed from `/api/admins`, which SWA wedged at 404 — see gotchas) |
+| `GET /api/people?q=` | typeahead behind the add-admin picker: `dbo.directory_users` when mirrored, else `dbo.superintendents` (names only, marked as un-grantable) |
 | `GET /api/me` · `/api/health` · `/api/sync-status` | identity/admin flag, liveness, mirror freshness |
 
 `?fresh=1` on any read bypasses the in-Function cache and returns `Cache-Control: no-store`.
@@ -482,6 +511,17 @@ docs/setup.md                        the deploy runbook — start here for anyth
   (Making the pre-copy script a `DROP` would self-heal this, at the cost of rebuilding the table
   nightly and a brief window where reads find nothing — not worth it for a once-per-schema-change
   problem, so the convention stays `DELETE`.)
+- **SWA can wedge a function NAME across deploys — the symptom is a permanent 404.**
+  `/api/admins` 404'd in production while `dist/functions/admins.js` was in the build,
+  `index.ts` imported it, and every other route worked. The sibling intranet hit the identical
+  thing (`admin-users` → `permissions`); the only fix that worked there was renaming **the
+  function name AND the route together** to force a fresh registration. Reusing the broken name
+  does not clear it. This repo's admin endpoints are now `adminUsers` / `admin-users` — do not
+  rename them back. ⚠️ Note SWA also answers **404, not 403**, when a route's `allowedRoles`
+  don't match, so check `staticwebapp.config.json` before concluding it's a wedge.
+- **A 404 from our own API is a deploy problem, and the UI now says so.** "Request failed (404)"
+  reads as a user error and sent someone hunting for a bad email address. `api()` turns a bodyless
+  404 into "this endpoint isn't in the deployed API — re-deploy, then retry".
 - **SWA caps a deployment at ~15,000 files**, and the error is the opaque "Failure during content
   distribution". Count files, not bytes; `.funcignore` does *not* shrink what SWA zips. This API
   has 2 runtime deps to stay well clear — check any new dependency's file count first.
