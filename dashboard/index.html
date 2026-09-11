@@ -327,6 +327,14 @@ async function api(path, opts){
   var body=null;
   try{ body = await r.json(); }catch(e){ /* non-JSON error page */ }
   if(!r.ok){
+    /* A 404 from our OWN API means the route isn't in the deployed build — a
+       deploy problem, not anything the reader did wrong. "Request failed (404)"
+       sent someone hunting for a bad email address for an hour; say what it
+       actually means. */
+    if(r.status===404 && !(body && body.error)){
+      throw new Error('This endpoint isn\'t in the deployed API (404 on /api'+path.split('?')[0]
+        +'). The page is fine — the API build is missing that route. Re-deploy, then retry.');
+    }
     throw new Error((body && body.error) || ('Request failed ('+r.status+' '+r.statusText+')'));
   }
   return body;
@@ -361,9 +369,23 @@ function matchesQuery(p,q){
    the meeting is real, the attendance record is the part that isn't there yet. */
 function minutesChip(state, opts){
   if(state!=='agenda') return '';
-  return ' <span class="pill info" title="This meeting is still an agenda in Procore. '
-    +'Attendance can\'t be recorded until it\'s converted to minutes — the meeting itself '
-    +'counts.">'+((opts&&opts.short)?'Agenda':'Not converted to minutes')+'</span>';
+  var inferred = opts && opts.source==='inferred';
+  var label = (opts&&opts.short) ? (inferred?'Agenda?':'Agenda')
+                                 : (inferred?'Likely not converted':'Not converted to minutes');
+  /* Two different claims, and the chip must not blur them. With
+     meeting_state mirrored we are reading Procore's own answer. Before that we
+     are INFERRING it from "no attendee on this meeting carries an attendance
+     status", which is only ever true of an un-converted meeting — except for a
+     converted meeting nobody ticked a box on. Saying "likely" costs nothing and
+     stops a guess being read as a fact. */
+  var why = inferred
+    ? 'No attendee on this meeting carries an attendance status, and Procore only '
+      +'allows attendance once a meeting is converted to minutes — so this is very '
+      +'likely still an agenda. Inferred, not read from Procore: a converted meeting '
+      +'where nobody ticked a box looks the same. Re-run the ingest for the exact answer.'
+    : 'This meeting is still an agenda in Procore. Attendance can\'t be recorded until '
+      +'it\'s converted to minutes — the meeting itself counts.';
+  return ' <span class="pill info" title="'+esc(why)+'">'+label+'</span>';
 }
 
 function neverPulled(p){
@@ -601,7 +623,22 @@ function vendorRow(v){
   else if(v.from_commitment && !v.from_directory) tags+=' <span class="pill info">Commitment</span>';
   else if(v.from_directory && !v.from_commitment) tags+=' <span class="pill info">Directory</span>';
   if(v.status==='held' && !v.override_status){
-    tags+=minutesChip(v.meeting_state, {short:true});
+    tags+=minutesChip(v.meeting_state,{short:true,source:v.meeting_state_source});
+    /* Credited by the meeting TITLE, on a meeting with nobody recorded in the
+       room. The only evidence this vendor's prep meeting happened is their name
+       inside a string — no attendance corroborates it. Worth seeing.
+
+       Not shown when the meeting is still an agenda: attendance is not
+       recordable there, the agenda chip already says so, and stacking a second
+       chip for the same cause would read as two problems instead of one. */
+    if(v.meeting_id && v.meeting_state!=='agenda'
+       && (v.match_method==='title' || v.match_method==='title_variant')
+       && Number(v.meeting_vendor_attendee_count||0)===0){
+      tags+=' <span class="pill warn" title="This vendor was credited from the meeting '
+        +'title alone, and the meeting records no vendor-side attendee — so nothing '
+        +'corroborates that they were actually there. Add the attendee in Procore, or '
+        +'override the row if you know the meeting happened.">No attendance list</span>';
+    }
     if(v.match_method==='title'){
       tags+=' <span class="pill warn">Title match</span>';
     }else if(v.match_method==='title_variant'){
@@ -697,7 +734,8 @@ async function openProject(pid){
         +'<th class="num">Attendees</th><th class="num">Vendor side</th>'
         +'<th class="num">Vendors matched</th><th class="num">Procore</th></tr></thead><tbody>';
       meetings.forEach(function(m){
-        mtgHtml+='<tr><td>'+esc(m.title||'—')+minutesChip(m.meeting_state)+'</td>'
+        mtgHtml+='<tr><td>'+esc(m.title||'—')
+          +minutesChip(m.meeting_state,{source:m.meeting_state_source})+'</td>'
           +'<td class="num">'+esc(fmtDate(m.meeting_date))+'</td>'
           +'<td class="num">'+esc(m.attendee_count==null?'—':m.attendee_count)+'</td>'
           +'<td class="num">'+esc(m.vendor_attendee_count==null?'—':m.vendor_attendee_count)+'</td>'
@@ -820,8 +858,12 @@ async function loadReview(){
         +'the title names nobody the tracker recognises. Those need a person.</div>';
     }
     if(awaiting.length+noVendorAgenda.length){
+      var inf = REVIEW.some(function(m){ return m.meeting_state_source==='inferred'; });
       h+='<div class="note">'+esc(awaiting.length+noVendorAgenda.length)+' meeting'
-        +((awaiting.length+noVendorAgenda.length)===1?' is':'s are')+' still an <b>agenda</b>. '
+        +((awaiting.length+noVendorAgenda.length)===1?' is':'s are')
+        +(inf?' <b>likely</b> still an <b>agenda</b> (inferred — no attendance was recorded '
+             +'on them, and Procore only allows that after conversion). '
+            :' still an <b>agenda</b>. ')
         +'The meeting happened and it counts — what\'s missing is the conversion to minutes, '
         +'which is the only way Procore lets anyone record attendance. Converting them is what '
         +'lets the tracker credit the vendor on its own.</div>';
@@ -847,7 +889,7 @@ async function loadReview(){
         }
       }
       var st = m.meeting_state==='agenda'
-            ? minutesChip('agenda')
+            ? minutesChip('agenda',{source:m.meeting_state_source})
           : m.meeting_state==='minutes'
             ? '<span class="pill warn" title="Converted to minutes, but no vendor-side '
               +'attendee was recorded.">Minutes</span>'
@@ -1394,13 +1436,64 @@ function renderAdminPanel(){
   h+='</div>';
 
   if(ADMIN){
-    h+='<div class="toolbar" style="margin-top:12px">'
-      +'<input type="search" id="admin-email" placeholder="name@buffaloconstruction.com">'
+    h+='<div class="toolbar" style="margin-top:12px;position:relative">'
+      +'<input type="search" id="admin-email" autocomplete="off" '
+        +'placeholder="Start typing a name, or paste an email">'
       +'<button class="hbtn primary" id="admin-add" style="color:#fff">Add admin</button>'
-      +'<span id="admin-msg" style="font-size:12px;color:var(--muted)"></span></div>';
+      +'<span id="admin-msg" style="font-size:12px;color:var(--muted)"></span>'
+      /* Results are absolutely positioned and inline-styled on purpose: a new
+         class wouldn't be in the cached stylesheet on the first load after a
+         deploy, which is the cached-CSS trap the sibling repos keep hitting. */
+      +'<div id="admin-people" style="display:none;position:absolute;top:100%;left:0;z-index:40;'
+        +'min-width:340px;max-height:260px;overflow:auto;background:#fff;'
+        +'border:1px solid var(--border);border-radius:var(--r-md);'
+        +'box-shadow:0 8px 24px rgba(0,37,61,.14);margin-top:4px"></div>'
+      +'</div>';
   }
   h+='</div>';
   $('admin-panel').innerHTML=h;
+
+  /* Type-to-search picker. The email is what actually grants access, so the
+     list shows it next to every name — picking the wrong Chris is otherwise
+     invisible until someone can't sign in. Anyone without an email on file is
+     shown greyed and can't be picked: there is nothing to grant. */
+  var box=$('admin-email'), plist=$('admin-people'), pseq=0;
+  function hidePeople(){ if(plist){ plist.style.display='none'; plist.innerHTML=''; } }
+  if(box && plist){
+    box.oninput=async function(){
+      var q=(box.value||'').trim(), my=++pseq;
+      if(q.length<2 || q.indexOf('@')>-1){ hidePeople(); return; }
+      try{
+        var r=await api('/people?q='+encodeURIComponent(q));
+        if(my!==pseq) return;                       // a later keystroke won already
+        var people=r.data||[];
+        if(!people.length){ hidePeople(); return; }
+        plist.innerHTML=people.map(function(u){
+          var has=!!(u.email||'').trim();
+          return '<div class="ppick" data-email="'+esc(u.email||'')+'"'
+            +' style="padding:8px 12px;font-size:13px;border-bottom:1px solid var(--border);'
+            +(has?'cursor:pointer':'opacity:.5')+'">'
+            +'<div style="font-weight:700;color:var(--navy)">'+esc(u.name||'—')+'</div>'
+            +'<div style="font-size:11px;color:var(--muted)">'
+            +esc(has ? u.email : 'no email on file — can\'t be granted access')
+            +(u.job_title?' · '+esc(u.job_title):'')+'</div></div>';
+        }).join('');
+        plist.style.display='';
+        Array.prototype.forEach.call(plist.querySelectorAll('.ppick'),function(el){
+          var em=el.getAttribute('data-email');
+          if(!em) return;
+          el.onclick=function(){ box.value=em; hidePeople(); box.focus(); };
+        });
+      }catch(e){
+        /* The picker is a convenience; typing the address still works. Say why
+           it's quiet rather than silently offering nothing. */
+        plist.innerHTML='<div style="padding:8px 12px;font-size:12px;color:var(--muted)">'
+          +esc('Name lookup unavailable ('+e.message+'). Type the full email instead.')+'</div>';
+        plist.style.display='';
+      }
+    };
+    box.onblur=function(){ setTimeout(hidePeople,150); };
+  }
 
   var add=$('admin-add');
   if(add) add.onclick=async function(){
@@ -1408,7 +1501,7 @@ function renderAdminPanel(){
     if(!email){ $('admin-email').focus(); return; }
     add.disabled=true; $('admin-msg').textContent='Adding…';
     try{
-      var r=await api('/admins',{method:'POST',headers:{'Content-Type':'application/json'},
+      var r=await api('/admin-users',{method:'POST',headers:{'Content-Type':'application/json'},
                                  body:JSON.stringify({email:email})});
       ADMINS=r.data||[]; $('admin-email').value='';
       renderAdminPanel(); $('admin-msg').textContent='Added.';
@@ -1421,7 +1514,7 @@ function renderAdminPanel(){
       if(!window.confirm('Remove '+email+' as an admin?')) return;
       b.disabled=true; b.textContent='…';
       try{
-        var r=await api('/admins/'+encodeURIComponent(email),{method:'DELETE'});
+        var r=await api('/admin-users/'+encodeURIComponent(email),{method:'DELETE'});
         ADMINS=r.data||[]; renderAdminPanel();
       }catch(e){
         // The API refuses to remove a built-in account or the last admin, and
@@ -1434,7 +1527,7 @@ function renderAdminPanel(){
 
 async function loadAdmins(){
   try{
-    var r=await api('/admins');
+    var r=await api('/admin-users');
     ADMINS=r.data||[];
     if(r.meta && r.meta.adminMode) SETTINGS.adminMode=r.meta.adminMode;
   }catch(e){ ADMINS=[]; }

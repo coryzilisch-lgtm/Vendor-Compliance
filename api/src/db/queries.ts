@@ -624,6 +624,93 @@ function manualTitleMatchBranch(): string {
         AND CHARINDEX(' ' + mv.vendor_normalized + ' ', mtg.title_padded) > 0`;
 }
 
+/**
+ * Agenda vs minutes, with a fallback that works BEFORE the ingest re-runs.
+ *
+ * The real answer is `dbo.vendor_prep_meetings.meeting_state`, which arrives
+ * with the next ingest + mirror. Until then this infers it from data already
+ * mirrored, using the one thing that is only ever true of a converted meeting:
+ * **an attendance status exists**. Procore does not let anyone mark Present /
+ * Absent / For Distribution Only until the meeting is converted to minutes, so
+ * a meeting where not one attendee carries a status has almost certainly not
+ * been converted. The ingest already measured this shape: 101 attendees with no
+ * status field at all, against 476 with one.
+ *
+ * ⚠️ It is an INFERENCE and the UI must say so. A meeting that WAS converted
+ * but where nobody ticked a single box looks identical from here. That is a
+ * false "needs converting", and the cost of it is someone opening the meeting
+ * in Procore and seeing it is already fine — acceptable, and much cheaper than
+ * the un-converted meetings staying invisible until the notebook is re-run.
+ * `meeting_state_source` carries 'procore' or 'inferred' so the chip can be
+ * honest about which one the reader is looking at.
+ */
+function meetingStateExpr(alias = 'm'): string {
+  if (hasMeetingState) return `COALESCE(${alias}.meeting_state, 'unknown')`;
+  return `CASE WHEN EXISTS (
+                  SELECT 1 FROM dbo.vendor_prep_attendees aa
+                   WHERE aa.meeting_id = ${alias}.meeting_id
+                     AND LOWER(COALESCE(aa.attendance_status, '')) NOT IN ('', 'unknown'))
+               THEN 'minutes' ELSE 'agenda' END`;
+}
+
+function meetingStateSourceExpr(): string {
+  return hasMeetingState ? `CAST('procore' AS NVARCHAR(16))` : `CAST('inferred' AS NVARCHAR(16))`;
+}
+
+/**
+ * People you can search when granting admin, so nobody has to type an email
+ * from memory and get it subtly wrong (a typo grants nobody anything and sits
+ * there looking granted).
+ *
+ * Sources, in order of preference, each probed before use — naming a table that
+ * isn't there is a parse error that takes the whole page down:
+ *   1. `dbo.directory_users` — the company directory the safety dashboard
+ *      mirrors for its All Hands roster. Real names and real UPNs.
+ *   2. `dbo.superintendents` — always present, but names only. Rows with no
+ *      email are returned and marked, so the picker can show them greyed with
+ *      "no email on file" rather than offering a row that can't be granted.
+ *
+ * Returns at most 20; this is a typeahead, not an export.
+ */
+export async function searchPeople(q: string): Promise<Record<string, unknown>[]> {
+  const term = String(q || '').trim();
+  if (term.length < 2) return [];
+  const like = `%${term.replace(/[%_[\]]/g, '')}%`;
+
+  const { rows: probe } = await db.query<{ has_dir: number | null; has_sup: number | null }>(
+    `SELECT OBJECT_ID('dbo.directory_users','U') AS has_dir,
+            OBJECT_ID('dbo.superintendents','U') AS has_sup`,
+  );
+  if (probe[0]?.has_dir != null) {
+    const { rows } = await db.query(
+      `SELECT TOP 20
+          LTRIM(RTRIM(display_name))                     AS name,
+          LOWER(LTRIM(RTRIM(COALESCE(email, upn, ''))))  AS email,
+          job_title, department
+       FROM dbo.directory_users
+       WHERE (@q = '' OR display_name LIKE @q OR email LIKE @q OR upn LIKE @q)
+         AND COALESCE(display_name, '') <> ''
+       ORDER BY display_name;`,
+      { q: like },
+    );
+    return rows;
+  }
+  if (probe[0]?.has_sup != null) {
+    const { rows } = await db.query(
+      `SELECT TOP 20 LTRIM(RTRIM(name)) AS name,
+              CAST('' AS NVARCHAR(256)) AS email,
+              CAST(NULL AS NVARCHAR(128)) AS job_title,
+              CAST(NULL AS NVARCHAR(128)) AS department
+       FROM dbo.superintendents
+       WHERE name LIKE @q AND COALESCE(name,'') <> ''
+       ORDER BY name;`,
+      { q: like },
+    );
+    return rows;
+  }
+  return [];
+}
+
 /** Which match rows count, per the settings. */
 function matchPredicate(s: Settings, alias = 'm'): string {
   const parts: string[] = [];
@@ -900,9 +987,8 @@ export async function getProjectSummaries(scope: 'active' | 'all'): Promise<Proj
                -- Prep meetings still sitting as an agenda. They DID happen and
                -- they count; attendance simply can't be recorded until someone
                -- converts them, so this is an action list, not a failure count.
-               ${hasMeetingState
-                 ? `SUM(CASE WHEN m.meeting_state = 'agenda' THEN 1 ELSE 0 END)`
-                 : `CAST(NULL AS INT)`} AS awaiting_minutes_count
+               SUM(CASE WHEN (${meetingStateExpr('m')}) = 'agenda' THEN 1 ELSE 0 END)
+                 AS awaiting_minutes_count
         FROM dbo.vendor_prep_meetings m
         LEFT JOIN (${countedMeetingIds(s)}) x
                ON x.meeting_id = m.meeting_id
@@ -963,6 +1049,11 @@ export type VendorRow = {
   has_variant_match: number;
   /** Agenda/minutes state of the meeting that credited this vendor. */
   meeting_state: string | null;
+  meeting_state_source: string | null;
+  /** Attendees recorded on the meeting that credited this vendor. 0 on a
+   *  title-only credit means the sole evidence is the meeting's title. */
+  meeting_attendee_count: number | null;
+  meeting_vendor_attendee_count: number | null;
   override_status: string | null;
   override_note: string | null;
   override_by: string | null;
@@ -994,11 +1085,22 @@ export async function getProjectDetail(projectId: number): Promise<{
         -- branches: one join, one place to be wrong. A vendor credited off a
         -- meeting still in agenda state is a weaker claim than one credited off
         -- recorded attendance, and the row says so.
-        ${hasMeetingState
-          ? `(SELECT TOP 1 COALESCE(mm.meeting_state, 'unknown')
-                FROM dbo.vendor_prep_meetings mm
-               WHERE mm.meeting_id = resolved.meeting_id)`
-          : `CAST(NULL AS NVARCHAR(16))`} AS meeting_state
+        (SELECT TOP 1 ${meetingStateExpr('mm')}
+           FROM dbo.vendor_prep_meetings mm
+          WHERE mm.meeting_id = resolved.meeting_id) AS meeting_state,
+        ${meetingStateSourceExpr()} AS meeting_state_source,
+        -- How many people were recorded in the room on the meeting that
+        -- credited this vendor. A title-matched vendor on a meeting with an
+        -- EMPTY attendee list is the weakest credit the tracker can produce:
+        -- the only evidence is their name in a string. Surfaced so that is
+        -- visible rather than indistinguishable from a vendor whose attendance
+        -- was actually recorded.
+        (SELECT TOP 1 mm.attendee_count
+           FROM dbo.vendor_prep_meetings mm
+          WHERE mm.meeting_id = resolved.meeting_id) AS meeting_attendee_count,
+        (SELECT TOP 1 mm.vendor_attendee_count
+           FROM dbo.vendor_prep_meetings mm
+          WHERE mm.meeting_id = resolved.meeting_id) AS meeting_vendor_attendee_count
     FROM resolved
     ORDER BY CASE status WHEN 'not_held' THEN 0 WHEN 'held' THEN 1 ELSE 2 END, vendor_name;
   `,
@@ -1017,8 +1119,8 @@ export async function getProjectDetail(projectId: number): Promise<{
     `SELECT m.meeting_id, m.title, CONVERT(VARCHAR(10), m.meeting_date, 23) AS meeting_date,
             m.held, m.attendee_count, m.vendor_attendee_count, m.vendor_attendees_present,
             m.series_name, m.location,
-            ${hasMeetingState ? `COALESCE(m.meeting_state, 'unknown')` : `CAST(NULL AS NVARCHAR(16))`}
-              AS meeting_state,
+            ${meetingStateExpr('m')}   AS meeting_state,
+            ${meetingStateSourceExpr()} AS meeting_state_source,
             (SELECT COUNT(DISTINCT x.vendor_normalized) FROM dbo.vendor_prep_matches x
               WHERE x.meeting_id = m.meeting_id
                 AND ${matchPredicate(s, 'x')}) AS matched_vendor_count,
@@ -1074,9 +1176,8 @@ export async function getUnmatchedMeetings(scope: 'active' | 'all'): Promise<Rec
     SELECT m.project_id, p.name AS project_name, m.meeting_id, m.title,
            CONVERT(VARCHAR(10), m.meeting_date, 23) AS meeting_date,
            m.attendee_count, m.vendor_attendee_count,
-           ${hasMeetingState
-             ? `COALESCE(m.meeting_state, 'unknown')`
-             : `CAST(NULL AS NVARCHAR(16))`}   AS meeting_state,
+           ${meetingStateExpr('m')} AS meeting_state,
+           ${meetingStateSourceExpr()} AS meeting_state_source,
            CASE WHEN x.meeting_id IS NULL THEN 'no_vendor' ELSE 'needs_minutes' END
              AS review_reason,
            sug.vendor_name       AS suggested_vendor,
@@ -1092,7 +1193,7 @@ export async function getUnmatchedMeetings(scope: 'active' | 'all'): Promise<Rec
           AND v.match_method = 'title_variant'
         ORDER BY v.vendor_name
     ) sug
-    WHERE (x.meeting_id IS NULL${hasMeetingState ? ` OR m.meeting_state = 'agenda'` : ''})
+    WHERE (x.meeting_id IS NULL OR (${meetingStateExpr('m')}) = 'agenda')
       AND ${projectFilter}
     ORDER BY CASE WHEN x.meeting_id IS NULL THEN 0 ELSE 1 END,
              m.meeting_date DESC;

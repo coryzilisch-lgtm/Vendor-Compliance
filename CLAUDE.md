@@ -465,7 +465,8 @@ docs/setup.md                        the deploy runbook — start here for anyth
 | `GET /api/settings` · `POST` (admin) | the four settings + live roster-coverage comparison |
 | `GET /api/overrides` · `POST` (admin) · `DELETE /{pid}/{vendor}` | the manual overrides |
 | `POST /api/manual-vendors` (admin) · `DELETE /{pid}/{vendor}` | vendors not in either Procore roster |
-| `GET /api/admins` · `POST` (admin) · `DELETE /{email}` | the in-app admin list |
+| `GET /api/admin-users` · `POST` (admin) · `DELETE /{email}` | the in-app admin list (renamed from `/api/admins`, which SWA wedged at 404 — see gotchas) |
+| `GET /api/people?q=` | typeahead behind the add-admin picker: `dbo.directory_users` when mirrored, else `dbo.superintendents` (names only, marked as un-grantable) |
 | `GET /api/me` · `/api/health` · `/api/sync-status` | identity/admin flag, liveness, mirror freshness |
 
 `?fresh=1` on any read bypasses the in-Function cache and returns `Cache-Control: no-store`.
@@ -510,6 +511,17 @@ docs/setup.md                        the deploy runbook — start here for anyth
   (Making the pre-copy script a `DROP` would self-heal this, at the cost of rebuilding the table
   nightly and a brief window where reads find nothing — not worth it for a once-per-schema-change
   problem, so the convention stays `DELETE`.)
+- **SWA can wedge a function NAME across deploys — the symptom is a permanent 404.**
+  `/api/admins` 404'd in production while `dist/functions/admins.js` was in the build,
+  `index.ts` imported it, and every other route worked. The sibling intranet hit the identical
+  thing (`admin-users` → `permissions`); the only fix that worked there was renaming **the
+  function name AND the route together** to force a fresh registration. Reusing the broken name
+  does not clear it. This repo's admin endpoints are now `adminUsers` / `admin-users` — do not
+  rename them back. ⚠️ Note SWA also answers **404, not 403**, when a route's `allowedRoles`
+  don't match, so check `staticwebapp.config.json` before concluding it's a wedge.
+- **A 404 from our own API is a deploy problem, and the UI now says so.** "Request failed (404)"
+  reads as a user error and sent someone hunting for a bad email address. `api()` turns a bodyless
+  404 into "this endpoint isn't in the deployed API — re-deploy, then retry".
 - **SWA caps a deployment at ~15,000 files**, and the error is the opaque "Failure during content
   distribution". Count files, not bytes; `.funcignore` does *not* shrink what SWA zips. This API
   has 2 runtime deps to stay well clear — check any new dependency's file count first.

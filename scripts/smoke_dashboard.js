@@ -58,30 +58,50 @@ const STUB = {
       prep_meeting_count: 0, pct_complete: null, last_meeting_date: null,
       unmatched_meeting_count: 0, ingested: 0, awaiting_minutes_count: null },
   ],
+  // ⚠️ This endpoint's envelope is NOT {data:{...}} — openProject() reads the
+  // vendor ARRAY from `data` and everything else from `meta`. A stub that
+  // invented the shape made `vendors.forEach` throw inside openProject's own
+  // try/catch, so the modal rendered an error, nothing logged, and every
+  // drilldown assertion was skipped. Third time an invented stub shape has
+  // hidden a real assertion — match the API, always.
   '/api/projects/3176472': {
-    project: { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', pct: 75 },
-    vendors: [
+    __data: [
       { vendor_normalized: 'zip electric', vendor_name: 'ZIP Electric LLC', status: 'held',
         match_method: 'attendee', meeting_id: 12457210, meeting_date: '2026-03-17',
-        attendee_attended: true, trade_name: 'Electrical', meeting_state: 'minutes' },
+        attendee_attended: true, trade_name: 'Electrical', meeting_state: 'minutes',
+        meeting_state_source: 'inferred', meeting_attendee_count: 6,
+        meeting_vendor_attendee_count: 3 },
       { vendor_normalized: 'makk concrete', vendor_name: 'MAKK Concrete', status: 'held',
         match_method: 'title', meeting_id: 12406175, meeting_date: '2026-03-05',
-        attendee_attended: null, trade_name: 'Concrete', meeting_state: 'agenda' },
+        attendee_attended: null, trade_name: 'Concrete', meeting_state: 'minutes',
+        meeting_state_source: 'inferred', meeting_attendee_count: 4,
+        meeting_vendor_attendee_count: 0 },
+      // Negative control: also credited from the title, but the meeting DOES
+      // record a vendor-side attendee — so the flag must stay off. Without a
+      // negative control the assertion only proves the chip can render.
       { vendor_normalized: 'hive energy', vendor_name: 'Hive Energy Solutions LLC', status: 'held',
         match_method: 'title_variant', meeting_id: 12719705, meeting_date: '2026-04-29',
-        attendee_attended: null, trade_name: null },
+        attendee_attended: null, trade_name: null, meeting_state: 'minutes',
+        meeting_state_source: 'inferred', meeting_attendee_count: 5,
+        meeting_vendor_attendee_count: 2 },
       { vendor_normalized: 'escar construction', vendor_name: 'Escar Construction',
         status: 'not_held', match_method: null, meeting_id: null, meeting_date: null,
         attendee_attended: null, trade_name: null },
     ],
-    meetings: [
-      { meeting_id: 12457210, title: 'Preparatory Meeting Agenda - ZIP', meeting_date: '2026-03-17',
-        vendor_attendee_count: 3, matched_vendors: 1, meeting_state: 'agenda' },
-    ],
-    unmatched: [
-      { meeting_id: 12406175, title: 'Preparatory Meeting Agenda- H&W LandWorks',
-        meeting_date: '2026-03-05', vendor_attendee_count: 0 },
-    ],
+    __meta: {
+      project: { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', pct: 75 },
+      summary: { vendor_total: 4, vendor_held: 3, vendor_outstanding: 1 },
+      meetings: [
+        { meeting_id: 12457210, title: 'Preparatory Meeting Agenda - ZIP',
+          meeting_date: '2026-03-17', attendee_count: 6, vendor_attendee_count: 3,
+          matched_vendor_count: 1, meeting_state: 'agenda',
+          meeting_state_source: 'inferred' },
+      ],
+      unmatched: [
+        { meeting_id: 12406175, title: 'Preparatory Meeting Agenda- H&W LandWorks',
+          meeting_date: '2026-03-05', vendor_attendee_count: 0 },
+      ],
+    },
   },
   '/api/unmatched-meetings': [
     { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', meeting_id: 12406175,
@@ -92,7 +112,7 @@ const STUB = {
     { project_id: 3387062, project_name: 'AEP Eagle Pass Service Center', meeting_id: 12719705,
       title: 'Pre-Contract Meeting Agenda - HIVE', meeting_date: '2026-04-29',
       vendor_attendee_count: 3, attendee_count: 5, meeting_state: 'agenda',
-      review_reason: 'needs_minutes',
+      review_reason: 'needs_minutes', meeting_state_source: 'inferred',
       suggested_vendor: null, suggested_vendor_normalized: null },
   ],
   '/api/settings': {
@@ -102,7 +122,12 @@ const STUB = {
                 commitment_vendors: 1390, directory_vendors: 2362 },
   },
   '/api/overrides': [],
-  '/api/admins': [{ email: 'cory.zilisch@buffaloconstruction.com', added_by: 'bootstrap' }],
+  '/api/admin-users': [{ email: 'cory.zilisch@buffaloconstruction.com', added_by: 'bootstrap' }],
+  '/api/people': [
+    { name: 'Justin Houston', email: 'justin.houston@buffaloconstruction.com',
+      job_title: 'Safety Director', department: 'Safety' },
+    { name: 'No Email Person', email: '', job_title: 'Superintendent', department: null },
+  ],
   '/api/metrics': {
     snapshot: { active_projects: 88, projects_with_meetings: 10, vendors_tracked: 2362,
                 vendors_held: 59, total_meetings: 63, unmatched_meetings: 10 },
@@ -146,7 +171,10 @@ const server = http.createServer((req, res) => {
     const data = stubFor(url);
     if (data === null) { res.writeHead(404).end('{"error":"no stub"}'); return; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ data, meta: { generated_at: NOW, cached: false } }));
+    const body = (data && data.__data !== undefined)
+      ? { data: data.__data, meta: { generated_at: NOW, cached: false, ...(data.__meta || {}) } }
+      : { data, meta: { generated_at: NOW, cached: false } };
+    res.end(JSON.stringify(body));
     return;
   }
   const file = url === '/' ? '/index.html' : url.split('?')[0];
@@ -214,6 +242,7 @@ const server = http.createServer((req, res) => {
     ['#mc-vend,#metrics-out', 'ZIP Electric', 'Metrics rendered its vendor table'],
     ['#review-out', 'still an', 'Review Queue explains the agenda-state rows'],
     ['#review-out', 'Converting', 'Review Queue says an agenda row needs converting'],
+    ['#review-out', 'Likely not converted', 'Inferred state is labelled as a guess, not a fact'],
     ['#kpis', 'Awaiting minutes', 'KPI strip surfaces the un-converted meeting count'],
     ['#review-out', 'converted to', 'Review Queue flags the minutes-state rows'],
   ];
@@ -235,9 +264,38 @@ const server = http.createServer((req, res) => {
   }
 
   // And the drilldown, which is where most of the rendering lives.
-  for (const sel of ['[data-project-id]', 'tbody tr']) {
-    const el = await page.$(sel);
-    if (el) { await el.click().catch(() => {}); await page.waitForTimeout(400); break; }
+  // Back to Projects first: the tab loop above leaves Settings active, and
+  // a bare `tbody tr` then matched a row in the admin table instead of a
+  // project — so the drilldown never opened and every assertion below was
+  // skipped in silence. The selector is data-pid, which is what the row
+  // actually carries.
+  await page.evaluate(() => {
+    const b = document.querySelector('nav.tabs button[data-tab="projects"]');
+    if (b) b.click();
+  });
+  await page.waitForTimeout(300);
+  const projRow = await page.$('#projects-out tr.click[data-pid]');
+  if (!projRow) {
+    problems.push('no project row to open — the drilldown assertions cannot run');
+  } else {
+    await projRow.click().catch(() => {});
+    await page.waitForTimeout(700);
+  }
+  // In the project drilldown: the title-matched vendor with an empty attendee
+  // list must carry "No attendance list", and the attendee-matched one must
+  // not. A flag that fires on every row conveys nothing.
+  const modal = await page.$eval('#modal', (el) => el.textContent || '').catch(() => '');
+  if (!/MAKK Concrete|ZIP Electric/.test(modal)) {
+    problems.push('project drilldown did not render its vendor rows');
+  } else {
+    if (!modal.includes('No attendance list')) {
+      problems.push('project modal: title-matched vendor with 0 attendees is not flagged');
+    }
+    // Exactly one: MAKK (title-matched, 0 vendor attendees) fires; Hive
+    // (title-matched but 2 attendees recorded) and ZIP (attendee-matched) must
+    // not. A flag that fires on every row conveys nothing.
+    const hits = (modal.match(/No attendance list/g) || []).length;
+    if (hits !== 1) problems.push(`"No attendance list" fired ${hits} times — expected exactly 1`);
   }
 
   await browser.close();
