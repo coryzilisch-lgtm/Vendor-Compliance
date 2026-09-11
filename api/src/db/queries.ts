@@ -26,6 +26,20 @@ let meetingsHaveTitlePadded = false;
  * that isn't there is a parse error that blanks the dashboard.
  */
 let hasProjectScope = false;
+/**
+ * Does dbo.vendor_prep_meetings carry `meeting_state` yet?
+ *
+ * A Procore meeting starts as an AGENDA and is later converted to MINUTES, and
+ * **attendance cannot be recorded until that conversion**. So most Review Queue
+ * rows — a prep meeting with no vendor-side attendee — are waiting on the
+ * super to convert the meeting, not evidence that the meeting was run without
+ * the vendor. Only a meeting already converted to minutes and still missing
+ * attendance is a missed step.
+ *
+ * Probed rather than assumed: the column arrives with the next ingest + mirror,
+ * and naming a column that isn't there is a parse error that blanks the page.
+ */
+let hasMeetingState = false;
 
 /**
  * The mirror pipeline AUTO-CREATES dbo.projects, so its column set follows
@@ -45,21 +59,25 @@ export async function ensureProjectColumnMeta(): Promise<void> {
     const { rows } = await db.query<{
       has_active: number | null; has_super: number | null; has_padded: number | null;
       has_scope: number | null;
+      has_mstate: number | null;
     }>(
       `SELECT COL_LENGTH('dbo.projects','is_active')                    AS has_active,
               OBJECT_ID('dbo.project_superintendents','U')              AS has_super,
               COL_LENGTH('dbo.vendor_prep_meetings','title_padded')     AS has_padded,
-              OBJECT_ID('dbo.vendor_project_scope','U')                 AS has_scope`,
+              OBJECT_ID('dbo.vendor_project_scope','U')                 AS has_scope,
+              COL_LENGTH('dbo.vendor_prep_meetings','meeting_state')     AS has_mstate`,
     );
     projectsHasIsActive = rows[0]?.has_active != null;
     hasSuperTables = rows[0]?.has_super != null;
     meetingsHaveTitlePadded = rows[0]?.has_padded != null;
     hasProjectScope = rows[0]?.has_scope != null;
+    hasMeetingState = rows[0]?.has_mstate != null;
   } catch {
     projectsHasIsActive = false;
     hasSuperTables = false;
     meetingsHaveTitlePadded = false;
     hasProjectScope = false;
+    hasMeetingState = false;
   }
   if (hasSuperTables) {
     try {
@@ -616,6 +634,13 @@ function matchPredicate(s: Settings, alias = 'm'): string {
   // from a different setting's clause.
   if (!s.allowNameVariantMatch) parts.push(`${alias}.match_method <> 'title_variant'`);
   if (s.requireVendorPresent) {
+    // ⚠️ This can never be satisfied by a meeting still in AGENDA state —
+    // Procore does not allow attendance to be recorded until the meeting is
+    // converted to minutes. Switching it on therefore marks every un-converted
+    // prep meeting as missed, which is a reading of the tracker's own workflow
+    // gap as a field failure. Leave it off until the Review Queue's "Agenda"
+    // bucket is empty.
+    //
     // Attendance is only knowable for attendee matches; a title match has no
     // attendee row to inspect, so it passes this gate on its own merits.
     parts.push(
@@ -1011,6 +1036,9 @@ export async function getUnmatchedMeetings(scope: 'active' | 'all'): Promise<Rec
     SELECT m.project_id, p.name AS project_name, m.meeting_id, m.title,
            CONVERT(VARCHAR(10), m.meeting_date, 23) AS meeting_date,
            m.attendee_count, m.vendor_attendee_count,
+           ${hasMeetingState
+             ? `COALESCE(m.meeting_state, 'unknown')`
+             : `CAST(NULL AS NVARCHAR(16))`}   AS meeting_state,
            sug.vendor_name       AS suggested_vendor,
            sug.vendor_normalized AS suggested_vendor_normalized
     FROM dbo.vendor_prep_meetings m

@@ -164,6 +164,31 @@ DROP TABLE IF EXISTS dbo.vendor_prep_attendees;
 DROP TABLE IF EXISTS dbo.vendor_prep_matches;
 ```
 
+## 2a. The Review Queue: agenda vs minutes
+
+Most rows in the Review Queue are there because the meeting has no vendor-side
+attendee — and **the usual reason is that the meeting is still an agenda.**
+Procore does not allow attendance to be recorded until a meeting is converted to
+minutes, so those rows are waiting on that conversion, not on anyone's
+behaviour.
+
+The queue separates them:
+
+| Chip | What it means | What to do |
+|---|---|---|
+| **Agenda** | Attendance isn't recordable yet. | Convert the meeting to minutes in Procore; the tracker then credits the vendor on its own. |
+| **Minutes** | Converted, and still names no vendor-side attendee. | The one worth chasing — attendance was skipped, or the vendor genuinely wasn't there. |
+| **—** | The mirror hasn't carried `meeting_state` yet. | Re-run the ingest + gold + pipeline. |
+
+Actionable rows are listed first. ⚠️ Don't switch on *Require the vendor to be
+marked Present* while the Agenda bucket is non-empty — an un-converted meeting
+can never satisfy it, so every one of them would read as missed.
+
+The ingest's **MEETING STATE** diagnostic reports which field carried the
+distinction and every raw value seen. If it says most meetings are `unknown`,
+Procore marks the state somewhere `MEETING_STATE_FIELDS` isn't looking — the
+listed values say where to look instead.
+
 ## 2b. "No vendors" on a project you know has vendors
 
 Three different situations produce that, and they need different fixes. The

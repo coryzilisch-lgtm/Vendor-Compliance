@@ -337,6 +337,11 @@ SELECT
     m.held_at,
     COALESCE(m.held, false)  AS held,
     m.status,
+    -- 'agenda' | 'minutes' | 'unknown'. A meeting still in agenda state CANNOT
+    -- have attendance recorded — Procore only allows it after the meeting is
+    -- converted to minutes. So a prep meeting with no vendor attendee is a
+    -- missed step only when this says 'minutes'.
+    COALESCE(m.meeting_state, 'unknown') AS meeting_state,
     m.location,
     m.attendee_count,
     -- Normalized + space-padded title, so the API can run the same whole-token
