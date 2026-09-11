@@ -422,6 +422,29 @@ function renderProjects(){
       +'<span class="arrow">'+arrow+'</span></th>';
   }).join('')+'</tr></thead><tbody>';
 
+/* Has the vendor ingest genuinely never pulled this project?
+   Two guards, because the first version of this got it backwards and labelled
+   EVERY project "Not ingested".
+
+   1. `ingested` is null when dbo.vendor_project_scope isn't mirrored yet — we
+      cannot tell, so we must not claim. The bug was `Number(p.ingested)===0`:
+      **Number(null) is 0**, so "unknown" evaluated as "definitely never
+      fetched". A null coerced into a definite claim is the exact error this
+      chip was added to prevent, which is a reason to be strict here rather
+      than clever.
+   2. Never say "not ingested" about a project that is visibly displaying
+      ingested data. If it has vendors or prep meetings on screen, we plainly
+      did fetch it, whatever the scope table says — a self-contradicting row is
+      worse than no chip at all. */
+function neverPulled(p){
+  if(p.ingested===null || p.ingested===undefined) return false;
+  if(Number(p.ingested)!==0) return false;
+  if(Number(p.vendor_total||0)>0) return false;
+  if(Number(p.prep_meeting_count||0)>0) return false;
+  if(p.last_meeting_date) return false;
+  return true;
+}
+
   rows.forEach(function(p){
     var pct = p.pct_complete==null ? null : Number(p.pct_complete);
     var barW = pct==null?0:pct;
@@ -433,13 +456,7 @@ function renderProjects(){
       +'<td class="num">'+esc(p.vendor_held)+'</td>'
       +'<td class="num">'+(p.vendor_outstanding>0
           ? '<span class="pill notheld">'+esc(p.vendor_outstanding)+'</span>' : '0')+'</td>'
-      /* `ingested === 0` means the vendor ingest has never pulled this project —
-         it is in dbo.projects (mirrored by the safety pipeline) but outside the
-         scope this notebook ran with. That is a gap in OUR coverage, not a fact
-         about the job, and rendering it as "No vendors" is how the two got
-         confused. `null` = the scope table isn't mirrored yet, so we can't tell
-         and don't claim either way. */
-      +'<td>'+(Number(p.ingested)===0
+      +'<td>'+(neverPulled(p)
           ? '<span class="pill info" title="This project has never been pulled by the '
             +'vendor ingest — run the notebook with BACKFILL_ALL_HISTORY = True. '
             +'Its vendors are unknown, not absent.">Not ingested</span>'

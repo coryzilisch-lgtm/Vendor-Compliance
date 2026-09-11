@@ -40,15 +40,23 @@ const STUB = {
   '/api/sync-status': { last_loaded: NOW },
   '/api/tracker': [
     { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', project_number: '24-101',
-      superintendent: 'Ken Houston', vendor_count: 12, held_count: 9, outstanding_count: 3,
-      pct: 75, last_meeting_date: '2026-03-17', unmatched_count: 2 },
+      superintendent: 'Ken Houston', vendor_total: 12, vendor_held: 9, vendor_outstanding: 3,
+      prep_meeting_count: 4, pct_complete: 75, last_meeting_date: '2026-03-17',
+      unmatched_meeting_count: 2,
+      // EXPLICIT null, not a missing key. This is what the API returns before
+      // dbo.vendor_project_scope is mirrored, and the difference is the whole
+      // bug: Number(null) is 0 while Number(undefined) is NaN, so a stub that
+      // merely omitted the field could not reproduce production and passed a
+      // dashboard that labelled every project "Not ingested".
+      ingested: null },
     { project_id: 3387062, project_name: 'AEP Eagle Pass Service Center', project_number: '25-004',
-      superintendent: null, vendor_count: 20, held_count: 0, outstanding_count: 20,
-      pct: 0, last_meeting_date: null, unmatched_count: 4, ingested: 1 },
+      superintendent: null, vendor_total: 20, vendor_held: 0, vendor_outstanding: 20,
+      prep_meeting_count: 5, pct_complete: 0, last_meeting_date: null,
+      unmatched_meeting_count: 4, ingested: 1 },
     { project_id: 3119932, project_name: 'An Old 2024 Job', project_number: '24-007',
-      superintendent: null, vendor_count: 0, held_count: 0, outstanding_count: 0,
-      vendor_total: 0, pct: null, last_meeting_date: null, unmatched_count: 0,
-      ingested: 0 },
+      superintendent: null, vendor_total: 0, vendor_held: 0, vendor_outstanding: 0,
+      prep_meeting_count: 0, pct_complete: null, last_meeting_date: null,
+      unmatched_meeting_count: 0, ingested: 0 },
   ],
   '/api/projects/3176472': {
     project: { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', pct: 75 },
@@ -203,6 +211,17 @@ const server = http.createServer((req, res) => {
     ['#review-out', 'Confirm as held', 'Review Queue offers the one-click confirm to admins'],
     ['#mc-vend,#metrics-out', 'ZIP Electric', 'Metrics rendered its vendor table'],
   ];
+  // The "Not ingested" chip must appear exactly once: on the project that has
+  // no data AND ingested:0. Hunting Creek carries no `ingested` field at all
+  // (what the API returns before dbo.vendor_project_scope is mirrored) and must
+  // NOT be labelled — Number(null) === 0 made every row claim it once already.
+  const notIngested = await page.$$eval('#projects-out tr', (trs) =>
+    trs.filter((tr) => /not ingested/i.test(tr.textContent || ''))
+       .map((tr) => (tr.querySelector('.pname') || {}).textContent || '?'));
+  if (notIngested.length !== 1 || !/Old 2024 Job/.test(notIngested[0])) {
+    problems.push(`"Not ingested" should mark only the unfetched project, marked: `
+      + (notIngested.length ? notIngested.join(', ') : '(none)'));
+  }
   for (const [sel, needle, what] of expectations) {
     const text = await page.$$eval(sel, (els) => els.map((e) => e.textContent).join(' '))
       .catch(() => '');
