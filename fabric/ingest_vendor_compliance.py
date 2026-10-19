@@ -182,6 +182,25 @@ PULL_MEETINGS    = True
 # call — and with a diagnostic that reports how many commitment rows carry a
 # usable vendor, so a silent drop can't be mistaken for an absence again.
 PULL_COMMITMENTS = True        # work order + purchase order contracts
+
+# ---- Materials commitments are not vendors who need a prep meeting ----------
+# BCI numbers commitments by what they buy: `S…` is a subcontractor performing
+# work on site, `M…` is a materials purchase. A materials supplier never holds
+# a preparatory meeting, so counting them made every project's percentage read
+# low. A vendor is dropped from a project's roster when EVERY commitment it has
+# on that project is a materials one. A vendor holding even one non-M contract
+# on the job is doing work there and stays.
+#
+# The drop applies to BOTH rosters, on purpose. Every commitment vendor is also
+# in the project directory (commitment_only = 0), so removing a supplier only
+# from the commitments side would leave it in the default `either` denominator
+# through the directory and change nothing.
+#
+# Matched on the contract NUMBER, case-insensitive, after leading whitespace.
+# A contract with no number is never treated as materials: an unknown must not
+# hide a vendor. The MATERIALS COMMITMENTS diagnostic prints the prefixes seen
+# so the rule can be checked against the real numbering.
+MATERIALS_COMMITMENT_PREFIXES = ("M",)
 # Procore's list endpoints return a slim contract record. When the vendor isn't
 # on it, fall back to GET /{path}/{id}, bounded so a tenant with thousands of
 # contracts can't turn one run into thousands of extra calls. The view probe
@@ -1773,8 +1792,9 @@ write_delta(meeting_attendees, "bronze_vendor_meeting_attendees",
                         "company_name", "company_normalized", "attendance_status"],
             merge_project_ids=merge_ids)
 write_delta(commitments, "bronze_vendor_commitments",
-            empty_cols=["project_procore_id", "contract_procore_id", "vendor_name",
-                        "vendor_normalized", "contract_kind"],
+            empty_cols=["project_procore_id", "project_name", "contract_procore_id",
+                        "contract_kind", "contract_number", "contract_status",
+                        "vendor_procore_id", "vendor_name", "vendor_normalized", "is_gc"],
             merge_project_ids=merge_ids)
 write_delta(project_users, "bronze_vendor_project_users",
             empty_cols=["project_procore_id", "person_procore_id", "name", "email",
@@ -1876,12 +1896,37 @@ FROM bronze_vendor_project_scope
 WHERE project_procore_id IS NOT NULL
 """)
 
+def _materials_sql(col="contract_number"):
+    """Spark SQL predicate: this commitment's number marks it as materials.
+    NULL / blank numbers come out FALSE, so an unknown never hides a vendor."""
+    v = f"UPPER(LTRIM(COALESCE(CAST({col} AS STRING), '')))"
+    tests = [f"{v} LIKE '{p.upper().replace(chr(39), '')}%'"
+             for p in MATERIALS_COMMITMENT_PREFIXES if p]
+    return " OR ".join(tests) if tests else "FALSE"
+
+
 # One row per (project, vendor), carrying BOTH provenance flags so the dashboard
 # can switch its denominator between commitments and the directory without a
 # re-ingest — and show the disagreement between them.
 spark.sql("""
 CREATE OR REPLACE TABLE silver_vendor_roster AS
-WITH commit_v AS (
+WITH commit_all AS (
+    SELECT
+        *,
+        ({materials_sql}) AS is_materials
+    FROM bronze_vendor_commitments
+    WHERE vendor_normalized IS NOT NULL AND vendor_normalized <> ''
+      AND LOWER(COALESCE(is_gc, 'false')) <> 'true'
+),
+-- Vendors whose only commitments on this project are materials (M...): a
+-- supplier, not a sub doing work. Removed from the roster on BOTH sides below.
+materials_only AS (
+    SELECT CAST(project_procore_id AS BIGINT) AS project_procore_id, vendor_normalized
+    FROM commit_all
+    GROUP BY project_procore_id, vendor_normalized
+    HAVING SUM(CASE WHEN is_materials THEN 0 ELSE 1 END) = 0
+),
+commit_v AS (
     SELECT
         CAST(project_procore_id AS BIGINT) AS project_procore_id,
         project_name,
@@ -1891,9 +1936,8 @@ WITH commit_v AS (
         COUNT(*)                               AS contract_count,
         MAX(contract_kind)                     AS contract_kind,
         MAX(contract_status)                   AS contract_status
-    FROM bronze_vendor_commitments
-    WHERE vendor_normalized IS NOT NULL AND vendor_normalized <> ''
-      AND LOWER(COALESCE(is_gc, 'false')) <> 'true'
+    FROM commit_all
+    WHERE NOT is_materials
     GROUP BY project_procore_id, project_name, vendor_normalized
 ),
 dir_v AS (
@@ -1926,7 +1970,10 @@ FROM commit_v c
 FULL OUTER JOIN dir_v d
   ON  c.project_procore_id = d.project_procore_id
   AND c.vendor_normalized  = d.vendor_normalized
-""")
+LEFT ANTI JOIN materials_only m
+  ON  m.project_procore_id = COALESCE(c.project_procore_id, d.project_procore_id)
+  AND m.vendor_normalized  = COALESCE(c.vendor_normalized, d.vendor_normalized)
+""".replace("{materials_sql}", _materials_sql()))
 
 # ============================================================
 # 9. Diagnostics
@@ -1999,6 +2046,44 @@ if PULL_COMMITMENTS:
     if _cs["detail_calls"] >= COMMITMENT_DETAIL_MAX:
         print(f"  ⚠️  Hit the detail-call cap ({COMMITMENT_DETAIL_MAX}); some contracts were")
         print("      left unresolved. Raise COMMITMENT_DETAIL_MAX and re-run.")
+
+if PULL_COMMITMENTS:
+    print("\n--- MATERIALS COMMITMENTS (excluded from the roster) ---")
+    print(f"  rule: contract number starts with {list(MATERIALS_COMMITMENT_PREFIXES)}")
+    print("  contracts by first character of their number (check the rule fits):")
+    spark.sql("""
+        SELECT COALESCE(NULLIF(UPPER(SUBSTRING(LTRIM(CAST(contract_number AS STRING)), 1, 1)), ''),
+                        '<none>') AS first_char,
+               contract_kind,
+               COUNT(*) AS contracts,
+               MIN(CAST(contract_number AS STRING)) AS example
+        FROM bronze_vendor_commitments
+        WHERE vendor_normalized IS NOT NULL AND vendor_normalized <> ''
+        GROUP BY 1, 2 ORDER BY contracts DESC
+    """).show(50, truncate=False)
+    _mat = spark.sql(f"""
+        WITH c AS (
+            SELECT project_procore_id, vendor_normalized,
+                   MAX(vendor_name) AS vendor_name,
+                   SUM(CASE WHEN {_materials_sql()} THEN 1 ELSE 0 END) AS m,
+                   SUM(CASE WHEN {_materials_sql()} THEN 0 ELSE 1 END) AS other
+            FROM bronze_vendor_commitments
+            WHERE vendor_normalized IS NOT NULL AND vendor_normalized <> ''
+              AND LOWER(COALESCE(is_gc, 'false')) <> 'true'
+            GROUP BY project_procore_id, vendor_normalized
+        )
+        SELECT
+            SUM(CASE WHEN m > 0 AND other = 0 THEN 1 ELSE 0 END) AS dropped_supplier_rows,
+            SUM(CASE WHEN m > 0 AND other > 0 THEN 1 ELSE 0 END) AS kept_mixed_rows,
+            COUNT(DISTINCT CASE WHEN m > 0 AND other = 0 THEN vendor_normalized END)
+                                                                 AS dropped_distinct_vendors
+        FROM c
+    """).collect()[0]
+    print(f"  (project, vendor) rows dropped as materials-only : {_mat['dropped_supplier_rows'] or 0}")
+    print(f"  ...distinct suppliers                            : {_mat['dropped_distinct_vendors'] or 0}")
+    print(f"  kept: also hold a non-materials contract there   : {_mat['kept_mixed_rows'] or 0}")
+    print("  Dropped from BOTH rosters, so they leave the `either`/`directory`")
+    print("  denominators too. A supplier wrongly dropped: give it a manual vendor entry.")
 
 print("\n--- MEETING DATE (which key this tenant actually populates) ---")
 for k, n in sorted(_date_fields_used.items(), key=lambda kv: -kv[1]):

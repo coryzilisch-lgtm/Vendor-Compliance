@@ -367,6 +367,30 @@ carries vendors (`detail_worth_trying()`) — kept as the rescue if Procore
 changes the shape, without spending ~12% of the nightly API budget confirming
 that templates have no vendor.
 
+### Materials commitments (`M…`) are excluded from the roster
+
+BCI numbers commitments by what they buy: **`S…` = a sub performing work, `M…` =
+a materials purchase.** Suppliers never hold a prep meeting, so counting them
+dragged every project's percentage down. `silver_vendor_roster` now drops a
+(project, vendor) when **every** commitment that vendor has on that project
+starts with a prefix in `MATERIALS_COMMITMENT_PREFIXES` (default `("M",)`).
+
+- **Dropped from BOTH rosters, not just commitments.** Every commitment vendor
+  is also in the directory, so removing a supplier only from the commitments
+  side would leave it in the default `either` denominator and change nothing.
+- **One non-M contract on the job keeps the vendor.** A sub with an `S` and an
+  `M` contract is doing work there.
+- **No number = not materials.** An unknown must not hide a vendor.
+- **Per project.** A supplier on one job and a sub on another stays on the
+  second.
+- Computed in SQL from `contract_number`, so it applies to existing bronze rows
+  with no re-ingest. The **MATERIALS COMMITMENTS** diagnostic prints contracts by
+  first character of their number and how many vendors were dropped: check it
+  against the real numbering before trusting the rule.
+- A supplier wrongly dropped can be added back as a manual vendor. A prep
+  meeting held with a dropped supplier will show in the Review Queue as
+  matching no vendor.
+
 ### Which roster to point the tracker at — the numbers, and the trade
 
 `commitment_only: 0`. **Every commitment vendor is also in the project
