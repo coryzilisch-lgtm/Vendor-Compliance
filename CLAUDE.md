@@ -367,20 +367,22 @@ carries vendors (`detail_worth_trying()`) — kept as the rescue if Procore
 changes the shape, without spending ~12% of the nightly API budget confirming
 that templates have no vendor.
 
-### Materials commitments (`M…`) are excluded from the roster
+### Materials (`M…`) and professional-services (`P…`) commitments are excluded from the roster
 
 BCI numbers commitments by what they buy: **`S…` = a sub performing work, `M…` =
-a materials purchase.** Suppliers never hold a prep meeting, so counting them
-dragged every project's percentage down. `silver_vendor_roster` now drops a
+a materials purchase, `P…` = professional services** (e.g. `P26TR019-01`, ECS
+Southwest, Testing & Inspections). Suppliers and testing firms don't hold a prep
+meeting (the safety team's call for `P`), so counting them dragged every
+project's percentage down. `silver_vendor_roster` now drops a
 (project, vendor) when **every** commitment that vendor has on that project
-starts with a prefix in `MATERIALS_COMMITMENT_PREFIXES` (default `("M",)`).
+starts with a prefix in `MATERIALS_COMMITMENT_PREFIXES` (`("M", "P")`).
 
 - **Dropped from BOTH rosters, not just commitments.** Every commitment vendor
   is also in the directory, so removing a supplier only from the commitments
   side would leave it in the default `either` denominator and change nothing.
-- **One non-M contract on the job keeps the vendor.** A sub with an `S` and an
-  `M` contract is doing work there.
-- **No number = not materials.** An unknown must not hide a vendor.
+- **One `S` (or other non-excluded) contract on the job keeps the vendor.** A
+  sub with an `S` and an `M` contract is doing work there.
+- **No number = not excluded.** An unknown must not hide a vendor.
 - **Per project.** A supplier on one job and a sub on another stays on the
   second.
 - Computed in SQL from `contract_number`, so it applies to existing bronze rows

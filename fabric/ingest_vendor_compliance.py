@@ -183,13 +183,16 @@ PULL_MEETINGS    = True
 # usable vendor, so a silent drop can't be mistaken for an absence again.
 PULL_COMMITMENTS = True        # work order + purchase order contracts
 
-# ---- Materials commitments are not vendors who need a prep meeting ----------
-# BCI numbers commitments by what they buy: `S…` is a subcontractor performing
-# work on site, `M…` is a materials purchase. A materials supplier never holds
-# a preparatory meeting, so counting them made every project's percentage read
+# ---- Commitments that are not vendors who need a prep meeting ---------------
+# BCI numbers commitments by what they buy:
+#   S...  a subcontractor performing work on site       -> needs a prep meeting
+#   M...  a materials purchase (supplier)               -> excluded
+#   P...  professional services, e.g. testing & inspections (ECS Southwest)
+#                                                        -> excluded (safety team's call)
+# Counting suppliers and testing firms made every project's percentage read
 # low. A vendor is dropped from a project's roster when EVERY commitment it has
-# on that project is a materials one. A vendor holding even one non-M contract
-# on the job is doing work there and stays.
+# on that project starts with one of these prefixes. A vendor holding even one
+# other contract (an S) on the job is doing work there and stays.
 #
 # The drop applies to BOTH rosters, on purpose. Every commitment vendor is also
 # in the project directory (commitment_only = 0), so removing a supplier only
@@ -197,10 +200,10 @@ PULL_COMMITMENTS = True        # work order + purchase order contracts
 # through the directory and change nothing.
 #
 # Matched on the contract NUMBER, case-insensitive, after leading whitespace.
-# A contract with no number is never treated as materials: an unknown must not
-# hide a vendor. The MATERIALS COMMITMENTS diagnostic prints the prefixes seen
-# so the rule can be checked against the real numbering.
-MATERIALS_COMMITMENT_PREFIXES = ("M",)
+# A contract with no number is never excluded: an unknown must not hide a
+# vendor. The MATERIALS COMMITMENTS diagnostic prints the prefixes seen so the
+# rule can be checked against the real numbering.
+MATERIALS_COMMITMENT_PREFIXES = ("M", "P")
 # Procore's list endpoints return a slim contract record. When the vendor isn't
 # on it, fall back to GET /{path}/{id}, bounded so a tenant with thousands of
 # contracts can't turn one run into thousands of extra calls. The view probe
@@ -1918,8 +1921,8 @@ WITH commit_all AS (
     WHERE vendor_normalized IS NOT NULL AND vendor_normalized <> ''
       AND LOWER(COALESCE(is_gc, 'false')) <> 'true'
 ),
--- Vendors whose only commitments on this project are materials (M...): a
--- supplier, not a sub doing work. Removed from the roster on BOTH sides below.
+-- Vendors whose only commitments on this project are excluded prefixes (M...
+-- materials, P... testing/professional services): not a sub doing work. Removed from the roster on BOTH sides below.
 materials_only AS (
     SELECT CAST(project_procore_id AS BIGINT) AS project_procore_id, vendor_normalized
     FROM commit_all
@@ -2079,9 +2082,9 @@ if PULL_COMMITMENTS:
                                                                  AS dropped_distinct_vendors
         FROM c
     """).collect()[0]
-    print(f"  (project, vendor) rows dropped as materials-only : {_mat['dropped_supplier_rows'] or 0}")
+    print(f"  (project, vendor) rows dropped (only M/P contracts): {_mat['dropped_supplier_rows'] or 0}")
     print(f"  ...distinct suppliers                            : {_mat['dropped_distinct_vendors'] or 0}")
-    print(f"  kept: also hold a non-materials contract there   : {_mat['kept_mixed_rows'] or 0}")
+    print(f"  kept: also hold an S contract there        : {_mat['kept_mixed_rows'] or 0}")
     print("  Dropped from BOTH rosters, so they leave the `either`/`directory`")
     print("  denominators too. A supplier wrongly dropped: give it a manual vendor entry.")
 
