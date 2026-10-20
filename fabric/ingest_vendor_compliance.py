@@ -269,15 +269,36 @@ ACTIVE_PROJECTS_ONLY = True
 # all — verify write_delta's merge branch before changing it.
 BACKFILL_ALL_HISTORY = False
 
-# Stage strings that mean this job will never need a prep meeting again —
-# it is finished, dead, or paused.
+# ---- Which projects get fetched each night -----------------------------------
+# SCOPE_MATCHES_TRACKER = True (default): fetch exactly the projects the tracker
+# SHOWS — Course of Construction, same rule as the API's activeStageFilter() and
+# the Safety Dashboard. Measured 2026-10: the looser rule below fetched 157
+# projects while the tracker showed ~88, so ~70 jobs cost ~5 calls each, every
+# night, for rows nobody could see (~944 calls a run instead of ~500).
 #
-# Note what is deliberately NOT here: **preconstruction and awarded jobs are
-# KEPT.** A preparatory meeting happens *before* the vendor starts work, so
-# those are exactly the jobs where prep meetings are being held right now. They
-# won't show on the tracker until the stage flips to Course of Construction, but
-# by then their meetings are already ingested and the checklist is correct on
-# day one instead of a day late.
+# What it costs: Awarded / Pre-Construction jobs are no longer pulled until the
+# stage flips. Nothing is lost when it does — the meetings LIST is not
+# incremental, so the first run after the flip fetches every meeting the job has
+# ever had, including prep meetings held while it was Awarded. Worst case is one
+# night's lag on the day of the flip.
+#
+# False = the old rule: anything not finished/dead/paused (FINISHED_STAGE_HINTS),
+# which includes Awarded, Pre-Construction and blank-stage jobs.
+SCOPE_MATCHES_TRACKER = True
+
+# ⚠️ Kept in step with NOT_COURSE_OF_CONSTRUCTION in api/src/db/queries.ts. A
+# stage must contain "construction" and none of these. Each is a trap for a
+# naive "contains construction" test: "Awarded Preconstruction", "Construction
+# Hold", "Post Construction".
+NOT_COURSE_OF_CONSTRUCTION = [
+    "pre-construction", "preconstruction", "pre construction",
+    "post-construction", "postconstruction", "post construction",
+    "hold",
+    "closeout", "close out", "complete",
+]
+
+# The old, looser rule (SCOPE_MATCHES_TRACKER = False): stage strings that mean
+# the job will never need a prep meeting again — finished, dead, or paused.
 FINISHED_STAGE_HINTS = [
     "post construction", "post-construction", "postconstruction",
     "closeout", "close out", "complete", "warranty",
@@ -1215,21 +1236,40 @@ def looks_completed(p):
     return (datetime.now(timezone.utc) - end).days > COMPLETED_GRACE_DAYS
 
 
+def stage_name(p):
+    """The project's stage as plain text. Procore's list response can carry it as
+    an object ({"id": ..., "name": "Course of Construction"}); reading str() of
+    that dict only worked by accident for substring tests."""
+    st = p.get("project_stage") or p.get("stage") or ""
+    if isinstance(st, dict):
+        st = st.get("name") or st.get("label") or ""
+    return str(st).strip()
+
+
 def is_finished_stage(p):
     """Stage says this job is done, dead or paused. Reads the stage off the LIST
     response — no per-project detail call needed."""
-    stage = str(p.get("project_stage") or p.get("stage") or "").lower()
+    stage = stage_name(p).lower()
     return any(h in stage for h in FINISHED_STAGE_HINTS)
 
 
+def is_course_of_construction(p):
+    """The tracker's own rule (API activeStageFilter): stage contains
+    "construction" and none of NOT_COURSE_OF_CONSTRUCTION."""
+    stage = stage_name(p).lower()
+    return "construction" in stage and not any(h in stage for h in NOT_COURSE_OF_CONSTRUCTION)
+
+
 def is_live_project(p):
-    """Worth spending API calls on: Procore still marks it active and its stage
-    isn't finished/dead/paused. Pre-construction and awarded jobs count as live
-    — see FINISHED_STAGE_HINTS."""
+    """Worth spending API calls on. Procore must still mark it active; then
+    either the tracker's course-of-construction rule (SCOPE_MATCHES_TRACKER) or
+    the looser not-finished rule."""
     if p.get("active") is False:
         return False
     if str(p.get("status") or "").lower() in ("inactive", "closed", "archived"):
         return False
+    if SCOPE_MATCHES_TRACKER:
+        return is_course_of_construction(p)
     return not is_finished_stage(p)
 
 
@@ -1272,11 +1312,27 @@ if BACKFILL_ALL_HISTORY:
 
 if ACTIVE_PROJECTS_ONLY and not ONLY_PROJECT_IDS:
     before = len(scope)
+    _pre_scope = list(scope)
     scope = [p for p in scope if is_live_project(p)]
     merge_ids = [p.get("id") for p in scope]
     print(f"  ACTIVE_PROJECTS_ONLY: {before} -> {len(scope)} projects "
-          f"(dropped {before - len(scope)} finished/dead/inactive; their existing "
-          f"rows are preserved).")
+          f"(rule: {'course of construction, same as the tracker' if SCOPE_MATCHES_TRACKER else 'not finished/dead/paused'}; "
+          f"{before - len(scope)} skipped, their existing rows are preserved).")
+    # Show the stages on each side, so a stage name this rule doesn't expect is
+    # visible instead of silently dropping (or keeping) a whole class of jobs.
+    _kept, _skipped = {}, {}
+    for p in _pre_scope:
+        bucket = _kept if is_live_project(p) else _skipped
+        k = stage_name(p) or "<no stage>"
+        bucket[k] = bucket.get(k, 0) + 1
+    print("    fetched: " + ", ".join(f"{k} ({n})" for k, n in sorted(_kept.items(), key=lambda kv: -kv[1])))
+    print("    skipped: " + ", ".join(f"{k} ({n})" for k, n in sorted(_skipped.items(), key=lambda kv: -kv[1])[:12]))
+    if _pre_scope and not scope:
+        raise RuntimeError(
+            "Scope filter kept 0 projects. Procore's project list probably isn't "
+            "carrying a stage this rule recognises (see 'skipped' above). Refusing "
+            "to run an ingest that would fetch nothing; set SCOPE_MATCHES_TRACKER = "
+            "False to fall back to the looser rule.")
     print(f"  ~{len(scope) * 4} API calls for rosters + 1 meetings call per project. "
           f"Set ACTIVE_PROJECTS_ONLY = False for a full historical backfill.")
 
@@ -1807,8 +1863,10 @@ write_delta(directory_vendors, "bronze_vendor_directory",
             empty_cols=["project_procore_id", "vendor_procore_id", "vendor_name",
                         "vendor_normalized"],
             merge_project_ids=merge_ids)
-if sync_errors:
-    write_delta(project_scope, "bronze_vendor_project_scope",
+# Always written. This used to sit inside `if sync_errors:` by mistake, so the
+# table only existed after a run where some Procore call failed; the first fully
+# clean run then died in the silver build with TABLE_OR_VIEW_NOT_FOUND.
+write_delta(project_scope, "bronze_vendor_project_scope",
             empty_cols=["project_procore_id", "project_name", "project_number"],
             merge_project_ids=merge_ids)
 write_delta(sync_errors, "bronze_vendor_sync_errors")
