@@ -393,6 +393,26 @@ starts with a prefix in `MATERIALS_COMMITMENT_PREFIXES` (`("M", "P")`).
   meeting held with a dropped supplier will show in the Review Queue as
   matching no vendor.
 
+### The nightly fetch scope matches what the tracker shows
+
+`SCOPE_MATCHES_TRACKER = True` (default): the ingest fetches only
+**course-of-construction** projects, with the same rule as the API's
+`activeStageFilter()` (`NOT_COURSE_OF_CONSTRUCTION` is duplicated in both files,
+keep them identical). Before this the ingest used a looser "not finished" rule
+and fetched **157 projects while the tracker showed ~88**: ~70 Awarded /
+Pre-Construction / blank-stage jobs at ~5 calls each, every night, for rows
+nobody could see (944 calls a run).
+
+Skipping Awarded / Pre-Construction loses nothing: the meetings list is not
+incremental, so the first run after a job flips to Course of Construction pulls
+every meeting it ever had. Worst case is one night's lag on the flip. The scope
+line now prints the stages fetched and skipped, and the run refuses to continue
+if the rule keeps zero projects (a sign Procore's list stopped carrying stage).
+
+A 63-minute run with 54 minutes of 429 waits is NOT a scope problem on its own:
+the hourly budget is shared by every notebook on the same Procore app, so check
+what else ran in that hour first.
+
 ### Which roster to point the tracker at — the numbers, and the trade
 
 `commitment_only: 0`. **Every commitment vendor is also in the project
