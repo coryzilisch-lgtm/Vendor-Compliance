@@ -1807,8 +1807,10 @@ write_delta(directory_vendors, "bronze_vendor_directory",
             empty_cols=["project_procore_id", "vendor_procore_id", "vendor_name",
                         "vendor_normalized"],
             merge_project_ids=merge_ids)
-if sync_errors:
-    write_delta(project_scope, "bronze_vendor_project_scope",
+# Always written. This used to sit inside `if sync_errors:` by mistake, so the
+# table only existed after a run where some Procore call failed; the first fully
+# clean run then died in the silver build with TABLE_OR_VIEW_NOT_FOUND.
+write_delta(project_scope, "bronze_vendor_project_scope",
             empty_cols=["project_procore_id", "project_name", "project_number"],
             merge_project_ids=merge_ids)
 write_delta(sync_errors, "bronze_vendor_sync_errors")
