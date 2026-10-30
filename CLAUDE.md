@@ -13,6 +13,18 @@ The meetings are created in Procore from the meeting template at
 ("Preparatory Meeting - ZIP"), and the vendor is normally added to the meeting's attendee list.
 Those two facts — the title and the attendee list — are the two signals the tracker matches on.
 
+
+## Azure Application Gateway WAF (Oct 2026)
+
+IT fronts this app with an Application Gateway WAF (OWASP DRS 2.1), tuned from an inventory
+of what the app sends: `docs/waf-exclusions.md`. **A change to a route, method, query parameter,
+custom header, cookie, content type, upload, request body shape or a non-browser caller is a WAF
+change.** Read `.claude/skills/waf-compatibility/SKILL.md` before making one, update the
+inventory in the same PR, and put a `WAF impact:` line in the PR description. A request the WAF
+rejects is a 403 from the gateway with no Function log: the app never sees it. The write-up
+covering all five apps is https://claude.ai/artifact/Q6EaFGC4UZ5CtvxjKJdzMA.
+
+
 ---
 
 ## ⚡ Resume Here — Current State (2026-08-12)
