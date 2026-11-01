@@ -42,7 +42,14 @@ Procore ─▶ fabric/ingest_vendor_compliance.py ─▶ silver_vendor_*
 
 ### It lives in its own Fabric notebook
 
-`Vendor Compliance - Prep Meetings`, two cells (ingest, then gold). **Fully standalone** — it mints
+`Vendor Compliance - Prep Meetings`, two cells (ingest, then gold) plus `fabric/stop_session.py`
+as a third, LAST cell (Nov 2026): it stops the Spark session when the work is done, because an
+interactive session otherwise idles for the workspace timeout (20 min default) billing every node.
+Run it on a **Small, single-node, no-autoscale** custom pool: both cells are HTTP loops against
+Procore with sleeps and 429 waits, and a Medium autoscaling cluster bills every node while one
+thread waits. Schedule it in a different hour from the Procore nightly notebook, or the two share
+the 3,600/hr Procore budget and one sleeps through 429s on a billed cluster.
+**Fully standalone** — it mints
 its own Procore token from Key Vault and fetches its own project list, so it has no ordering
 dependency on `main_ingestion.py` or the Procore Nightly/Friday notebooks. A failure here can't
 take down the safety dashboard's run, and vice versa.
