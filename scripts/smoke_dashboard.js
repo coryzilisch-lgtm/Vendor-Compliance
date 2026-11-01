@@ -37,7 +37,10 @@ const STUB = {
   '/api/me': { email: 'cory.zilisch@buffaloconstruction.com', is_admin: true,
                admin_mode: 'allowlist', emails_seen: ['cory.zilisch@buffaloconstruction.com'] },
   '/api/health': { status: 'ok' },
-  '/api/sync-status': { last_loaded: NOW },
+  // Carries meta.versions: the dashboard keys its localStorage copies on it
+  // and skips the request while the versions match (asserted below).
+  '/api/sync-status': { __data: { last_loaded: NOW },
+                        __meta: { versions: { mirror: NOW, admin: '0' } } },
   '/api/tracker': [
     { project_id: 3176472, project_name: 'Hunting Creek GC Snack Shack', project_number: '24-101',
       superintendent: 'Ken Houston', vendor_total: 12, vendor_held: 9, vendor_outstanding: 3,
@@ -165,9 +168,12 @@ function stubFor(url) {
   return null;
 }
 
+const hits = {};
 const server = http.createServer((req, res) => {
   const url = req.url || '/';
   if (url.startsWith('/api/')) {
+    const key = url.split('?')[0];
+    hits[key] = (hits[key] || 0) + 1;
     const data = stubFor(url);
     if (data === null) { res.writeHead(404).end('{"error":"no stub"}'); return; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -189,9 +195,19 @@ const server = http.createServer((req, res) => {
   try { ({ chromium } = require('playwright-core')); }
   catch { console.log('SKIP: playwright-core not installed'); process.exit(0); }
 
-  const exe = ['/opt/pw-browsers/chromium/chrome-linux/chrome',
-               '/opt/pw-browsers/chromium-1194/chrome-linux/chrome']
-    .find((p) => fs.existsSync(p));
+  // The preinstalled Chromium moves between builds (chromium-1194/chrome-linux,
+  // chromium-1243/chrome-linux64…); find whichever is there, or take
+  // PW_CHROMIUM when set.
+  const candidates = [process.env.PW_CHROMIUM].filter(Boolean);
+  try {
+    for (const dir of fs.readdirSync('/opt/pw-browsers')) {
+      if (!/^chromium(-\d+)?$/.test(dir)) continue;
+      for (const sub of ['chrome-linux64', 'chrome-linux']) {
+        candidates.push(path.join('/opt/pw-browsers', dir, sub, 'chrome'));
+      }
+    }
+  } catch { /* no /opt/pw-browsers */ }
+  const exe = candidates.find((p) => fs.existsSync(p));
   if (!exe) { console.log('SKIP: no Chromium at /opt/pw-browsers'); process.exit(0); }
 
   await new Promise((r) => server.listen(PORT, r));
@@ -296,6 +312,39 @@ const server = http.createServer((req, res) => {
     // not. A flag that fires on every row conveys nothing.
     const hits = (modal.match(/No attendance list/g) || []).length;
     if (hits !== 1) problems.push(`"No attendance list" fired ${hits} times — expected exactly 1`);
+  }
+
+  // The browser cache. With the stub reporting the same data versions on a
+  // reload, the tracker, Review Queue and the drilldown must come from
+  // localStorage with no request at all; Refresh must bypass it. Both
+  // directions matter: a cache that never misses is as broken as one that
+  // never hits, and neither fails a syntax check.
+  const trackerBefore = hits['/api/tracker'] || 0;
+  const unmatchedBefore = hits['/api/unmatched-meetings'] || 0;
+  const projectBefore = hits['/api/projects/3176472'] || 0;
+  if (trackerBefore !== 1) problems.push(`expected 1 tracker request on first load, saw ${trackerBefore}`);
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(400);
+  const rowsAfterReload = await page.$$eval('#projects-out tr.click[data-pid]', (t) => t.length);
+  if (!rowsAfterReload) problems.push('after a reload the tracker rendered no project rows');
+  if ((hits['/api/tracker'] || 0) !== trackerBefore) {
+    problems.push(`reload re-fetched /api/tracker (${hits['/api/tracker']} requests) although the data versions matched`);
+  }
+  if ((hits['/api/unmatched-meetings'] || 0) !== unmatchedBefore) {
+    problems.push('reload re-fetched /api/unmatched-meetings although the data versions matched');
+  }
+  const row2 = await page.$('#projects-out tr.click[data-pid]');
+  if (row2) { await row2.click().catch(() => {}); await page.waitForTimeout(500); }
+  if ((hits['/api/projects/3176472'] || 0) !== projectBefore) {
+    problems.push('re-opening a drilldown re-fetched /api/projects/{id} although the data versions matched');
+  }
+  const modal2 = await page.$eval('#modal', (el) => el.textContent || '').catch(() => '');
+  if (!/MAKK Concrete|ZIP Electric/.test(modal2)) problems.push('cached drilldown did not render its vendor rows');
+  await page.keyboard.press('Escape');
+  await page.click('#btn-refresh').catch(() => {});
+  await page.waitForTimeout(600);
+  if ((hits['/api/tracker'] || 0) !== trackerBefore + 1) {
+    problems.push(`Refresh should bypass the cache: tracker requests ${hits['/api/tracker']}, expected ${trackerBefore + 1}`);
   }
 
   await browser.close();

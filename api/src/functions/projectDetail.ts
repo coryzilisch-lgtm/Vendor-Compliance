@@ -2,6 +2,7 @@ import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { getProjectDetail, getSettings } from '../db/queries.js';
 import { cacheGet, cacheSet } from '../cache.js';
 import { errorResponse, isFresh, meta } from './_shared.js';
+import { currentVersions } from '../versions.js';
 
 /**
  * GET /api/projects/{id}
@@ -28,7 +29,11 @@ app.http('projectDetail', {
         if (hit) return hit;
       }
 
-      const [detail, settings] = await Promise.all([getProjectDetail(id), getSettings()]);
+      const [detail, settings, versions] = await Promise.all([
+        getProjectDetail(id),
+        getSettings(),
+        currentVersions(),
+      ]);
       if (!detail.project) {
         return { status: 404, jsonBody: { error: `Project ${id} isn't in the mirror.` } };
       }
@@ -43,6 +48,7 @@ app.http('projectDetail', {
           meetings: detail.meetings,
           unmatched: detail.unmatched,
           settings,
+          versions,
           summary: {
             vendor_total: tracked,
             vendor_held: held,
