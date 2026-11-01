@@ -43,6 +43,7 @@ Two cells:
 |---|---|
 | 1 | `fabric/ingest_vendor_compliance.py` |
 | 2 | `fabric/build_vendor_gold.py` |
+| 3 | `fabric/stop_session.py` (stops the Spark session; see the header comment) |
 
 **This notebook is fully standalone.** It mints its own Procore token from Key Vault
 (`procore-client-id` / `-secret` / `-company-id`) and fetches its own project list, so it does
