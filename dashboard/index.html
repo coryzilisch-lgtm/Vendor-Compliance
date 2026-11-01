@@ -343,6 +343,68 @@ function errNote(msg){
   return '<div class="note err">Couldn\'t load this: '+esc(msg)+'</div>';
 }
 
+/* ── browser cache keyed on the data versions ───────────────
+   Everything the tracker shows is computed from the nightly mirror (changes
+   once a day, ~4 AM) plus the live admin tables (overrides, manual vendors,
+   settings). /api/sync-status names both as meta.versions {mirror, admin}.
+   A copy in localStorage stored under the same two values is still the right
+   answer, so it is served with NO request. Before this, every page load ran
+   the tracker and Review Queue queries against Fabric even though nothing
+   had changed since the last person looked, and every drilldown sent
+   fresh=1. Refresh (fresh) always bypasses and overwrites. Nothing is stored
+   when the request fails, and every localStorage access is guarded: a
+   private window or a full store must degrade to "fetch as before". */
+var VERS=null;                         // {mirror, admin} from /api/sync-status, or null
+var LS_PREFIX='vc:';
+function versKey(){ return VERS ? String(VERS.mirror||'')+'|'+String(VERS.admin||'') : null; }
+function lsGet(k){
+  try{ var raw=localStorage.getItem(LS_PREFIX+k); return raw?JSON.parse(raw):null; }catch(e){ return null; }
+}
+function lsSet(k,v){ try{ localStorage.setItem(LS_PREFIX+k, JSON.stringify(v)); }catch(e){ /* full or blocked */ } }
+/* Drop every copy stored under a version that is no longer current, so a
+   store never fills up with yesterday's answers. */
+function lsPrune(){
+  try{
+    var want=versKey();
+    for(var i=localStorage.length-1;i>=0;i--){
+      var k=localStorage.key(i);
+      if(!k || k.indexOf(LS_PREFIX)!==0) continue;
+      var e=null; try{ e=JSON.parse(localStorage.getItem(k)); }catch(_){ }
+      if(!want || !e || e.v!==want) localStorage.removeItem(k);
+    }
+  }catch(e){ /* ignore */ }
+}
+async function cachedApi(path, key, fresh){
+  var want=versKey();
+  if(!fresh && want){
+    var hit=lsGet(key);
+    if(hit && hit.v===want && hit.body) return hit.body;
+  }
+  var body=await api(path);            // throws on a non-OK answer: nothing is stored
+  if(want && body && !body.error) lsSet(key,{v:want, at:Date.now(), body:body});
+  return body;
+}
+/* One request per load. Its server cost is one small query per instance per
+   five minutes; a failure just turns the browser cache off for this visit. */
+async function loadVersions(){
+  try{
+    var r=await api('/sync-status');
+    var v=(r.meta&&r.meta.versions)||null;
+    VERS = (v && (v.mirror||v.admin)) ? {mirror:String(v.mirror||''), admin:String(v.admin||'')} : null;
+  }catch(e){ VERS=null; }
+  lsPrune();
+}
+/* After an admin write: adopt the admin version the write handler reports, so
+   every stored copy mismatches and the next read refetches. A write answered
+   by a different Function instance than the one serving sync-status still
+   advances OUR copy, which is what matters for the person who just edited. */
+function noteAdminWrite(r){
+  var v=r&&r.meta&&r.meta.versions;
+  if(!VERS) VERS={mirror:'',admin:''};
+  VERS.admin = (v&&v.admin) ? String(v.admin) : 'local-'+Date.now();
+  lsPrune();
+}
+
 /* ── projects ──────────────────────────────────────────── */
 function matchesFilter(p){
   if(FILTER==='outstanding') return p.vendor_outstanding>0;
@@ -551,7 +613,7 @@ function renderProjects(){
 
 async function loadProjects(fresh){
   try{
-    var r = await api('/tracker?scope='+SCOPE+(fresh?'&fresh=1':''));
+    var r = await cachedApi('/tracker?scope='+SCOPE+(fresh?'&fresh=1':''), 'tracker:'+SCOPE, fresh);
     PROJECTS = r.data||[];
     TOTALS   = (r.meta&&r.meta.totals)||{};
     SETTINGS = (r.meta&&r.meta.settings)||{};
@@ -669,13 +731,18 @@ function vendorRow(v){
     +'</div>';
 }
 
-async function openProject(pid){
+/* fresh is passed only right after a write on this project: the API busts
+   its own copy on the write, and the browser copy is keyed on the admin
+   version, so an ordinary open is served from cache. It used to send fresh=1
+   on every click, which ran three live Fabric queries per drilldown and made
+   the server's 15-minute project cache dead code. */
+async function openProject(pid, fresh){
   if(CURRENT!==pid) COLLAPSED={};
   CURRENT=pid;
   $('modal').innerHTML='<div class="modal-hd"><h2>Loading…</h2></div>';
   $('overlay').classList.add('on');
   try{
-    var r = await api('/projects/'+pid+'?fresh=1');
+    var r = await cachedApi('/projects/'+pid+(fresh?'?fresh=1':''), 'project:'+pid, fresh);
     var p = (r.meta&&r.meta.project)||{}, s=(r.meta&&r.meta.summary)||{};
     var vendors = r.data||[];
     var unmatched = (r.meta&&r.meta.unmatched)||[];
@@ -782,12 +849,12 @@ function wireVendorActions(pid){
       }
       b.disabled=true; b.textContent='Saving…';
       try{
-        await api('/overrides',{
+        noteAdminWrite(await api('/overrides',{
           method:'POST', headers:{'Content-Type':'application/json'},
           body:JSON.stringify({project_id:pid, vendor_normalized:vendor,
                                status:(act==='clear'?'clear':act), note:note})
-        });
-        await openProject(pid);
+        }));
+        await openProject(pid, true);
         loadProjects(true);
       }catch(e){
         alert('Could not save: '+e.message);
@@ -802,11 +869,11 @@ function wireVendorActions(pid){
     if(!name){ $('mv-name').focus(); return; }
     add.disabled=true; add.textContent='Adding…';
     try{
-      await api('/manual-vendors',{
+      noteAdminWrite(await api('/manual-vendors',{
         method:'POST', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({project_id:pid, vendor_name:name})
-      });
-      await openProject(pid);
+      }));
+      await openProject(pid, true);
       loadProjects(true);
     }catch(e){
       alert('Could not add: '+e.message);
@@ -818,9 +885,9 @@ function wireVendorActions(pid){
 function closeModal(){ $('overlay').classList.remove('on'); CURRENT=null; }
 
 /* ── review queue ──────────────────────────────────────── */
-async function loadReview(){
+async function loadReview(fresh){
   try{
-    var r = await api('/unmatched-meetings?scope='+SCOPE);
+    var r = await cachedApi('/unmatched-meetings?scope='+SCOPE+(fresh?'&fresh=1':''), 'unmatched:'+SCOPE, fresh);
     REVIEW = r.data||[];
     var b=$('badge-review');
     if(REVIEW.length){ b.textContent=REVIEW.length; b.style.display=''; } else { b.style.display='none'; }
@@ -925,13 +992,13 @@ async function loadReview(){
           if(!vendor) return;
           b.disabled=true; b.textContent='Saving…';
           try{
-            await api('/overrides',{
+            noteAdminWrite(await api('/overrides',{
               method:'POST', headers:{'Content-Type':'application/json'},
               body:JSON.stringify({project_id:pid, vendor_normalized:vendor, status:'held',
                 note:'Confirmed from the Review Queue: the meeting title names this vendor '
                      +'under a shorter name ('+(b.getAttribute('data-mdate')||'no date')+').'})
-            });
-            await loadReview();
+            }));
+            await loadReview(true);
             loadProjects(true);
           }catch(e){
             alert('Could not confirm: '+e.message);
@@ -1089,7 +1156,7 @@ async function loadSettings(){
       btn.disabled=true; $('save-msg').textContent='Saving…';
       try{
         var sel=document.querySelector('input[name="vendorSource"]:checked');
-        await api('/settings',{
+        noteAdminWrite(await api('/settings',{
           method:'POST', headers:{'Content-Type':'application/json'},
           body:JSON.stringify({
             vendorSource: sel?sel.value:SETTINGS.vendorSource,
@@ -1100,10 +1167,10 @@ async function loadSettings(){
             adminMode: (document.querySelector('input[name="adminMode"]:checked')||{}).value
                        || SETTINGS.adminMode
           })
-        });
+        }));
         $('save-msg').textContent='Saved — reloading the tracker.';
         await loadProjects(true);
-        await loadReview();
+        await loadReview(true);
       }catch(e){
         $('save-msg').textContent='Failed: '+e.message;
       }
@@ -1369,7 +1436,8 @@ function renderTopVendors(){
 async function loadMetrics(fresh){
   try{
     // api() already prepends /api — passing it here made this /api/api/metrics.
-    var r=await api('/metrics?months='+MONTHS+'&scope='+MSCOPE+(fresh?'&fresh=1':''));
+    var r=await cachedApi('/metrics?months='+MONTHS+'&scope='+MSCOPE+(fresh?'&fresh=1':''),
+                          'metrics:'+MONTHS+':'+MSCOPE, fresh);
     METRICS=r.data||null;
     renderMetrics();
   }catch(e){
@@ -1457,10 +1525,16 @@ function renderAdminPanel(){
      list shows it next to every name — picking the wrong Chris is otherwise
      invisible until someone can't sign in. Anyone without an email on file is
      shown greyed and can't be picked: there is nothing to grant. */
-  var box=$('admin-email'), plist=$('admin-people'), pseq=0;
+  var box=$('admin-email'), plist=$('admin-people'), pseq=0, ptimer=null;
   function hidePeople(){ if(plist){ plist.style.display='none'; plist.innerHTML=''; } }
   if(box && plist){
-    box.oninput=async function(){
+    /* Debounced 250 ms: each lookup is two Fabric queries, and typing a name
+       fired one per keystroke. */
+    box.oninput=function(){
+      if(ptimer) clearTimeout(ptimer);
+      ptimer=setTimeout(searchPeople, 250);
+    };
+    async function searchPeople(){
       var q=(box.value||'').trim(), my=++pseq;
       if(q.length<2 || q.indexOf('@')>-1){ hidePeople(); return; }
       try{
@@ -1503,6 +1577,7 @@ function renderAdminPanel(){
     try{
       var r=await api('/admin-users',{method:'POST',headers:{'Content-Type':'application/json'},
                                  body:JSON.stringify({email:email})});
+      noteAdminWrite(r);
       ADMINS=r.data||[]; $('admin-email').value='';
       renderAdminPanel(); $('admin-msg').textContent='Added.';
     }catch(e){ $('admin-msg').textContent='Failed: '+e.message; add.disabled=false; }
@@ -1515,6 +1590,7 @@ function renderAdminPanel(){
       b.disabled=true; b.textContent='…';
       try{
         var r=await api('/admin-users/'+encodeURIComponent(email),{method:'DELETE'});
+        noteAdminWrite(r);
         ADMINS=r.data||[]; renderAdminPanel();
       }catch(e){
         // The API refuses to remove a built-in account or the last admin, and
@@ -1553,7 +1629,7 @@ document.addEventListener('click',function(e){
     Array.prototype.forEach.call(document.querySelectorAll('.chip[data-months]'),function(c){
       c.classList.toggle('on', c===t);
     });
-    loadMetrics(true);
+    loadMetrics(false);   // keyed per months+scope; Refresh is the fresh path
   }
   /* Scope chip: "Include finished" drops the active-project filter so adoption
      over the last two years is measured against the projects that actually held
@@ -1564,7 +1640,7 @@ document.addEventListener('click',function(e){
     Array.prototype.forEach.call(document.querySelectorAll('.chip[data-mscope]'),function(c){
       c.classList.toggle('on', c===t);
     });
-    loadMetrics(true);
+    loadMetrics(false);
   }
   if(t.matches && t.matches('.chip[data-filter]')){
     FILTER=t.getAttribute('data-filter');
@@ -1577,8 +1653,14 @@ document.addEventListener('click',function(e){
 $('overlay').onclick=function(e){ if(e.target===$('overlay')) closeModal(); };
 document.addEventListener('keydown',function(e){ if(e.key==='Escape') closeModal(); });
 $('q').oninput=renderProjects;
-$('scope').onchange=function(){ SCOPE=$('scope').value; loadProjects(true); loadReview(); };
-$('btn-refresh').onclick=function(){ loadProjects(true); loadReview(); if(METRICS) loadMetrics(true); };
+$('scope').onchange=function(){ SCOPE=$('scope').value; loadProjects(false); loadReview(false); };
+/* Refresh is the ONLY path that bypasses every cache: re-read the versions
+   (fresh sync-status), then refetch what is on screen with fresh=1. */
+$('btn-refresh').onclick=async function(){
+  try{ var r=await api('/sync-status?fresh=1'); var v=(r.meta&&r.meta.versions)||null;
+       VERS=(v&&(v.mirror||v.admin))?{mirror:String(v.mirror||''),admin:String(v.admin||'')}:null; }catch(e){ VERS=null; }
+  loadProjects(true); loadReview(true); if(METRICS) loadMetrics(true);
+};
 $('btn-settings').onclick=function(){ showTab('settings'); };
 
 (async function init(){
@@ -1594,8 +1676,9 @@ $('btn-settings').onclick=function(){ showTab('settings'); };
   }
   if(ADMIN){ $('btn-settings').style.display=''; }
   $('tab-settings').style.display='';
+  await loadVersions();
   await loadProjects(false);
-  await loadReview();
+  await loadReview(false);
 })();
 })();
 </script>

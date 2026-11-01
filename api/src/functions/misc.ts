@@ -1,6 +1,8 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
-import { getSyncStatus, getUnmatchedMeetings, settingsHealth } from '../db/queries.js';
-import { BOOTSTRAP_ADMIN_LIST, effectiveAdminMode, errorResponse, getClientPrincipal, isAdmin, meta, requestEmails } from './_shared.js';
+import { getUnmatchedMeetings, settingsHealth } from '../db/queries.js';
+import { cacheGet, cacheSet } from '../cache.js';
+import { adminVersion, mirrorVersionOf, syncStatusCached } from '../versions.js';
+import { BOOTSTRAP_ADMIN_LIST, effectiveAdminMode, errorResponse, getClientPrincipal, isAdmin, isFresh, meta, requestEmails } from './_shared.js';
 
 /** GET /api/health — liveness only; deliberately does not touch SQL. */
 app.http('health', {
@@ -93,14 +95,24 @@ app.http('me', {
   },
 });
 
-/** GET /api/sync-status — when the Fabric pipeline last landed vendor data. */
+/**
+ * GET /api/sync-status — when the Fabric pipeline last landed vendor data.
+ *
+ * This is the one request the dashboard makes on every load: `meta.versions`
+ * tells it whether its localStorage copies of the tracker, the Review Queue,
+ * the metrics and the drilldowns are still current. The mirror part is a
+ * 300 s process cache (one small query per instance per five minutes); the
+ * admin part is in-memory and always live, so an admin's own write is seen on
+ * the very next call to the same instance.
+ */
 app.http('syncStatus', {
   methods: ['GET'],
   authLevel: 'anonymous',
   route: 'sync-status',
-  handler: async (): Promise<HttpResponseInit> => {
+  handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
-      return meta(await getSyncStatus(), undefined, 0);
+      const status = await syncStatusCached(isFresh(request));
+      return meta(status, { versions: { mirror: mirrorVersionOf(status), admin: adminVersion() } }, 0);
     } catch (err) {
       return errorResponse(err);
     }
@@ -122,7 +134,24 @@ app.http('unmatchedMeetings', {
   handler: async (request: HttpRequest): Promise<HttpResponseInit> => {
     try {
       const scope = request.query.get('scope') === 'all' ? 'all' : 'active';
-      return meta(await getUnmatchedMeetings(scope), { scope }, 600);
+      const fresh = isFresh(request);
+      const key = `unmatched:${scope}`;
+      if (!fresh) {
+        const hit = cacheGet<HttpResponseInit>(key);
+        if (hit) return hit;
+      }
+      const [rows, status] = await Promise.all([
+        getUnmatchedMeetings(scope),
+        syncStatusCached().catch(() => ({}) as Record<string, unknown>),
+      ]);
+      const response = meta(
+        rows,
+        { scope, versions: { mirror: mirrorVersionOf(status), admin: adminVersion() } },
+        fresh ? 0 : 600,
+      );
+      // Same TTL as the tracker; busted by the same admin writes (versions.ts).
+      if (!fresh) cacheSet(key, 900, response);
+      return response;
     } catch (err) {
       return errorResponse(err);
     }

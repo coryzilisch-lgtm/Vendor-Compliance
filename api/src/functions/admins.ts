@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { addAdmin, getSettings, listAdmins, removeAdmin, searchPeople } from '../db/queries.js';
-import { cacheBust } from '../cache.js';
+import { bustAfterAdminWrite, currentVersions } from '../versions.js';
 import { BOOTSTRAP_ADMIN_LIST, actorEmail, errorResponse, meta, requireAdmin } from './_shared.js';
 
 /**
@@ -48,8 +48,8 @@ app.http('adminUsers', {
       }
 
       await addAdmin(email, actorEmail(request), BOOTSTRAP_ADMIN_LIST());
-      cacheBust('tracker:');
-      return meta(await listAdmins(BOOTSTRAP_ADMIN_LIST()), { added: email }, 0);
+      bustAfterAdminWrite();
+      return meta(await listAdmins(BOOTSTRAP_ADMIN_LIST()), { added: email, versions: await currentVersions() }, 0);
     } catch (err) {
       return errorResponse(err);
     }
@@ -74,8 +74,8 @@ app.http('adminUserDelete', {
       const result = await removeAdmin(email, BOOTSTRAP_ADMIN_LIST());
       if (!result.ok) return { status: 409, jsonBody: { error: result.error } };
 
-      cacheBust('tracker:');
-      return meta(await listAdmins(BOOTSTRAP_ADMIN_LIST()), { removed: email }, 0);
+      bustAfterAdminWrite();
+      return meta(await listAdmins(BOOTSTRAP_ADMIN_LIST()), { removed: email, versions: await currentVersions() }, 0);
     } catch (err) {
       return errorResponse(err);
     }

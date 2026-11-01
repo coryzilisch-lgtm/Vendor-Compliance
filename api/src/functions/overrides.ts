@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { clearOverride, listOverrides, saveOverride } from '../db/queries.js';
-import { cacheBust } from '../cache.js';
+import { bustAfterAdminWrite, currentVersions } from '../versions.js';
 import { actorEmail, errorResponse, meta, requireAdmin } from './_shared.js';
 import { normalizeCompany } from '../normalize.js';
 
@@ -61,10 +61,12 @@ app.http('overrides', {
         };
       }
 
-      cacheBust('tracker:');
-      cacheBust('metrics:');
-      cacheBust(`project:${projectId}`);
-      return meta({ ok: true, project_id: projectId, vendor_normalized: vendorNormalized }, undefined, 0);
+      bustAfterAdminWrite(projectId);
+      return meta(
+        { ok: true, project_id: projectId, vendor_normalized: vendorNormalized },
+        { versions: await currentVersions() },
+        0,
+      );
     } catch (err) {
       return errorResponse(err);
     }
@@ -87,10 +89,8 @@ app.http('overrideDelete', {
         return { status: 400, jsonBody: { error: 'projectId and vendor are required.' } };
       }
       await clearOverride(projectId, vendor);
-      cacheBust('tracker:');
-      cacheBust('metrics:');
-      cacheBust(`project:${projectId}`);
-      return meta({ ok: true }, undefined, 0);
+      bustAfterAdminWrite(projectId);
+      return meta({ ok: true }, { versions: await currentVersions() }, 0);
     } catch (err) {
       return errorResponse(err);
     }

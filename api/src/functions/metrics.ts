@@ -2,6 +2,7 @@ import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
 import { getMetrics } from '../db/queries.js';
 import { cacheGet, cacheSet } from '../cache.js';
 import { errorResponse, isFresh, meta } from './_shared.js';
+import { currentVersions } from '../versions.js';
 
 /**
  * GET /api/metrics?months=12
@@ -28,8 +29,8 @@ app.http('metrics', {
         const hit = cacheGet<HttpResponseInit>(key);
         if (hit) return hit;
       }
-      const data = await getMetrics(months, scope);
-      const response = meta(data, undefined, fresh ? 0 : 3600);
+      const [data, versions] = await Promise.all([getMetrics(months, scope), currentVersions()]);
+      const response = meta(data, { versions }, fresh ? 0 : 3600);
       if (!fresh) cacheSet(key, 900, response);
       return response;
     } catch (err) {

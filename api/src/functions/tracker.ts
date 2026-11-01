@@ -1,5 +1,6 @@
 import { app, HttpRequest, HttpResponseInit } from '@azure/functions';
-import { getProjectSummaries, getSettings, getSyncStatus } from '../db/queries.js';
+import { getProjectSummaries, getSettings } from '../db/queries.js';
+import { adminVersion, mirrorVersionOf, syncStatusCached } from '../versions.js';
 import { cacheGet, cacheSet } from '../cache.js';
 import { errorResponse, isFresh, meta } from './_shared.js';
 
@@ -30,7 +31,7 @@ app.http('tracker', {
       const [projects, settings, sync] = await Promise.all([
         getProjectSummaries(scope),
         getSettings(),
-        getSyncStatus().catch(() => ({})),
+        syncStatusCached(fresh).catch(() => ({})),
       ]);
 
       const totals = projects.reduce(
@@ -50,6 +51,7 @@ app.http('tracker', {
           scope,
           settings,
           sync,
+          versions: { mirror: mirrorVersionOf(sync), admin: adminVersion() },
           totals: {
             ...totals,
             projects: projects.length,

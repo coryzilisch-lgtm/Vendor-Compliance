@@ -490,6 +490,47 @@ Specifically:
 
 ---
 
+## Caching: Fabric is read once per data change, not once per click (2026-11-01)
+
+The capacity throttles during the day, and this app was spending queries on reads whose
+answer could not have changed. What it does now, and the keys to know when debugging:
+
+- **Browser cache keyed on the data versions** (`cachedApi` in `dashboard/index.html`).
+  Every read the tracker shows is computed from the nightly mirror (`vendor_*`, lands
+  ~4 AM) plus the live admin tables (overrides, manual vendors, settings). `GET
+  /api/sync-status` reports both as `meta.versions = { mirror, admin }`: `mirror` is the
+  newest `_fabric_loaded_at` across the mirrored tables; `admin` is the time of the last
+  admin write the answering Function instance handled (`'0'` before any). The tracker,
+  Review Queue, metrics and each drilldown are stored in `localStorage` under `vc:<key>`
+  with the versions they were fetched under, and served with **no request** while the
+  versions still match. Page load = one `sync-status` call (300 s process cache, so one
+  small query per instance per 5 minutes) and nothing else on a quiet day. A copy stored
+  under an old version is pruned. Nothing is stored on a failed request, every
+  `localStorage` access is guarded, and a missing `meta.versions` (an old API build) just
+  turns the browser cache off.
+- **`fresh=1` is sent by the Refresh button only.** It bypasses and overwrites every
+  layer. The project drilldown used to send it on every click, which ran three live
+  Fabric queries per open and made the server's 15-minute `project:{id}` cache dead code.
+  Metrics chips and the scope select are now served from the cache (keyed per
+  months / scope).
+- **Every admin write goes through `bustAfterAdminWrite()`** (`api/src/versions.ts`): it
+  drops `tracker:`, `metrics:`, `unmatched:`, `coverage` and `project:` on that instance
+  and advances the admin version. The write's response carries `meta.versions`, which
+  the dashboard adopts (`noteAdminWrite`) so the editor's own next read refetches. A new
+  write endpoint that does not call it is a stale-tracker bug.
+- **New process caches:** `unmatched:{scope}` 900 s, `coverage` (the Settings tab's
+  roster comparison) 900 s, `sync-status` 300 s. Same TTL family as `tracker:` / `metrics:`
+  / `project:`.
+- **Known limit, unchanged from before:** the admin version is per Function instance. Another
+  instance can report an older one and serve its own in-memory copy until that copy's
+  TTL (≤ 15 min). The browser cache adds no staleness on top of what the process cache
+  already had; a cross-instance counter would cost a query on exactly the path this saves.
+- **People typeahead** is debounced 250 ms (it was two queries per keystroke).
+- `node scripts/smoke_dashboard.js` asserts both directions: a reload with matching
+  versions makes no tracker / Review Queue / drilldown request, and Refresh does. Both
+  were confirmed failing with the cache broken each way. The script now finds whichever
+  `/opt/pw-browsers/chromium*` build is installed (or `PW_CHROMIUM`).
+
 ## Repo layout
 
 ```
@@ -525,7 +566,7 @@ docs/setup.md                        the deploy runbook — start here for anyth
 | `POST /api/manual-vendors` (admin) · `DELETE /{pid}/{vendor}` | vendors not in either Procore roster |
 | `GET /api/admin-users` · `POST` (admin) · `DELETE /{email}` | the in-app admin list (renamed from `/api/admins`, which SWA wedged at 404 — see gotchas) |
 | `GET /api/people?q=` | typeahead behind the add-admin picker: `dbo.directory_users` when mirrored, else `dbo.superintendents` (names only, marked as un-grantable) |
-| `GET /api/me` · `/api/health` · `/api/sync-status` | identity/admin flag, liveness, mirror freshness |
+| `GET /api/me` · `/api/health` · `/api/sync-status` | identity/admin flag, liveness, mirror freshness + `meta.versions` (the browser cache key) |
 
 `?fresh=1` on any read bypasses the in-Function cache and returns `Cache-Control: no-store`.
 
