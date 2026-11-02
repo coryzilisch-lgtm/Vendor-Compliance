@@ -7,7 +7,9 @@
   "scripts": {
     "build": "tsc",
     "start": "func start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "pretest": "tsc",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@azure/functions": "^4.5.0",

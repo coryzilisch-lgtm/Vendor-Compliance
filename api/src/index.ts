@@ -5,6 +5,13 @@
 // file" rule that bit the intranet applies to *duplicate registrations of the
 // same name*, not to distinct routes, and keeping four trivial handlers in one
 // file is fewer moving parts than four near-empty ones.
+import { app } from '@azure/functions';
+import { registerGuestGate } from './guestGate.js';
+
+// Guest accounts are refused on every route before any handler runs (Nov 2026):
+// see guestGate.ts. Registered first so no function module can come before it.
+registerGuestGate(app, 'The Prep-Phase Meeting Tracker');
+
 import './functions/misc.js';
 import './functions/tracker.js';
 import './functions/projectDetail.js';
