@@ -497,6 +497,41 @@ Specifically:
 
 ---
 
+## The nightly ingest re-pulls only what can change (2026-11-02)
+
+The nightly run was ~450 Procore calls, and ~350 of them re-fetched rosters that had not
+changed: project users, directory vendors, work orders and purchase orders for all 88
+course-of-construction projects, every night. The meetings list is the only per-project
+pull that has to run nightly (it is how new prep meetings are found). Now:
+
+- **Rosters refresh on `ROSTER_REFRESH_WEEKDAY` (Friday, `None` = nightly).** On other
+  nights directory vendors and commitments are fetched only for projects new to scope (no
+  stored directory rows), `ONLY_PROJECT_IDS`, or `BACKFILL_ALL_HISTORY`; everyone else keeps
+  their stored rows through `merge_project_ids`. `roster_refresh_tonight` /
+  `roster_fetch_for` are the decision functions. The scope table carries last run's counts
+  forward for projects not fetched, so it never reports zero vendors on a skip night.
+- **Project users are fetched lazily** (`ensure_project_users`), only when a meeting detail
+  call is actually made for that project, which on a warm night is a handful. The table
+  merges on the pids fetched.
+- **`THROTTLE_SEC` is 0.1** (was 0.25). The low-remaining floor and the 429 handler are the
+  real guard.
+- **A failed fetch keeps the stored rows.** `request_json` raises a real error (it ended in
+  `raise None` after three 429s), the per-table handlers record the pid in `_failed`, and
+  `write_delta_merged` drops it from the merge list and refuses the empty-rows + empty-merge
+  case that used to overwrite a table with nothing.
+- **Bug fixed:** the commitment detail call assigned `request_json`'s `(payload, status)` tuple
+  to `detail` and then tested `isinstance(detail, dict)`, so it could never recover a vendor.
+  The "72 calls, 0 recoveries" measurement was this bug, not proof about templates.
+- **The project list is Active + Inactive as two requests** (`fetch_projects_every_status`,
+  copied from Safety-Dash); lowercase `by_status=all` was ignored by Procore.
+- `RUN_DIAGNOSTICS = True` guards the ingest's section-9 diagnostics; flip it off to save a
+  minute of Spark once the rules are trusted.
+
+Expected warm night: ~100-130 calls instead of ~450. `fabric/test_lean_vendor.py` lifts the
+decision functions out of the cell with `ast` and runs them (41 checks); it is the only test,
+nothing here has run against Procore yet. **Re-paste the ingest cell** into the scheduled
+notebook; the gold cell is unchanged.
+
 ## Caching: Fabric is read once per data change, not once per click (2026-11-01)
 
 The capacity throttles during the day, and this app was spending queries on reads whose
