@@ -21,6 +21,13 @@
 # BOTH vendor rosters are ingested on purpose. Which one drives the tracker's
 # checklist is a dashboard setting (`vendorSource`), not a decision baked in here.
 #
+# LEAN NIGHTLY (Nov 2026). Rosters (#2, #3) are re-fetched only on
+# ROSTER_REFRESH_WEEKDAY or for projects new to scope; people (#1) only for a
+# project that needs a meeting DETAIL call; the meetings LIST (#4) every night
+# for every in-scope project, because it is the only thing that finds a new
+# prep meeting. A failed fetch keeps that project's stored rows. Section 9's
+# diagnostics sit behind RUN_DIAGNOSTICS.
+#
 # CORRECTED 2026-09. An earlier note here said "BCI does NOT use Procore
 # commitments". That was wrong, and it was wrong in a way worth keeping written
 # down. Commitments exist — project 3119932 alone returns 20 work orders and 10
@@ -134,7 +141,10 @@ TEMPLATE_ID_FIELDS = [
     "source_meeting_template_id", "origin_id",
 ]
 
-THROTTLE_SEC = 0.25
+# 0.1 s (was 0.25, Nov 2026). The fixed sleep was ~2 minutes of a ~450-call
+# night spent doing nothing; the RATE_LIMIT_FLOOR pause below and the 429
+# handler in request_json are what actually protect the budget.
+THROTTLE_SEC = 0.1
 MEETINGS_PER_PAGE = 100
 # The project directory runs ~200 companies on a busy job; 1000/page turns that
 # from three calls into one. Same trick that gave the incidents ingest its
@@ -364,6 +374,35 @@ EXCLUDED_PROJECT_NUMBER_PREFIXES = ["BB"]
 # bronze rows (every other project is preserved). Set back to [] when done.
 ONLY_PROJECT_IDS = []          # e.g. [3408160, 3078043]
 
+# ---- Roster refresh cadence (Nov 2026) --------------------------------------
+# The directory vendor list, work orders and purchase orders of a project
+# change rarely, but they were re-fetched for every in-scope project every
+# night: 3 of the ~5 calls per project, ~80% of the run, for rows identical to
+# the ones already in bronze. They are now refreshed in full on ONE weekday
+# (Mon=0 ... Fri=4, Sun=6; None = every night, the old behaviour). On the other
+# nights only projects NEW to scope (no rows in bronze_vendor_directory yet),
+# ONLY_PROJECT_IDS and BACKFILL_ALL_HISTORY runs fetch their rosters; everyone
+# else keeps their stored rows through the project-level merge, and the
+# email-domain fallback reads the stored vendor names instead.
+#
+# The meetings LIST is still pulled every night for every in-scope project.
+# That is the one call that discovers a new prep meeting and it cannot be
+# cached; it is the irreducible floor of the run.
+ROSTER_REFRESH_WEEKDAY = 4
+
+# Project directory PEOPLE (the attendee -> company bridge) are fetched lazily
+# (Nov 2026): only for a project the moment a meeting DETAIL call is about to be
+# made for it, since that is the only thing the map is used for. On a warm
+# night with every prep meeting cached that is zero users calls instead of one
+# per project. Projects not fetched keep their stored rows.
+
+# Section 9 (the run-end diagnostics: coverage, template ids, attendee shapes,
+# commitment resolution, materials prefixes, detail-call reuse, prep title
+# exclusions, meeting state) is ~15 Spark jobs that only print. True keeps
+# them, as before; set False on a scheduled run once they have answered their
+# questions. The totals and API lines above section 9 always print.
+RUN_DIAGNOSTICS = True
+
 # ---- The general contractor --------------------------------------------------
 # Attendees from this company are BCI's own people, never "the vendor". Matched
 # case-insensitively after normalization, so "Buffalo Construction, Inc." and
@@ -491,7 +530,12 @@ def request_json(url, params=None, allow_404=True):
             last_exc = e
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_SLEEP_SECONDS * attempt)
-    raise last_exc
+    # Three 429s (or 401s) in a row exhaust the attempts without an exception,
+    # so this used to be `raise None`, a TypeError. Raise something that says
+    # what happened; the per-project handler keeps that project's stored rows.
+    raise last_exc or RuntimeError(
+        f"Procore request gave up after {MAX_RETRIES} attempts "
+        f"(last status {response.status_code if response is not None else 'none'}): {url}")
 
 
 def _note_status(label, status, total=None, returned=None):
@@ -1181,15 +1225,52 @@ def extract_attendee_list(detail):
 # ============================================================
 # 5. Project scope
 # ============================================================
+def fetch_projects_every_status(_get_paginated, endpoint, cid, page_size):
+    """The company project list INCLUDING inactive jobs (Oct 2026 fix, copied
+    from Safety-Dash main_ingestion.py; this notebook is standalone).
+
+    Procore documents filters[by_status] as "Active" | "Inactive" | "All". This
+    cell sent lowercase "all", which Procore ignores and answers with the
+    default (active-only) list, so BACKFILL_ALL_HISTORY never saw an inactive
+    job. Ask for Active and Inactive separately and merge by id; print both
+    counts so a filter Procore ignores can't hide again.
+    `_get_paginated(url, params, per_page)` is this cell's pager."""
+    by_id, ids_by = {}, {}
+    for st in ("Active", "Inactive"):
+        try:
+            rows = _get_paginated(endpoint, {"company_id": cid, "filters[by_status]": st}, page_size)
+        except Exception as e:
+            print(f"  filters[by_status]={st} failed: {e}")
+            rows = []
+        rows = [r for r in (rows or []) if isinstance(r, dict) and r.get("id") is not None]
+        ids_by[st] = {r["id"] for r in rows}
+        for r in rows:
+            by_id.setdefault(r["id"], r)
+    n_act, n_inact = len(ids_by["Active"]), len(ids_by["Inactive"])
+    print(f"  Project list: {n_act} from by_status=Active, {n_inact} from by_status=Inactive, "
+          f"{len(by_id)} unique.")
+    if not by_id:
+        print("  Neither status filter returned projects; falling back to the default list (active only).")
+        rows = _get_paginated(endpoint, {"company_id": cid}, page_size)
+        return [r for r in (rows or []) if isinstance(r, dict)]
+    if n_inact and ids_by["Inactive"] == ids_by["Active"]:
+        print("  WARNING: by_status=Inactive returned the same projects as Active, so Procore is "
+              "ignoring the filter. Inactive jobs are NOT in this pull.")
+    elif n_inact == 0:
+        print("  WARNING: Procore returned 0 inactive projects. Either there are none, or the API "
+              "service account can't see them.")
+    for pid in ids_by["Inactive"] - ids_by["Active"]:
+        if by_id[pid].get("active") is None:
+            by_id[pid]["active"] = False
+    return list(by_id.values())
+
+
 def fetch_all_projects():
-    """Full project list. filters[by_status]=all so Inactive/completed jobs are
-    included — the same fix ingest_safety.py needed."""
+    """Full project list, Active + Inactive as two requests (see above)."""
     url = f"{PROCORE_API_BASE_URL}/rest/v1.0/projects"
-    rows = get_paginated(url, {"company_id": company_id, "filters[by_status]": "all"}, per_page=300)
-    if not rows:
-        print("  filters[by_status]=all returned nothing — falling back to the default list.")
-        rows = get_paginated(url, {"company_id": company_id}, per_page=300)
-    return rows
+    return fetch_projects_every_status(
+        lambda u, params, page_size: get_paginated(u, params, per_page=page_size),
+        url, company_id, 300)
 
 
 def project_dates(p):
@@ -1356,6 +1437,68 @@ if VENDOR_TEST_LIMIT is not None:
 
 print(f"  {len(all_projects)} projects total; {len(scope)} in scope.")
 
+
+# ---- Roster refresh: which projects get their rosters re-fetched tonight ----
+def roster_refresh_tonight(weekday, refresh_weekday=None, backfill=False, only_ids=None):
+    """True when EVERY in-scope project's rosters are re-fetched tonight."""
+    if refresh_weekday is None or backfill or only_ids:
+        return True
+    return int(weekday) == int(refresh_weekday)
+
+
+def roster_fetch_for(pid, refresh_all, known_pids, only_ids=None):
+    """Fetch this project's directory vendors + commitments tonight?
+    Yes on a refresh night, for a project with no stored directory rows yet
+    (new to scope), or when it is explicitly targeted."""
+    if refresh_all:
+        return True
+    if only_ids and str(pid) in {str(i) for i in only_ids}:
+        return True
+    return str(pid) not in {str(k) for k in known_pids}
+
+
+_refresh_all = roster_refresh_tonight(datetime.now(timezone.utc).weekday(),
+                                      ROSTER_REFRESH_WEEKDAY, BACKFILL_ALL_HISTORY,
+                                      ONLY_PROJECT_IDS)
+
+# What bronze already holds, for the nights that reuse it: the project ids with
+# directory rows (= "seen before"), each project's stored vendor names (the
+# email-domain fallback), and last run's per-project counts/statuses (so the
+# scope table can carry them forward instead of reporting zero vendors).
+_bronze_directory_pids = set()
+_bronze_vendor_norms = {}      # pid(str) -> {spaceless normalized name: vendor_name}
+_bronze_scope_rows = {}        # pid(str) -> last run's project_scope row
+if spark.catalog.tableExists("bronze_vendor_directory"):
+    try:
+        for r in spark.table("bronze_vendor_directory").select("project_procore_id", "vendor_name").collect():
+            _pid = str(r["project_procore_id"])
+            _bronze_directory_pids.add(_pid)
+            _vn = r["vendor_name"]
+            if _vn:
+                _bronze_vendor_norms.setdefault(_pid, {})[normalize_company(_vn).replace(" ", "")] = _vn
+    except Exception as e:
+        print(f"  could not read bronze_vendor_directory ({e}); treating every project as new.")
+if spark.catalog.tableExists("bronze_vendor_project_scope"):
+    try:
+        for r in spark.table("bronze_vendor_project_scope").collect():
+            _bronze_scope_rows[str(r["project_procore_id"])] = r.asDict()
+    except Exception as e:
+        print(f"  could not read bronze_vendor_project_scope ({e}); counts will not carry forward.")
+
+_roster_pids = [p.get("id") for p in scope
+                if roster_fetch_for(p.get("id"), _refresh_all, _bronze_directory_pids, ONLY_PROJECT_IDS)]
+if _refresh_all:
+    print(f"  Roster refresh night (ROSTER_REFRESH_WEEKDAY={ROSTER_REFRESH_WEEKDAY}): directory "
+          f"vendors + commitments re-fetched for all {len(_roster_pids)} in-scope projects.")
+else:
+    print(f"  Not a roster refresh night (ROSTER_REFRESH_WEEKDAY={ROSTER_REFRESH_WEEKDAY}, "
+          f"today={datetime.now(timezone.utc).weekday()}): rosters re-fetched for "
+          f"{len(_roster_pids)} project(s) new to scope; the other "
+          f"{len(scope) - len(_roster_pids)} keep their stored rows. Project users are fetched "
+          f"only where a meeting detail call needs them.")
+print(f"  Expected: ~{len(scope)} meetings calls + ~{3 * len(_roster_pids)} roster calls "
+      f"+ one users call per project with an uncached prep meeting.")
+
 from pyspark.sql.types import BooleanType as _BoolT
 spark.udf.register("is_prep_title", looks_like_prep_meeting, _BoolT())
 
@@ -1485,6 +1628,11 @@ meeting_summaries, meeting_details, meeting_attendees, project_users = [], [], [
 commitments, directory_vendors, sync_errors = [], [], []
 project_scope = []
 template_id_hits, attendance_shapes, raw_status_values = {}, {}, {}
+# Projects whose fetch FAILED, per table. A failed project must keep its stored
+# rows (it is dropped from that table's merge list and its partial rows are
+# discarded), never be replaced with nothing.
+_failed = {"users": set(), "commitments": set(), "directory": set(), "meetings": set()}
+_users_fetched_pids = []       # projects whose directory PEOPLE were fetched tonight
 
 load_meeting_detail_cache([p.get("id") for p in scope])
 print()
@@ -1503,11 +1651,21 @@ for pi, project in enumerate(scope, start=1):
     # "Company" column by joining the person against the project directory, so
     # the tracker has to do the same. One extra call per project buys the single
     # most important matching signal.
+    #
+    # Fetched LAZILY (Nov 2026): the map is only consulted when a meeting detail
+    # call is made, so `ensure_project_users()` runs just before the first
+    # detail call for this project and not at all when every prep meeting is
+    # served from the cache. Not fetched = stored rows kept (merge).
     person_company = {}
     project_vendor_norms = {}   # space-stripped key -> the vendor's real name
-    if PULL_PROJECT_USERS:
+    _users_done = [False]
+
+    def ensure_project_users(_pid=pid):
+        if _users_done[0] or not PULL_PROJECT_USERS:
+            return
+        _users_done[0] = True
         try:
-            rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.0/projects/{pid}/users",
+            rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.0/projects/{_pid}/users",
                                  {"company_id": company_id}, per_page=VENDOR_PAGE_SIZE,
                                  label="project_users")
             for u in rows:
@@ -1522,7 +1680,7 @@ for pi, project in enumerate(scope, start=1):
                 if uid is not None and cname:
                     person_company[str(uid)] = cname
                 project_users.append({
-                    "project_procore_id": pid,
+                    "project_procore_id": _pid,
                     "person_procore_id": uid,
                     "name": pick(u, "name"),
                     "email": email,
@@ -1531,13 +1689,18 @@ for pi, project in enumerate(scope, start=1):
                     "is_employee": u.get("is_employee"),
                     "is_gc": is_gc(cname),
                 })
+            _users_fetched_pids.append(_pid)
         except Exception as e:
-            print(f"  project users failed: project={pid}: {e}")
-            sync_errors.append({"project_procore_id": pid, "stage": "project_users",
+            print(f"  project users failed: project={_pid}: {e} (stored rows kept)")
+            _failed["users"].add(_pid)
+            sync_errors.append({"project_procore_id": _pid, "stage": "project_users",
                                 "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
 
+    # Rosters tonight, or carried forward from bronze? See ROSTER_REFRESH_WEEKDAY.
+    _fetch_roster = pid in _roster_pids
+
     # ---- 6b. Commitments (work orders + purchase orders) -------------------
-    if PULL_COMMITMENTS:
+    if PULL_COMMITMENTS and _fetch_roster:
         for kind, path in (("work_order", "work_order_contracts"),
                            ("purchase_order", "purchase_order_contracts")):
             try:
@@ -1552,7 +1715,11 @@ for pi, project in enumerate(scope, start=1):
                             and isinstance(c, dict) and c.get("id") is not None):
                         _commitment_stats["detail_calls"] += 1
                         try:
-                            detail = request_json(
+                            # request_json returns (payload, status). This used
+                            # to assign the tuple to `detail`, so the dict check
+                            # below never passed and no detail call could ever
+                            # recover a vendor ("72 calls, 0 recoveries").
+                            detail, _dstatus = request_json(
                                 f"{PROCORE_API_BASE_URL}/rest/v1.0/{path}/{c['id']}",
                                 {"project_id": pid})
                             if isinstance(detail, dict):
@@ -1582,12 +1749,13 @@ for pi, project in enumerate(scope, start=1):
                         "raw_json": safe_json_dumps(c),
                     })
             except Exception as e:
-                print(f"  {kind} failed: project={pid}: {e}")
+                print(f"  {kind} failed: project={pid}: {e} (stored commitment rows kept)")
+                _failed["commitments"].add(pid)
                 sync_errors.append({"project_procore_id": pid, "stage": kind,
                                     "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
 
     # ---- 6c. Project directory vendors -------------------------------------
-    if PULL_DIRECTORY:
+    if PULL_DIRECTORY and _fetch_roster:
         try:
             rows = get_paginated(f"{PROCORE_API_BASE_URL}/rest/v1.1/projects/{pid}/vendors",
                                  {"company_id": company_id}, per_page=VENDOR_PAGE_SIZE,
@@ -1609,7 +1777,8 @@ for pi, project in enumerate(scope, start=1):
                     "raw_json": safe_json_dumps(v),
                 })
         except Exception as e:
-            print(f"  directory vendors failed: project={pid}: {e}")
+            print(f"  directory vendors failed: project={pid}: {e} (stored directory rows kept)")
+            _failed["directory"].add(pid)
             sync_errors.append({"project_procore_id": pid, "stage": "directory_vendors",
                                 "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
         # Feed the email-domain fallback: this project's vendor names, normalized
@@ -1621,6 +1790,12 @@ for pi, project in enumerate(scope, start=1):
             if v["project_procore_id"] == pid and v.get("vendor_name")
         }
         project_vendor_norms.pop("", None)
+        if pid in _failed["directory"] and not project_vendor_norms:
+            project_vendor_norms = dict(_bronze_vendor_norms.get(str(pid), {}))
+    elif PULL_DIRECTORY:
+        # Not fetched tonight: the stored vendor names feed the email-domain
+        # fallback exactly as fresh ones would.
+        project_vendor_norms = dict(_bronze_vendor_norms.get(str(pid), {}))
 
     # ---- 6d. Meetings ------------------------------------------------------
     # LAST on purpose: attendee company resolution needs the project-user and
@@ -1688,6 +1863,9 @@ for pi, project in enumerate(scope, start=1):
                     meeting_details.append(_cached_detail)
                     meeting_attendees.extend(_cached_atts)
                     continue
+
+                # The attendee -> company map is only needed from here on.
+                ensure_project_users()
 
                 detail, status = request_json(
                     f"{PROCORE_API_BASE_URL}/rest/v1.1/projects/{pid}/meetings/{mid}",
@@ -1785,7 +1963,8 @@ for pi, project in enumerate(scope, start=1):
                         "raw_json": safe_json_dumps(a),
                     })
         except Exception as e:
-            print(f"  meetings failed: project={pid}: {e}")
+            print(f"  meetings failed: project={pid}: {e} (stored meeting rows kept)")
+            _failed["meetings"].add(pid)
             sync_errors.append({"project_procore_id": pid, "stage": "meetings",
                                 "error": str(e), "created_at": datetime.now(timezone.utc).isoformat()})
     # ---- 6e. What did this project actually yield? -------------------------
@@ -1793,20 +1972,42 @@ for pi, project in enumerate(scope, start=1):
     # This is what lets the dashboard tell "no vendors on this job" apart from
     # "this job was never ingested" — which currently render identically as
     # "No Vendors", i.e. an absence of data displayed as a fact about the job.
+    # Counts for a table not fetched tonight (roster skip night, lazy users,
+    # or a failed fetch whose stored rows are kept) carry forward from last
+    # run's scope row, so a skip night can't report "no vendors".
+    _prev = _bronze_scope_rows.get(str(pid), {})
+
+    def _carry(key, fetched_ok, fresh_count):
+        if fetched_ok:
+            return fresh_count
+        v = _prev.get(key)
+        try:
+            return int(v) if v is not None else fresh_count
+        except (TypeError, ValueError):
+            return fresh_count
+
+    _dir_ok = _fetch_roster and pid not in _failed["directory"]
+    _com_ok = _fetch_roster and pid not in _failed["commitments"]
+    _usr_ok = _users_done[0] and pid not in _failed["users"]
+    _mtg_ok = pid not in _failed["meetings"]
     project_scope.append({
         "project_procore_id": pid,
         "project_name": pname,
         "project_number": project_number_of(project),
-        "directory_vendors": sum(1 for v in directory_vendors
-                                 if v["project_procore_id"] == pid),
-        "commitment_vendors": sum(1 for c in commitments
-                                  if c["project_procore_id"] == pid and c.get("vendor_name")),
-        "commitment_rows": sum(1 for c in commitments if c["project_procore_id"] == pid),
-        "project_users": sum(1 for u in project_users if u["project_procore_id"] == pid),
-        "prep_meetings": sum(1 for m in meeting_details if m["project_procore_id"] == pid),
-        "status_project_vendors": _last_status.get("project_vendors"),
-        "status_work_order": _last_status.get("work_order_contracts"),
-        "status_purchase_order": _last_status.get("purchase_order_contracts"),
+        "directory_vendors": _carry("directory_vendors", _dir_ok,
+                                    sum(1 for v in directory_vendors if v["project_procore_id"] == pid)),
+        "commitment_vendors": _carry("commitment_vendors", _com_ok,
+                                     sum(1 for c in commitments
+                                         if c["project_procore_id"] == pid and c.get("vendor_name"))),
+        "commitment_rows": _carry("commitment_rows", _com_ok,
+                                  sum(1 for c in commitments if c["project_procore_id"] == pid)),
+        "project_users": _carry("project_users", _usr_ok,
+                                sum(1 for u in project_users if u["project_procore_id"] == pid)),
+        "prep_meetings": _carry("prep_meetings", _mtg_ok,
+                                sum(1 for m in meeting_details if m["project_procore_id"] == pid)),
+        "status_project_vendors": _last_status.get("project_vendors") if _dir_ok else _prev.get("status_project_vendors"),
+        "status_work_order": _last_status.get("work_order_contracts") if _com_ok else _prev.get("status_work_order"),
+        "status_purchase_order": _last_status.get("purchase_order_contracts") if _com_ok else _prev.get("status_purchase_order"),
         "status_meetings": _last_status.get("meetings"),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -1840,29 +2041,69 @@ if _stats["sleep"] > _elapsed * 0.4:
 # 7. Bronze writes
 # ============================================================
 print("\n--- bronze ---")
-write_delta(meeting_summaries, "bronze_vendor_meeting_summaries",
-            empty_cols=["project_procore_id", "meeting_procore_id", "title", "is_prep_candidate"],
-            merge_project_ids=merge_ids)
-write_delta(meeting_details, "bronze_vendor_meeting_details",
-            empty_cols=["project_procore_id", "meeting_procore_id", "title", "meeting_date"],
-            merge_project_ids=merge_ids)
-write_delta(meeting_attendees, "bronze_vendor_meeting_attendees",
-            empty_cols=["project_procore_id", "meeting_procore_id", "attendee_name",
-                        "company_name", "company_normalized", "attendance_status"],
-            merge_project_ids=merge_ids)
-write_delta(commitments, "bronze_vendor_commitments",
-            empty_cols=["project_procore_id", "project_name", "contract_procore_id",
-                        "contract_kind", "contract_number", "contract_status",
-                        "vendor_procore_id", "vendor_name", "vendor_normalized", "is_gc"],
-            merge_project_ids=merge_ids)
-write_delta(project_users, "bronze_vendor_project_users",
-            empty_cols=["project_procore_id", "person_procore_id", "name", "email",
-                        "company_name", "company_normalized"],
-            merge_project_ids=merge_ids)
-write_delta(directory_vendors, "bronze_vendor_directory",
-            empty_cols=["project_procore_id", "vendor_procore_id", "vendor_name",
-                        "vendor_normalized"],
-            merge_project_ids=merge_ids)
+
+
+def _merge_list(base_pids, failed):
+    """The projects a table's write replaces: the ones fetched tonight minus
+    the ones whose fetch failed (those keep their stored rows). None when the
+    run is a plain full overwrite (merge_ids is None) and nothing failed."""
+    if base_pids is None:
+        if not failed:
+            return None
+        base_pids = [p.get("id") for p in scope if p.get("id") is not None]
+    return [p for p in base_pids if p not in failed]
+
+
+def _drop_failed(rows, failed):
+    """Partial rows collected for a project whose fetch then failed must not
+    be written over its stored rows."""
+    return [r for r in rows if r.get("project_procore_id") not in failed] if failed else rows
+
+
+def write_delta_merged(rows, table_name, empty_cols, base_pids, failed):
+    """write_delta, but NEVER with empty rows and an empty merge list: that
+    combination overwrites the whole table with nothing (a skip night with no
+    new projects, or a night where every fetch failed). Skip and say so."""
+    ids = _merge_list(base_pids, failed)
+    rows = _drop_failed(rows, failed)
+    if ids is not None and not ids and not rows:
+        print(f"  {table_name}: nothing fetched tonight, stored rows kept as they are.")
+        return
+    if ids is None and not rows and spark.catalog.tableExists(table_name):
+        print(f"  {table_name}: 0 rows fetched on a full-overwrite run; keeping the stored "
+              f"table rather than emptying it.")
+        return
+    write_delta(rows, table_name, empty_cols=empty_cols, merge_project_ids=ids)
+
+
+# Meetings: every in-scope project was listed tonight (merge_ids), minus the
+# ones whose meetings pull failed.
+write_delta_merged(meeting_summaries, "bronze_vendor_meeting_summaries",
+                   ["project_procore_id", "meeting_procore_id", "title", "is_prep_candidate"],
+                   merge_ids, _failed["meetings"])
+write_delta_merged(meeting_details, "bronze_vendor_meeting_details",
+                   ["project_procore_id", "meeting_procore_id", "title", "meeting_date"],
+                   merge_ids, _failed["meetings"])
+write_delta_merged(meeting_attendees, "bronze_vendor_meeting_attendees",
+                   ["project_procore_id", "meeting_procore_id", "attendee_name",
+                    "company_name", "company_normalized", "attendance_status"],
+                   merge_ids, _failed["meetings"])
+# Rosters: only the projects whose rosters were re-fetched tonight
+# (ROSTER_REFRESH_WEEKDAY); everyone else keeps their rows.
+write_delta_merged(commitments, "bronze_vendor_commitments",
+                   ["project_procore_id", "project_name", "contract_procore_id",
+                    "contract_kind", "contract_number", "contract_status",
+                    "vendor_procore_id", "vendor_name", "vendor_normalized", "is_gc"],
+                   _roster_pids, _failed["commitments"])
+# People: only the projects a meeting detail call needed tonight.
+write_delta_merged(project_users, "bronze_vendor_project_users",
+                   ["project_procore_id", "person_procore_id", "name", "email",
+                    "company_name", "company_normalized"],
+                   _users_fetched_pids, _failed["users"])
+write_delta_merged(directory_vendors, "bronze_vendor_directory",
+                   ["project_procore_id", "vendor_procore_id", "vendor_name",
+                    "vendor_normalized"],
+                   _roster_pids, _failed["directory"])
 # Always written. This used to sit inside `if sync_errors:` by mistake, so the
 # table only existed after a run where some Procore call failed; the first fully
 # clean run then died in the silver build with TABLE_OR_VIEW_NOT_FOUND.
@@ -2044,363 +2285,368 @@ LEFT ANTI JOIN materials_only m
 #   • whether the meeting record exposes the template id,
 #   • whether attendee company names are being returned at all.
 # ============================================================
-print("\n" + "=" * 62)
-print("COVERAGE DIAGNOSTIC — which vendor roster should drive the tracker?")
-print("=" * 62)
-spark.sql("""
-SELECT
-    COUNT(DISTINCT CASE WHEN from_commitment THEN project_procore_id END) AS projects_with_commitments,
-    COUNT(DISTINCT CASE WHEN from_directory  THEN project_procore_id END) AS projects_with_directory,
-    SUM(CASE WHEN from_commitment THEN 1 ELSE 0 END)                      AS vendor_rows_commitment,
-    SUM(CASE WHEN from_directory  THEN 1 ELSE 0 END)                      AS vendor_rows_directory,
-    SUM(CASE WHEN from_commitment AND from_directory THEN 1 ELSE 0 END)   AS vendor_rows_both,
-    SUM(CASE WHEN from_commitment AND NOT from_directory THEN 1 ELSE 0 END) AS commitment_only,
-    SUM(CASE WHEN from_directory AND NOT from_commitment THEN 1 ELSE 0 END) AS directory_only
-FROM silver_vendor_roster
-""").show(truncate=False)
-print("Read this as: whichever source covers more PROJECTS is the one BCI keeps")
-print("current. A large `directory_only` count is expected — the project directory")
-print("holds the owner, architect and inspectors, who never need a prep meeting.")
-print("⚠️  A zero in `vendor_rows_commitment` does NOT mean the tenant has no")
-print("    commitments. Read the next block before concluding anything from it.")
-
-# ---- Did the commitments we fetched survive into the roster? ---------------
-# This block exists because the previous version of this file didn't have it.
-# 1500 contracts were pulled, every one lost its vendor name, the roster's
-# non-empty filter dropped all 1500, and the resulting zero above was written
-# down as "BCI does not use Procore commitments". Bronze count vs silver count,
-# side by side, makes that failure impossible to misread as an absence.
-if PULL_COMMITMENTS:
-    print("\n--- COMMITMENT VENDOR RESOLUTION (bronze in -> roster out) ---")
-    _cs = _commitment_stats
-    print(f"  contracts fetched              : {_cs['rows']}")
-    print(f"  ...with a vendor resolved      : {_cs['with_vendor']}")
-    print(f"  ...resolved via a detail call  : {_cs['via_detail']} "
-          f"({_cs['detail_calls']} detail calls made, cap {COMMITMENT_DETAIL_MAX})")
-    if _cs["rows"] and not detail_worth_trying() and _cs["detail_calls"] < COMMITMENT_DETAIL_MAX:
-        print("     (detail lookups stood down — the list view is carrying vendors, so the")
-        print("      contracts still missing one are templates/drafts that have no vendor)")
-    unresolved = _cs["rows"] - _cs["with_vendor"]
-    if unresolved:
-        print(f"  ...with NO vendor anywhere     : {unresolved}  <-- expected: TEMPLATE / "
-              "PO Template / draft contracts carry none, and drop out of the roster on their own")
-    if _commitment_view:
-        for path, view in _commitment_view.items():
-            print(f"  list view used for {path}: {view or 'default'}")
-    if _commitment_paths:
-        print("  where the vendor was found:")
-        for k, n in sorted(_commitment_paths.items(), key=lambda kv: -kv[1]):
-            print(f"    {k}: {n}")
-    survived = spark.sql("""
-        SELECT COUNT(*) AS n FROM silver_vendor_roster WHERE from_commitment
-    """).collect()[0]["n"]
-    print(f"  roster rows from commitments   : {survived}")
-    if _cs["rows"] and not _cs["with_vendor"]:
-        print("  ⚠️  Contracts came back but NONE carried a vendor. That is a SHAPE")
-        print("      problem, not an empty tenant. Print one raw_json from")
-        print("      bronze_vendor_commitments and tell me which key holds the company:")
-        print("        spark.sql('SELECT raw_json FROM bronze_vendor_commitments LIMIT 1')"
-              ".collect()[0][0]")
-    elif _cs["with_vendor"] and not survived:
-        print("  ⚠️  Vendors resolved but no roster rows — check the is_gc filter; the")
-        print("      contracts may all be written against Buffalo Construction itself.")
-    if _cs["detail_calls"] >= COMMITMENT_DETAIL_MAX:
-        print(f"  ⚠️  Hit the detail-call cap ({COMMITMENT_DETAIL_MAX}); some contracts were")
-        print("      left unresolved. Raise COMMITMENT_DETAIL_MAX and re-run.")
-
-if PULL_COMMITMENTS:
-    print("\n--- MATERIALS COMMITMENTS (excluded from the roster) ---")
-    print(f"  rule: contract number starts with {list(MATERIALS_COMMITMENT_PREFIXES)}")
-    print("  contracts by first character of their number (check the rule fits):")
+if not RUN_DIAGNOSTICS:
+    print("\n(Section 9 diagnostics skipped: RUN_DIAGNOSTICS = False.)")
+else:
+    print("\n" + "=" * 62)
+    print("COVERAGE DIAGNOSTIC — which vendor roster should drive the tracker?")
+    print("=" * 62)
     spark.sql("""
-        SELECT COALESCE(NULLIF(UPPER(SUBSTRING(LTRIM(CAST(contract_number AS STRING)), 1, 1)), ''),
-                        '<none>') AS first_char,
-               contract_kind,
-               COUNT(*) AS contracts,
-               MIN(CAST(contract_number AS STRING)) AS example
-        FROM bronze_vendor_commitments
-        WHERE vendor_normalized IS NOT NULL AND vendor_normalized <> ''
-        GROUP BY 1, 2 ORDER BY contracts DESC
-    """).show(50, truncate=False)
-    _mat = spark.sql(f"""
-        WITH c AS (
-            SELECT project_procore_id, vendor_normalized,
-                   MAX(vendor_name) AS vendor_name,
-                   SUM(CASE WHEN {_materials_sql()} THEN 1 ELSE 0 END) AS m,
-                   SUM(CASE WHEN {_materials_sql()} THEN 0 ELSE 1 END) AS other
+    SELECT
+        COUNT(DISTINCT CASE WHEN from_commitment THEN project_procore_id END) AS projects_with_commitments,
+        COUNT(DISTINCT CASE WHEN from_directory  THEN project_procore_id END) AS projects_with_directory,
+        SUM(CASE WHEN from_commitment THEN 1 ELSE 0 END)                      AS vendor_rows_commitment,
+        SUM(CASE WHEN from_directory  THEN 1 ELSE 0 END)                      AS vendor_rows_directory,
+        SUM(CASE WHEN from_commitment AND from_directory THEN 1 ELSE 0 END)   AS vendor_rows_both,
+        SUM(CASE WHEN from_commitment AND NOT from_directory THEN 1 ELSE 0 END) AS commitment_only,
+        SUM(CASE WHEN from_directory AND NOT from_commitment THEN 1 ELSE 0 END) AS directory_only
+    FROM silver_vendor_roster
+    """).show(truncate=False)
+    print("Read this as: whichever source covers more PROJECTS is the one BCI keeps")
+    print("current. A large `directory_only` count is expected — the project directory")
+    print("holds the owner, architect and inspectors, who never need a prep meeting.")
+    print("⚠️  A zero in `vendor_rows_commitment` does NOT mean the tenant has no")
+    print("    commitments. Read the next block before concluding anything from it.")
+
+    # ---- Did the commitments we fetched survive into the roster? ---------------
+    # This block exists because the previous version of this file didn't have it.
+    # 1500 contracts were pulled, every one lost its vendor name, the roster's
+    # non-empty filter dropped all 1500, and the resulting zero above was written
+    # down as "BCI does not use Procore commitments". Bronze count vs silver count,
+    # side by side, makes that failure impossible to misread as an absence.
+    if PULL_COMMITMENTS:
+        print("\n--- COMMITMENT VENDOR RESOLUTION (bronze in -> roster out) ---")
+        _cs = _commitment_stats
+        print(f"  contracts fetched              : {_cs['rows']}")
+        print(f"  ...with a vendor resolved      : {_cs['with_vendor']}")
+        print(f"  ...resolved via a detail call  : {_cs['via_detail']} "
+              f"({_cs['detail_calls']} detail calls made, cap {COMMITMENT_DETAIL_MAX})")
+        if _cs["rows"] and not detail_worth_trying() and _cs["detail_calls"] < COMMITMENT_DETAIL_MAX:
+            print("     (detail lookups stood down — the list view is carrying vendors, so the")
+            print("      contracts still missing one are templates/drafts that have no vendor)")
+        unresolved = _cs["rows"] - _cs["with_vendor"]
+        if unresolved:
+            print(f"  ...with NO vendor anywhere     : {unresolved}  <-- expected: TEMPLATE / "
+                  "PO Template / draft contracts carry none, and drop out of the roster on their own")
+        if _commitment_view:
+            for path, view in _commitment_view.items():
+                print(f"  list view used for {path}: {view or 'default'}")
+        if _commitment_paths:
+            print("  where the vendor was found:")
+            for k, n in sorted(_commitment_paths.items(), key=lambda kv: -kv[1]):
+                print(f"    {k}: {n}")
+        survived = spark.sql("""
+            SELECT COUNT(*) AS n FROM silver_vendor_roster WHERE from_commitment
+        """).collect()[0]["n"]
+        print(f"  roster rows from commitments   : {survived}")
+        if _cs["rows"] and not _cs["with_vendor"]:
+            print("  ⚠️  Contracts came back but NONE carried a vendor. That is a SHAPE")
+            print("      problem, not an empty tenant. Print one raw_json from")
+            print("      bronze_vendor_commitments and tell me which key holds the company:")
+            print("        spark.sql('SELECT raw_json FROM bronze_vendor_commitments LIMIT 1')"
+                  ".collect()[0][0]")
+        elif _cs["with_vendor"] and not survived:
+            print("  ⚠️  Vendors resolved but no roster rows — check the is_gc filter; the")
+            print("      contracts may all be written against Buffalo Construction itself.")
+        if _cs["detail_calls"] >= COMMITMENT_DETAIL_MAX:
+            print(f"  ⚠️  Hit the detail-call cap ({COMMITMENT_DETAIL_MAX}); some contracts were")
+            print("      left unresolved. Raise COMMITMENT_DETAIL_MAX and re-run.")
+
+    if PULL_COMMITMENTS:
+        print("\n--- MATERIALS COMMITMENTS (excluded from the roster) ---")
+        print(f"  rule: contract number starts with {list(MATERIALS_COMMITMENT_PREFIXES)}")
+        print("  contracts by first character of their number (check the rule fits):")
+        spark.sql("""
+            SELECT COALESCE(NULLIF(UPPER(SUBSTRING(LTRIM(CAST(contract_number AS STRING)), 1, 1)), ''),
+                            '<none>') AS first_char,
+                   contract_kind,
+                   COUNT(*) AS contracts,
+                   MIN(CAST(contract_number AS STRING)) AS example
             FROM bronze_vendor_commitments
             WHERE vendor_normalized IS NOT NULL AND vendor_normalized <> ''
-              AND LOWER(COALESCE(is_gc, 'false')) <> 'true'
-            GROUP BY project_procore_id, vendor_normalized
-        )
-        SELECT
-            SUM(CASE WHEN m > 0 AND other = 0 THEN 1 ELSE 0 END) AS dropped_supplier_rows,
-            SUM(CASE WHEN m > 0 AND other > 0 THEN 1 ELSE 0 END) AS kept_mixed_rows,
-            COUNT(DISTINCT CASE WHEN m > 0 AND other = 0 THEN vendor_normalized END)
-                                                                 AS dropped_distinct_vendors
-        FROM c
-    """).collect()[0]
-    print(f"  (project, vendor) rows dropped (only M/P contracts): {_mat['dropped_supplier_rows'] or 0}")
-    print(f"  ...distinct suppliers                            : {_mat['dropped_distinct_vendors'] or 0}")
-    print(f"  kept: also hold an S contract there        : {_mat['kept_mixed_rows'] or 0}")
-    print("  Dropped from BOTH rosters, so they leave the `either`/`directory`")
-    print("  denominators too. A supplier wrongly dropped: give it a manual vendor entry.")
+            GROUP BY 1, 2 ORDER BY contracts DESC
+        """).show(50, truncate=False)
+        _mat = spark.sql(f"""
+            WITH c AS (
+                SELECT project_procore_id, vendor_normalized,
+                       MAX(vendor_name) AS vendor_name,
+                       SUM(CASE WHEN {_materials_sql()} THEN 1 ELSE 0 END) AS m,
+                       SUM(CASE WHEN {_materials_sql()} THEN 0 ELSE 1 END) AS other
+                FROM bronze_vendor_commitments
+                WHERE vendor_normalized IS NOT NULL AND vendor_normalized <> ''
+                  AND LOWER(COALESCE(is_gc, 'false')) <> 'true'
+                GROUP BY project_procore_id, vendor_normalized
+            )
+            SELECT
+                SUM(CASE WHEN m > 0 AND other = 0 THEN 1 ELSE 0 END) AS dropped_supplier_rows,
+                SUM(CASE WHEN m > 0 AND other > 0 THEN 1 ELSE 0 END) AS kept_mixed_rows,
+                COUNT(DISTINCT CASE WHEN m > 0 AND other = 0 THEN vendor_normalized END)
+                                                                     AS dropped_distinct_vendors
+            FROM c
+        """).collect()[0]
+        print(f"  (project, vendor) rows dropped (only M/P contracts): {_mat['dropped_supplier_rows'] or 0}")
+        print(f"  ...distinct suppliers                            : {_mat['dropped_distinct_vendors'] or 0}")
+        print(f"  kept: also hold an S contract there        : {_mat['kept_mixed_rows'] or 0}")
+        print("  Dropped from BOTH rosters, so they leave the `either`/`directory`")
+        print("  denominators too. A supplier wrongly dropped: give it a manual vendor entry.")
 
-print("\n--- MEETING DATE (which key this tenant actually populates) ---")
-for k, n in sorted(_date_fields_used.items(), key=lambda kv: -kv[1]):
-    print(f"  {k}: {n}")
-if _date_fields_used.get("<none>"):
-    print(f"  ⚠️  {_date_fields_used['<none>']} meeting(s) had NO recognized date key.")
-    print("      Date-ish keys actually present on the meeting records:")
-    if _date_key_samples:
-        for k, v in sorted(_date_key_samples.items()):
-            mark = "  <-- add this to DATE_FIELDS" if k not in DATE_FIELDS else ""
-            print(f"        {k} = {v}{mark}")
+    print("\n--- MEETING DATE (which key this tenant actually populates) ---")
+    for k, n in sorted(_date_fields_used.items(), key=lambda kv: -kv[1]):
+        print(f"  {k}: {n}")
+    if _date_fields_used.get("<none>"):
+        print(f"  ⚠️  {_date_fields_used['<none>']} meeting(s) had NO recognized date key.")
+        print("      Date-ish keys actually present on the meeting records:")
+        if _date_key_samples:
+            for k, v in sorted(_date_key_samples.items()):
+                mark = "  <-- add this to DATE_FIELDS" if k not in DATE_FIELDS else ""
+                print(f"        {k} = {v}{mark}")
+        else:
+            print("        (none at all — the meeting record carries no date; the tracker")
+            print("         will show meetings without dates, which is cosmetic only)")
+
+    print("\n--- meeting template id exposure ---")
+    if template_id_hits:
+        for tid, n in sorted(template_id_hits.items(), key=lambda kv: -kv[1])[:15]:
+            mark = "  <-- the prep template" if tid == str(PREP_MEETING_TEMPLATE_ID) else ""
+            print(f"  template_id={tid}: {n} meetings{mark}")
+        print("  => the API exposes the template id. PREP_MATCH_MODE = 'template_or_title'")
+        print("     (the default) takes the UNION of the template and the title test, which is")
+        print("     what you want. Set it to 'template' only if a title-matched meeting from a")
+        print("     different template turns out to be noise.")
     else:
-        print("        (none at all — the meeting record carries no date; the tracker")
-        print("         will show meetings without dates, which is cosmetic only)")
+        print("  none of", TEMPLATE_ID_FIELDS, "appeared on any meeting record.")
+        print("  => the API does not expose the originating template; the title match is")
+        print("     the only available filter. Leave PREP_REQUIRE_TEMPLATE_ID = False.")
 
-print("\n--- meeting template id exposure ---")
-if template_id_hits:
-    for tid, n in sorted(template_id_hits.items(), key=lambda kv: -kv[1])[:15]:
-        mark = "  <-- the prep template" if tid == str(PREP_MEETING_TEMPLATE_ID) else ""
-        print(f"  template_id={tid}: {n} meetings{mark}")
-    print("  => the API exposes the template id. PREP_MATCH_MODE = 'template_or_title'")
-    print("     (the default) takes the UNION of the template and the title test, which is")
-    print("     what you want. Set it to 'template' only if a title-matched meeting from a")
-    print("     different template turns out to be noise.")
-else:
-    print("  none of", TEMPLATE_ID_FIELDS, "appeared on any meeting record.")
-    print("  => the API does not expose the originating template; the title match is")
-    print("     the only available filter. Leave PREP_REQUIRE_TEMPLATE_ID = False.")
+    # What the title rule threw away. This is the block to read after tightening it:
+    # if a real preparatory meeting is in here, its title needs fixing in Procore or
+    # the exclude pattern that caught it needs narrowing.
+    # Did the cache actually save anything? A reuse rate of zero means every night
+    # is still re-downloading the whole back catalogue — the failure this exists to
+    # prevent, and one that is invisible without being counted.
+    # ---- Projects the run looked at and found nothing on ------------------------
+    # The question this answers: a project shows "No Vendors" in the tracker — did
+    # we fetch it and it really has none, or did the fetch come back empty for a
+    # reason? A 403 here means the API service account is not on that project's
+    # directory, which is common on old jobs and is a PERMISSION story, not a data
+    # one. You can see those vendors in Procore because you have access; it doesn't.
+    # ---- Agenda vs minutes ------------------------------------------------------
+    # THE FIELD NAME IS BEING DISCOVERED HERE, not assumed. If this prints
+    # "unknown" for most meetings, MEETING_STATE_FIELDS is looking in the wrong
+    # place — the raw values below say where to look instead.
+    print("\n--- MEETING STATE (agenda vs minutes) ---")
+    _ms_counts = {}
+    for _d in meeting_details:
+        _k = _d.get("meeting_state") or "unknown"
+        _ms_counts[_k] = _ms_counts.get(_k, 0) + 1
+    for _k, _n in sorted(_ms_counts.items(), key=lambda kv: -kv[1]):
+        print(f"  {_k}: {_n}")
+    if _meeting_state_paths:
+        print("  decided by:")
+        for _k, _n in sorted(_meeting_state_paths.items(), key=lambda kv: -kv[1]):
+            print(f"    {_k}: {_n}")
+    if _meeting_state_values:
+        print("  raw values seen on each candidate key:")
+        for _key, _vals in _meeting_state_values.items():
+            for _v, _n in sorted(_vals.items(), key=lambda kv: -kv[1])[:8]:
+                print(f"    {_key} = {_v!r}: {_n}")
+    if _ms_counts.get("unknown"):
+        print(f"  ⚠️  {_ms_counts['unknown']} meeting(s) could not be classified. Procore marks a")
+        print("      meeting agenda-vs-minutes somewhere this code isn't looking. The raw values")
+        print("      above are every candidate key that WAS present — if the distinction is in")
+        print("      one of them under a different word, add it to MEETING_STATE_FIELDS. If none")
+        print("      of them carry it, print a raw_json from bronze_vendor_meeting_details:")
+        print("        spark.sql('SELECT raw_json FROM bronze_vendor_meeting_details LIMIT 1')"
+              ".collect()[0][0]")
 
-# What the title rule threw away. This is the block to read after tightening it:
-# if a real preparatory meeting is in here, its title needs fixing in Procore or
-# the exclude pattern that caught it needs narrowing.
-# Did the cache actually save anything? A reuse rate of zero means every night
-# is still re-downloading the whole back catalogue — the failure this exists to
-# prevent, and one that is invisible without being counted.
-# ---- Projects the run looked at and found nothing on ------------------------
-# The question this answers: a project shows "No Vendors" in the tracker — did
-# we fetch it and it really has none, or did the fetch come back empty for a
-# reason? A 403 here means the API service account is not on that project's
-# directory, which is common on old jobs and is a PERMISSION story, not a data
-# one. You can see those vendors in Procore because you have access; it doesn't.
-# ---- Agenda vs minutes ------------------------------------------------------
-# THE FIELD NAME IS BEING DISCOVERED HERE, not assumed. If this prints
-# "unknown" for most meetings, MEETING_STATE_FIELDS is looking in the wrong
-# place — the raw values below say where to look instead.
-print("\n--- MEETING STATE (agenda vs minutes) ---")
-_ms_counts = {}
-for _d in meeting_details:
-    _k = _d.get("meeting_state") or "unknown"
-    _ms_counts[_k] = _ms_counts.get(_k, 0) + 1
-for _k, _n in sorted(_ms_counts.items(), key=lambda kv: -kv[1]):
-    print(f"  {_k}: {_n}")
-if _meeting_state_paths:
-    print("  decided by:")
-    for _k, _n in sorted(_meeting_state_paths.items(), key=lambda kv: -kv[1]):
-        print(f"    {_k}: {_n}")
-if _meeting_state_values:
-    print("  raw values seen on each candidate key:")
-    for _key, _vals in _meeting_state_values.items():
-        for _v, _n in sorted(_vals.items(), key=lambda kv: -kv[1])[:8]:
-            print(f"    {_key} = {_v!r}: {_n}")
-if _ms_counts.get("unknown"):
-    print(f"  ⚠️  {_ms_counts['unknown']} meeting(s) could not be classified. Procore marks a")
-    print("      meeting agenda-vs-minutes somewhere this code isn't looking. The raw values")
-    print("      above are every candidate key that WAS present — if the distinction is in")
-    print("      one of them under a different word, add it to MEETING_STATE_FIELDS. If none")
-    print("      of them carry it, print a raw_json from bronze_vendor_meeting_details:")
-    print("        spark.sql('SELECT raw_json FROM bronze_vendor_meeting_details LIMIT 1')"
-          ".collect()[0][0]")
+    # How many Review Queue rows are a workflow state rather than a missed step?
+    _agenda_no_vendor = sum(
+        1 for _d in meeting_details
+        if _d.get("meeting_state") == "agenda"
+        and not any(a["meeting_procore_id"] == _d["meeting_procore_id"]
+                    and str(a.get("is_gc")).lower() != "true"
+                    for a in meeting_attendees))
+    if _agenda_no_vendor:
+        print(f"  => {_agenda_no_vendor} prep meeting(s) are still AGENDAS with no vendor attendee.")
+        print("     Attendance can't be taken until they're converted to minutes, so those are")
+        print("     waiting on the super, not evidence the meeting was run badly. The tracker")
+        print("     shows them separately from meetings that WERE converted and still have no")
+        print("     attendance — only the second group is a missed step.")
 
-# How many Review Queue rows are a workflow state rather than a missed step?
-_agenda_no_vendor = sum(
-    1 for _d in meeting_details
-    if _d.get("meeting_state") == "agenda"
-    and not any(a["meeting_procore_id"] == _d["meeting_procore_id"]
-                and str(a.get("is_gc")).lower() != "true"
-                for a in meeting_attendees))
-if _agenda_no_vendor:
-    print(f"  => {_agenda_no_vendor} prep meeting(s) are still AGENDAS with no vendor attendee.")
-    print("     Attendance can't be taken until they're converted to minutes, so those are")
-    print("     waiting on the super, not evidence the meeting was run badly. The tracker")
-    print("     shows them separately from meetings that WERE converted and still have no")
-    print("     attendance — only the second group is a missed step.")
+    print("\n--- PROJECTS WITH NO VENDORS (and the HTTP status that produced it) ---")
+    _empty = [r for r in project_scope
+              if not r["directory_vendors"] and not r["commitment_vendors"]]
+    if not _empty:
+        print(f"  none — all {len(project_scope)} project(s) in scope yielded at least one vendor.")
+    else:
+        print(f"  {len(_empty)} of {len(project_scope)} project(s) in scope came back with no vendors.")
+        _by_status = {}
+        for r in _empty:
+            k = (r["status_project_vendors"], r["status_work_order"], r["status_purchase_order"])
+            _by_status.setdefault(k, []).append(r)
+        for (sv, wo, po), rows in sorted(_by_status.items(), key=lambda kv: -len(kv[1])):
+            print(f"  vendors HTTP {sv} / work_order {wo} / purchase_order {po}: {len(rows)} project(s)")
+            for r in rows[:5]:
+                print(f"      {r['project_number'] or '(no number)':<14} {str(r['project_name'])[:44]}")
+            if len(rows) > 5:
+                print(f"      ... and {len(rows) - 5} more")
+            if 403 in (sv, wo, po) or 404 in (sv, wo, po):
+                print("      ^ 403/404 = the API service account has no access to that project's")
+                print("        tool. NOT an empty roster. Grant it access in Procore (the same")
+                print("        fix as the safety dashboard's private Observations) and re-run.")
+            elif (sv, wo, po) == (200, 200, 200):
+                print("      ^ all 200 with zero rows: Procore says these jobs genuinely have no")
+                print("        vendors on the directory AND no commitments written. If you can see")
+                print("        vendors on one of these in Procore, send me its project number —")
+                print("        that would mean the account sees a different view than you do.")
 
-print("\n--- PROJECTS WITH NO VENDORS (and the HTTP status that produced it) ---")
-_empty = [r for r in project_scope
-          if not r["directory_vendors"] and not r["commitment_vendors"]]
-if not _empty:
-    print(f"  none — all {len(project_scope)} project(s) in scope yielded at least one vendor.")
-else:
-    print(f"  {len(_empty)} of {len(project_scope)} project(s) in scope came back with no vendors.")
-    _by_status = {}
-    for r in _empty:
-        k = (r["status_project_vendors"], r["status_work_order"], r["status_purchase_order"])
-        _by_status.setdefault(k, []).append(r)
-    for (sv, wo, po), rows in sorted(_by_status.items(), key=lambda kv: -len(kv[1])):
-        print(f"  vendors HTTP {sv} / work_order {wo} / purchase_order {po}: {len(rows)} project(s)")
-        for r in rows[:5]:
-            print(f"      {r['project_number'] or '(no number)':<14} {str(r['project_name'])[:44]}")
-        if len(rows) > 5:
-            print(f"      ... and {len(rows) - 5} more")
-        if 403 in (sv, wo, po) or 404 in (sv, wo, po):
-            print("      ^ 403/404 = the API service account has no access to that project's")
-            print("        tool. NOT an empty roster. Grant it access in Procore (the same")
-            print("        fix as the safety dashboard's private Observations) and re-run.")
-        elif (sv, wo, po) == (200, 200, 200):
-            print("      ^ all 200 with zero rows: Procore says these jobs genuinely have no")
-            print("        vendors on the directory AND no commitments written. If you can see")
-            print("        vendors on one of these in Procore, send me its project number —")
-            print("        that would mean the account sees a different view than you do.")
+    print("\n--- DETAIL-CALL REUSE (what this run did NOT have to fetch) ---")
+    _rs = _reuse_stats
+    if not REUSE_MEETING_DETAILS:
+        print("  disabled (REUSE_MEETING_DETAILS = False) — full sweep, everything re-fetched.")
+    else:
+        print(f"  prep meetings already in bronze : {_rs['eligible']}")
+        print(f"  reused, no API call             : {_rs['reused']}"
+              + (f"  ({_rs['settled']} on the age rule, no updated_at)" if _rs["settled"] else ""))
+        print(f"  re-fetched                      : {_rs['refetched']}")
+        if _rs["changed"]:
+            print(f"    - {_rs['changed']} genuinely changed since last run")
+        if _rs["stale_version"]:
+            print(f"    - {_rs['stale_version']} built by an older resolution version "
+                  f"(now {ATTENDEE_RESOLUTION_VERSION}) — expected once after a logic change")
+        if _rs["no_updated_at"]:
+            print(f"    - {_rs['no_updated_at']} re-read ONLY because the list record carries no")
+            print(f"      updated_at and the meeting is within REUSE_SETTLED_AFTER_DAYS "
+                  f"({REUSE_SETTLED_AFTER_DAYS}). If this number is above 0 every night,")
+            print("      lower REUSE_SETTLED_AFTER_DAYS or confirm the list carries updated_at.")
+        if _rs["eligible"] and not _rs["reused"]:
+            print("  ⚠️  NOTHING was reused despite bronze having rows. Every night is paying")
+            print("      for the whole back catalogue. Check that the list record carries")
+            print("      updated_at, or lower REUSE_SETTLED_AFTER_DAYS.")
+        elif _rs["reused"]:
+            print(f"  => {_rs['reused']} detail call(s) saved on this run.")
 
-print("\n--- DETAIL-CALL REUSE (what this run did NOT have to fetch) ---")
-_rs = _reuse_stats
-if not REUSE_MEETING_DETAILS:
-    print("  disabled (REUSE_MEETING_DETAILS = False) — full sweep, everything re-fetched.")
-else:
-    print(f"  prep meetings already in bronze : {_rs['eligible']}")
-    print(f"  reused, no API call             : {_rs['reused']}"
-          + (f"  ({_rs['settled']} on the age rule, no updated_at)" if _rs["settled"] else ""))
-    print(f"  re-fetched                      : {_rs['refetched']}")
-    if _rs["changed"]:
-        print(f"    - {_rs['changed']} genuinely changed since last run")
-    if _rs["stale_version"]:
-        print(f"    - {_rs['stale_version']} built by an older resolution version "
-              f"(now {ATTENDEE_RESOLUTION_VERSION}) — expected once after a logic change")
-    if _rs["no_updated_at"]:
-        print(f"    - {_rs['no_updated_at']} could not be proven unchanged: the list record")
-        print("      carries no updated_at and the meeting is too recent to call settled.")
-    if _rs["eligible"] and not _rs["reused"]:
-        print("  ⚠️  NOTHING was reused despite bronze having rows. Every night is paying")
-        print("      for the whole back catalogue. Check that the list record carries")
-        print("      updated_at, or lower REUSE_SETTLED_AFTER_DAYS.")
-    elif _rs["reused"]:
-        print(f"  => {_rs['reused']} detail call(s) saved on this run.")
+    print("\n--- PREP TITLE EXCLUSIONS (said 'prep' but named another meeting type) ---")
+    if _prep_excluded_titles:
+        for t, n in sorted(_prep_excluded_titles.items(), key=lambda kv: -kv[1])[:25]:
+            print(f"  {n:>3}x  {t}")
+        print(f"  => {sum(_prep_excluded_titles.values())} meeting(s) dropped. Check none of these is")
+        print("     a genuine preparatory meeting before trusting the numbers above.")
+    else:
+        print("  none — no title matched both an include and an exclude pattern.")
 
-print("\n--- PREP TITLE EXCLUSIONS (said 'prep' but named another meeting type) ---")
-if _prep_excluded_titles:
-    for t, n in sorted(_prep_excluded_titles.items(), key=lambda kv: -kv[1])[:25]:
-        print(f"  {n:>3}x  {t}")
-    print(f"  => {sum(_prep_excluded_titles.values())} meeting(s) dropped. Check none of these is")
-    print("     a genuine preparatory meeting before trusting the numbers above.")
-else:
-    print("  none — no title matched both an include and an exclude pattern.")
+    # The template id is reported, not used. Kept because a big gap between the two
+    # is exactly what revealed that the template does not mean "preparatory".
+    print("\n--- template id vs the title rule (informational) ---")
+    _tmpl_n = template_id_hits.get(str(PREP_MEETING_TEMPLATE_ID), 0)
+    print(f"  meetings on template {PREP_MEETING_TEMPLATE_ID}: {_tmpl_n}")
+    print(f"  meetings the TITLE rule accepted    : {len(meeting_details)}")
+    if _tmpl_n > len(meeting_details):
+        print(f"  => {_tmpl_n - len(meeting_details)} meeting(s) were built from the prep template but are")
+        print("     NOT preparatory meetings by title — pre-contract, kick-off, coordination.")
+        print("     That gap is why PREP_MATCH_MODE is 'title'; do not 'improve' it back to a union.")
 
-# The template id is reported, not used. Kept because a big gap between the two
-# is exactly what revealed that the template does not mean "preparatory".
-print("\n--- template id vs the title rule (informational) ---")
-_tmpl_n = template_id_hits.get(str(PREP_MEETING_TEMPLATE_ID), 0)
-print(f"  meetings on template {PREP_MEETING_TEMPLATE_ID}: {_tmpl_n}")
-print(f"  meetings the TITLE rule accepted    : {len(meeting_details)}")
-if _tmpl_n > len(meeting_details):
-    print(f"  => {_tmpl_n - len(meeting_details)} meeting(s) were built from the prep template but are")
-    print("     NOT preparatory meetings by title — pre-contract, kick-off, coordination.")
-    print("     That gap is why PREP_MATCH_MODE is 'title'; do not 'improve' it back to a union.")
+    print("\n--- how each prep meeting was identified ---")
+    for k in ("both", "template_only", "title_only"):
+        if k in _prep_source:
+            print(f"  {k}: {_prep_source[k]}")
+    if _prep_source.get("template_only"):
+        print(f"  => {_prep_source['template_only']} meeting(s) came from the prep template but")
+        print("     do NOT have 'prep' in the title. The title heuristic alone would have")
+        print("     missed them — this is why PREP_MATCH_MODE defaults to the union.")
+    if _prep_source.get("title_only"):
+        print(f"  => {_prep_source['title_only']} meeting(s) are titled like prep meetings but were")
+        print("     built from a different template. Worth a look: either they belong and the")
+        print("     union is doing its job, or someone free-typed a meeting that isn't one.")
 
-print("\n--- how each prep meeting was identified ---")
-for k in ("both", "template_only", "title_only"):
-    if k in _prep_source:
-        print(f"  {k}: {_prep_source[k]}")
-if _prep_source.get("template_only"):
-    print(f"  => {_prep_source['template_only']} meeting(s) came from the prep template but")
-    print("     do NOT have 'prep' in the title. The title heuristic alone would have")
-    print("     missed them — this is why PREP_MATCH_MODE defaults to the union.")
-if _prep_source.get("title_only"):
-    print(f"  => {_prep_source['title_only']} meeting(s) are titled like prep meetings but were")
-    print("     built from a different template. Worth a look: either they belong and the")
-    print("     union is doing its job, or someone free-typed a meeting that isn't one.")
+    print("\n--- endpoint reachability (tells 'no data' apart from 'no permission') ---")
+    for (label, status), n in sorted(_endpoint_status.items()):
+        note = ""
+        if status in (403, 404):
+            note = ("  <-- NOT a 'no rows' answer: the tool is disabled for this project or the "
+                    "API user lacks permission on it")
+        print(f"  {label:<28} HTTP {status}: {n} project(s){note}")
+    if any(s in (403, 404) for (lbl, s) in _endpoint_status
+           if lbl in ("work_order_contracts", "purchase_order_contracts")):
+        print("  ⚠️  Commitments returned 403/404 on some projects. A zero commitment count in")
+        print("      the COVERAGE DIAGNOSTIC above may therefore mean 'no access', not 'no")
+        print("      contracts' — grant the API service account read on Commitments before")
+        print("      concluding BCI doesn't use them.")
 
-print("\n--- endpoint reachability (tells 'no data' apart from 'no permission') ---")
-for (label, status), n in sorted(_endpoint_status.items()):
-    note = ""
-    if status in (403, 404):
-        note = ("  <-- NOT a 'no rows' answer: the tool is disabled for this project or the "
-                "API user lacks permission on it")
-    print(f"  {label:<28} HTTP {status}: {n} project(s){note}")
-if any(s in (403, 404) for (lbl, s) in _endpoint_status
-       if lbl in ("work_order_contracts", "purchase_order_contracts")):
-    print("  ⚠️  Commitments returned 403/404 on some projects. A zero commitment count in")
-    print("      the COVERAGE DIAGNOSTIC above may therefore mean 'no access', not 'no")
-    print("      contracts' — grant the API service account read on Commitments before")
-    print("      concluding BCI doesn't use them.")
+    if _withheld:
+        print("\n  ⚠️  ROWS WITHHELD — Procore's Total header exceeded the rows actually returned:")
+        for lbl, n in sorted(_withheld.items(), key=lambda kv: -kv[1]):
+            print(f"        {lbl}: on {n} project(s)")
+        print("      The data EXISTS and this service account cannot see all of it. That is a tool")
+        print("      permission in Procore, not an empty dataset. Same failure mode that hid private")
+        print("      Observations from the safety dashboard. Run fabric/diagnose_commitments.py.")
 
-if _withheld:
-    print("\n  ⚠️  ROWS WITHHELD — Procore's Total header exceeded the rows actually returned:")
-    for lbl, n in sorted(_withheld.items(), key=lambda kv: -kv[1]):
-        print(f"        {lbl}: on {n} project(s)")
-    print("      The data EXISTS and this service account cannot see all of it. That is a tool")
-    print("      permission in Procore, not an empty dataset. Same failure mode that hid private")
-    print("      Observations from the safety dashboard. Run fabric/diagnose_commitments.py.")
+    print("\n--- ATTENDEE SHAPE (where the company name actually lives) ---")
+    print("  top-level keys seen on attendee objects:")
+    for k, n in sorted(_attendee_keys.items(), key=lambda kv: -kv[1])[:30]:
+        print(f"    {k}: {n}")
+    print("  path that produced the company name:")
+    for k, n in sorted(_company_paths.items(), key=lambda kv: -kv[1]):
+        print(f"    {k}: {n}")
+    _unresolved = _company_paths.get("resolved:unresolved", 0)
+    _resolved   = sum(v for k, v in _company_paths.items() if k.startswith("resolved:")) - _unresolved
+    print(f"  => {_resolved} attendee(s) resolved, {_unresolved} unresolved.")
+    if _company_paths.get("resolved:email_domain"):
+        print(f"  note: {_company_paths['resolved:email_domain']} resolved by EMAIL DOMAIN rather than")
+        print("        the directory join — those people aren't in the project directory. Worth a")
+        print("        spot-check, and worth adding them to the Procore project directory.")
+    if _unresolved:
+        print(f"  ⚠️  {_unresolved} attendee(s) could not be tied to a company by any route: not on")
+        print("      the record, not in the project directory, and the email domain matched no")
+        print("      vendor on the job. Those meetings can still match on the title. Sample:")
+        try:
+            _sample = spark.sql("""
+                SELECT raw_json FROM bronze_vendor_meeting_attendees
+                WHERE raw_json IS NOT NULL LIMIT 1""").collect()
+            if _sample:
+                print("\n  SAMPLE ATTENDEE RECORD (copy this back):")
+                print("  " + str(_sample[0]["raw_json"])[:1500])
+        except Exception as _e:
+            print(f"  (couldn't read a sample row: {_e})")
 
-print("\n--- ATTENDEE SHAPE (where the company name actually lives) ---")
-print("  top-level keys seen on attendee objects:")
-for k, n in sorted(_attendee_keys.items(), key=lambda kv: -kv[1])[:30]:
-    print(f"    {k}: {n}")
-print("  path that produced the company name:")
-for k, n in sorted(_company_paths.items(), key=lambda kv: -kv[1]):
-    print(f"    {k}: {n}")
-_unresolved = _company_paths.get("resolved:unresolved", 0)
-_resolved   = sum(v for k, v in _company_paths.items() if k.startswith("resolved:")) - _unresolved
-print(f"  => {_resolved} attendee(s) resolved, {_unresolved} unresolved.")
-if _company_paths.get("resolved:email_domain"):
-    print(f"  note: {_company_paths['resolved:email_domain']} resolved by EMAIL DOMAIN rather than")
-    print("        the directory join — those people aren't in the project directory. Worth a")
-    print("        spot-check, and worth adding them to the Procore project directory.")
-if _unresolved:
-    print(f"  ⚠️  {_unresolved} attendee(s) could not be tied to a company by any route: not on")
-    print("      the record, not in the project directory, and the email domain matched no")
-    print("      vendor on the job. Those meetings can still match on the title. Sample:")
-    try:
-        _sample = spark.sql("""
-            SELECT raw_json FROM bronze_vendor_meeting_attendees
-            WHERE raw_json IS NOT NULL LIMIT 1""").collect()
-        if _sample:
-            print("\n  SAMPLE ATTENDEE RECORD (copy this back):")
-            print("  " + str(_sample[0]["raw_json"])[:1500])
-    except Exception as _e:
-        print(f"  (couldn't read a sample row: {_e})")
+    print("\n--- attendance status shapes seen ---")
+    print("  raw `status` values returned by Procore:")
+    for v, n in sorted(raw_status_values.items(), key=lambda kv: -kv[1]):
+        known = attendance_status({"status": v})
+        mark = "" if known != "unknown" else "   <-- NOT recognized; add a hint for it"
+        print(f"    {v!r} -> {known}{mark}")
+    for st, n in sorted(attendance_shapes.items(), key=lambda kv: -kv[1]):
+        print(f"  {st}: {n}")
+    _unknown = attendance_shapes.get("unknown", 0)
+    if _unknown:
+        print(f"  ({_unknown} attendee(s) carried NO status field at all — nobody ticked a box for")
+        print("   them. That is different from an unrecognized value; every status string Procore")
+        print("   actually returned is listed above and is understood.)")
+    if _unknown > sum(attendance_shapes.values()) * 0.5:
+        print("  ⚠️  Most attendees came back 'unknown' — the attendance field is in a")
+        print("     shape attendance_status() doesn't recognize. Inspect a raw_json row")
+        print("     in bronze_vendor_meeting_attendees and extend the hint lists.")
 
-print("\n--- attendance status shapes seen ---")
-print("  raw `status` values returned by Procore:")
-for v, n in sorted(raw_status_values.items(), key=lambda kv: -kv[1]):
-    known = attendance_status({"status": v})
-    mark = "" if known != "unknown" else "   <-- NOT recognized; add a hint for it"
-    print(f"    {v!r} -> {known}{mark}")
-for st, n in sorted(attendance_shapes.items(), key=lambda kv: -kv[1]):
-    print(f"  {st}: {n}")
-_unknown = attendance_shapes.get("unknown", 0)
-if _unknown:
-    print(f"  ({_unknown} attendee(s) carried NO status field at all — nobody ticked a box for")
-    print("   them. That is different from an unrecognized value; every status string Procore")
-    print("   actually returned is listed above and is understood.)")
-if _unknown > sum(attendance_shapes.values()) * 0.5:
-    print("  ⚠️  Most attendees came back 'unknown' — the attendance field is in a")
-    print("     shape attendance_status() doesn't recognize. Inspect a raw_json row")
-    print("     in bronze_vendor_meeting_attendees and extend the hint lists.")
+    print("\n--- attendee company coverage (the primary matching signal) ---")
+    spark.sql("""
+    SELECT
+        COUNT(*)                                                          AS attendee_rows,
+        SUM(CASE WHEN company_normalized IS NULL OR company_normalized = ''
+                 THEN 1 ELSE 0 END)                                       AS missing_company,
+        SUM(CASE WHEN is_gc THEN 1 ELSE 0 END)                            AS buffalo_attendees,
+        SUM(CASE WHEN NOT is_gc AND company_normalized <> '' THEN 1 ELSE 0 END) AS vendor_attendees
+    FROM silver_vendor_prep_attendees
+    """).show(truncate=False)
+    print("If `missing_company` is high, attendee_company() is looking in the wrong")
+    print("place — inspect raw_json and extend it. Title matching still works, but at")
+    print("lower confidence.")
 
-print("\n--- attendee company coverage (the primary matching signal) ---")
-spark.sql("""
-SELECT
-    COUNT(*)                                                          AS attendee_rows,
-    SUM(CASE WHEN company_normalized IS NULL OR company_normalized = ''
-             THEN 1 ELSE 0 END)                                       AS missing_company,
-    SUM(CASE WHEN is_gc THEN 1 ELSE 0 END)                            AS buffalo_attendees,
-    SUM(CASE WHEN NOT is_gc AND company_normalized <> '' THEN 1 ELSE 0 END) AS vendor_attendees
-FROM silver_vendor_prep_attendees
-""").show(truncate=False)
-print("If `missing_company` is high, attendee_company() is looking in the wrong")
-print("place — inspect raw_json and extend it. Title matching still works, but at")
-print("lower confidence.")
-
-print("\n--- prep meetings per project (top 15) ---")
-spark.sql("""
-SELECT project_procore_id, MAX(project_name) AS project_name, COUNT(*) AS prep_meetings
-FROM silver_vendor_prep_meetings
-GROUP BY project_procore_id
-ORDER BY prep_meetings DESC
-""").show(15, truncate=False)
+    print("\n--- prep meetings per project (top 15) ---")
+    spark.sql("""
+    SELECT project_procore_id, MAX(project_name) AS project_name, COUNT(*) AS prep_meetings
+    FROM silver_vendor_prep_meetings
+    GROUP BY project_procore_id
+    ORDER BY prep_meetings DESC
+    """).show(15, truncate=False)
 
 print("\nVendor compliance ingestion complete. Next: build_vendor_gold.py")
