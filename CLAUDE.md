@@ -174,6 +174,21 @@ Two deliberate details:
   console. Both refusals return 409 with the reason, so the UI can say which
   rule was hit rather than failing silently.
 
+**Guest accounts are refused on every route (Nov 2026).** `api/src/guestGate.ts`,
+registered as a `preInvocation` hook at the top of `api/src/index.ts`, so no handler can
+forget it. A principal is a guest when a name claim carries `#EXT#`, an `idp` claim names
+another tenant, `acct` is `1`, **or Microsoft Graph says the account's `userType` is `Guest`**
+(app-only token on `AZURE_CLIENT_ID`, the Fabric service principal; needs `User.Read.All` on
+that registration, otherwise the lookup fails, is logged as `guest gate: Graph lookup failed`,
+and the claims decide). Cached an hour per oid. The answer is `403 { error: 'guest' }`; the
+dashboard wraps `window.fetch` once (top of the script) and turns the first one into a
+full-page notice with Sign out. One warning per refusal in the Function log with the claim
+TYPES, never values. Why in code and not only Entra: "Assignment required" is checked at
+sign-in only, and an SWA session cookie outlives it (IT's guest session on The Range survived
+the setting). Set the Entra side too (Enterprise applications → this app → Properties →
+Assignment required → Users and groups: an employee group). `cd api && npm test` (new
+script; `pretest` runs `tsc`) covers it.
+
 ### The Metrics tab, and the two numbers it refuses to show
 
 `GET /api/metrics?months=` → adoption snapshot, monthly series, project
